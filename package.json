@@ -1,0 +1,105 @@
+{
+  "name": "ecode-vscode",
+  "displayName": "Ecode Local",
+  "description": "泛微 Ecode 本地开发 VSCode 插件 — 在线代码同步到本地编辑，保存即同步",
+  "version": "0.1.0",
+  "publisher": "ecode-local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrBear-xzx/ecode-local.git"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ecode",
+    "泛微",
+    "e-cology",
+    "低代码"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ecode.setup",
+        "title": "Ecode: Setup",
+        "icon": "$(gear)"
+      }
+    ],
+    "configuration": {
+      "title": "Ecode",
+      "properties": {
+        "ecode.server.url": {
+          "type": "string",
+          "default": "",
+          "description": "Ecode 服务器地址（如 http://localhost:8099）"
+        },
+        "ecode.server.appId": {
+          "type": "string",
+          "default": "",
+          "description": "Ecode App ID（可选，发布列表中获取的 UUID）"
+        },
+        "ecode.server.username": {
+          "type": "string",
+          "default": "sysadmin",
+          "description": "E-cology 登录用户名"
+        },
+        "ecode.localDir": {
+          "type": "string",
+          "default": "ecode",
+          "description": "本地代码存放目录（相对于工作区根目录）"
+        },
+        "ecode.server.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时自动连接服务器"
+        },
+        "ecode.sync.autoPushOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "保存文件时自动同步到服务器"
+        },
+        "ecode.sync.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "保存后推送的防抖延迟（毫秒）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "eslint src --ext .ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.93.0",
+    "@types/node": "^20.0.0",
+    "@vscode/test-electron": "^2.4.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0",
+    "mocha": "^10.0.0",
+    "@types/mocha": "^10.0.0",
+    "glob": "^11.0.0",
+    "eslint": "^9.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vscode/vsce": "^3.0.0"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.0",
+    "simple-git": "^3.0.0",
+    "form-data": "^4.0.0"
+  }
+}

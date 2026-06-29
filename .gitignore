@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+*.vsix
+.DS_Store
+Thumbs.db
+*.log
+reference/
+scripts/
