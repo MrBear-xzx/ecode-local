@@ -1,7 +1,7 @@
 {
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
-  "description": "泛微 Ecode 本地开发 VSCode 插件 — 在线代码同步到本地编辑，保存即同步",
+  "description": "泛微 Ecode 本地开发 VSCode 插件 — 在线代码同步到本地编辑，手动推送",
   "version": "0.1.0",
   "publisher": "ecode-local",
   "license": "MIT",
@@ -52,25 +52,10 @@
           "default": "sysadmin",
           "description": "E-cology 登录用户名"
         },
-        "ecode.localDir": {
-          "type": "string",
-          "default": "ecode",
-          "description": "本地代码存放目录（相对于工作区根目录）"
-        },
         "ecode.server.autoConnect": {
           "type": "boolean",
           "default": true,
           "description": "启动时自动连接服务器"
-        },
-        "ecode.sync.autoPushOnSave": {
-          "type": "boolean",
-          "default": true,
-          "description": "保存文件时自动同步到服务器"
-        },
-        "ecode.sync.debounceMs": {
-          "type": "number",
-          "default": 300,
-          "description": "保存后推送的防抖延迟（毫秒）"
         }
       }
     }

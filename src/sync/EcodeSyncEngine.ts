@@ -3,6 +3,9 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { AuthManager } from './auth/AuthManager';
 import { FileApi } from './api/FileApi';
+import { SyncStateStore } from './SyncStateStore';
+import { LOCAL_SYNC_DIR } from '../constants';
+import type { FileDiff, SyncResult } from './api/types';
 
 interface TreeNode {
   id: string;
@@ -17,17 +20,12 @@ interface TreeNode {
  */
 export class EcodeSyncEngine {
   private fileApi: FileApi | null = null;
-  private localDir: string;
-  private autoSyncEnabled: boolean;
-  private disposables: vscode.Disposable[] = [];
+  private stateStore: SyncStateStore | null = null;
 
   constructor(
     private authManager: AuthManager,
     private output: vscode.LogOutputChannel,
-  ) {
-    this.localDir = vscode.workspace.getConfiguration('ecode').get<string>('localDir') || 'ecode';
-    this.autoSyncEnabled = vscode.workspace.getConfiguration('ecode').get<boolean>('sync.autoPushOnSave') ?? true;
-  }
+  ) {}
 
   private async getFileApi(): Promise<FileApi | null> {
     if (this.fileApi) { return this.fileApi; }
@@ -35,6 +33,15 @@ export class EcodeSyncEngine {
     if (!client) { return null; }
     this.fileApi = new FileApi(client);
     return this.fileApi;
+  }
+
+  private getStateStore(): SyncStateStore {
+    if (!this.stateStore) {
+      const wsFolder = vscode.workspace.workspaceFolders?.[0];
+      const manifestDir = wsFolder?.uri.fsPath ?? vscode.workspace.rootPath ?? '';
+      this.stateStore = new SyncStateStore(this.getLocalDir(), manifestDir);
+    }
+    return this.stateStore;
   }
 
   // ==================== PULL ====================
@@ -75,18 +82,17 @@ export class EcodeSyncEngine {
 
   /**
    * pull — 全量递归下载所有文件到本地
+   * 拉取前检查本地是否有未推送的修改，有则跳过并记录冲突
    */
   async pull(
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
-  ): Promise<{ downloaded: number; failed: number; errors: string[] }> {
+  ): Promise<SyncResult> {
     const api = await this.getFileApi();
     if (!api) { throw new Error('Not connected'); }
 
     const localDir = this.getLocalDir();
-    let downloaded = 0;
-    let failed = 0;
-    const errors: string[] = [];
+    const result: SyncResult = { success: true, pulled: 0, pushed: 0, failed: 0, conflicts: [], errors: [] };
 
     const root = await this.getFileTree();
     const systemNode = root.find(n => n.attribute === 'system');
@@ -94,22 +100,19 @@ export class EcodeSyncEngine {
 
     // system 节点（工具包等）
     if (systemNode?.hasChild) {
-      if (token?.isCancellationRequested) { return { downloaded, failed, errors }; }
-      await this.pullType(api, systemNode.id, systemNode.name, localDir,
-        (d, f, e) => { downloaded += d; failed += f; errors.push(...e); },
-        onProgress, token);
+      if (token?.isCancellationRequested) { return result; }
+      await this.pullType(api, systemNode.id, systemNode.name, localDir, result, onProgress, token);
     }
 
     // 各分类
     for (const t of types) {
       if (token?.isCancellationRequested) { break; }
-      await this.pullType(api, t.id, t.name, localDir,
-        (d, f, e) => { downloaded += d; failed += f; errors.push(...e); },
-        onProgress, token);
+      await this.pullType(api, t.id, t.name, localDir, result, onProgress, token);
     }
 
-    this.output.info(`pull done: ${downloaded} ok, ${failed} failed`);
-    return { downloaded, failed, errors };
+    result.success = result.failed === 0;
+    this.output.info(`pull done: ${result.pulled} ok, ${result.failed} failed, ${result.conflicts.length} conflicts`);
+    return result;
   }
 
   private async pullType(
@@ -117,7 +120,7 @@ export class EcodeSyncEngine {
     typeId: string,
     typePath: string,
     localDir: string,
-    onResult: (d: number, f: number, e: string[]) => void,
+    syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
   ): Promise<void> {
@@ -126,19 +129,17 @@ export class EcodeSyncEngine {
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, typePath, localDir, onProgress, onResult);
+      await this.downloadOne(file, typePath, localDir, syncResult, onProgress);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir,
-        onResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir, syncResult, onProgress, token);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir,
-        onResult, onProgress, token);
+      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir, syncResult, onProgress, token);
     }
   }
 
@@ -147,7 +148,7 @@ export class EcodeSyncEngine {
     folderId: string,
     folderPath: string,
     localDir: string,
-    onResult: (d: number, f: number, e: string[]) => void,
+    syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
   ): Promise<void> {
@@ -156,19 +157,17 @@ export class EcodeSyncEngine {
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, folderPath, localDir, onProgress, onResult);
+      await this.downloadOne(file, folderPath, localDir, syncResult, onProgress);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir,
-        onResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir, syncResult, onProgress, token);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir,
-        onResult, onProgress, token);
+      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir, syncResult, onProgress, token);
     }
   }
 
@@ -176,11 +175,13 @@ export class EcodeSyncEngine {
     file: TreeNode,
     parentPath: string,
     localDir: string,
+    syncResult: SyncResult,
     onProgress: (msg: string) => void,
-    onResult: (d: number, f: number, e: string[]) => void,
   ): Promise<void> {
     onProgress(parentPath);
     const localPath = path.join(localDir, parentPath, file.name);
+    const remotePath = parentPath ? `${parentPath}/${file.name}` : file.name;
+
     try {
       const api = await this.getFileApi();
       if (!api) { throw new Error('Not connected'); }
@@ -188,13 +189,40 @@ export class EcodeSyncEngine {
       if (!content.status || content.data === undefined) {
         throw new Error(content.msg || 'Failed to get file content');
       }
+
+      const store = this.getStateStore();
+
+      // 保护拉取：检查本地是否有未推送的修改
+      if (fs.existsSync(localPath)) {
+        let localHash: string;
+        try {
+          localHash = store.computeHash(localPath);
+        } catch {
+          localHash = '';
+        }
+
+        const storedEntry = store.getEntry(remotePath);
+        if (storedEntry && localHash && localHash !== storedEntry.hash) {
+          // 本地有未推送的修改 → 跳过，记录冲突
+          this.output.warn(`Conflict: ${remotePath} — local modifications would be overwritten`);
+          syncResult.conflicts.push(remotePath);
+          return;
+        }
+      }
+
+      // 正常写入
       const dir = path.dirname(localPath);
       if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
       fs.writeFileSync(localPath, content.data, 'utf-8');
-      onResult(1, 0, []);
+
+      // 更新清单基线
+      store.updateEntry(remotePath, content.data, file.id);
+
+      syncResult.pulled++;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      onResult(0, 1, [`${parentPath}/${file.name}: ${msg}`]);
+      syncResult.failed++;
+      syncResult.errors.push(`${parentPath}/${file.name}: ${msg}`);
       this.output.error(`FAIL: ${parentPath}/${file.name} — ${msg}`);
     }
   }
@@ -233,63 +261,76 @@ export class EcodeSyncEngine {
 
   // ==================== PUSH ====================
 
-  enableAutoSync(context: vscode.ExtensionContext): void {
-    if (this.disposables.length > 0) { return; }
-
-    const watcher = vscode.workspace.onDidSaveTextDocument(doc => this.onSave(doc));
-    this.disposables.push(watcher);
-    context.subscriptions.push(watcher);
-
-    const configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('ecode.sync.autoPushOnSave')) {
-        this.autoSyncEnabled = vscode.workspace.getConfiguration('ecode').get<boolean>('sync.autoPushOnSave') ?? true;
-      }
-      if (e.affectsConfiguration('ecode.localDir')) {
-        this.localDir = vscode.workspace.getConfiguration('ecode').get<string>('localDir') || 'ecode';
-      }
-    });
-    this.disposables.push(configWatcher);
-    context.subscriptions.push(configWatcher);
-
-    this.output.info('Auto-sync enabled');
+  /**
+   * 获取本地变更状态（added / modified / deleted）
+   */
+  async getStatus(): Promise<FileDiff[]> {
+    const store = this.getStateStore();
+    const diffs = store.diff();
+    const counts: Record<string, number> = { added: 0, modified: 0, deleted: 0 };
+    for (const d of diffs) { counts[d.status]++; }
+    this.output.info(`Status: ${counts.added} added, ${counts.modified} modified, ${counts.deleted} deleted`);
+    return diffs;
   }
 
-  disableAutoSync(): void {
-    for (const d of this.disposables) { d.dispose(); }
-    this.disposables = [];
-  }
+  /**
+   * 增量推送 — 仅推送有变更的文件
+   * @param files 可选，不传则自动 getStatus() 获取差异
+   */
+  async pushChanged(files?: FileDiff[]): Promise<SyncResult> {
+    const api = await this.getFileApi();
+    if (!api) { throw new Error('Not connected'); }
 
-  private async onSave(doc: vscode.TextDocument): Promise<void> {
-    if (!this.autoSyncEnabled) { return; }
+    const store = this.getStateStore();
+    const diffs = files ?? await this.getStatus();
+    const toPush = diffs.filter(d => d.status === 'added' || d.status === 'modified');
 
-    const wsFolder = vscode.workspace.getWorkspaceFolder(doc.uri);
-    if (!wsFolder) { return; }
+    const result: SyncResult = { success: true, pulled: 0, pushed: 0, failed: 0, conflicts: [], errors: [] };
+    const localDir = this.getLocalDir();
 
-    const dir = path.join(wsFolder.uri.fsPath, this.localDir);
-    if (!doc.uri.fsPath.startsWith(dir)) { return; }
+    for (const diff of toPush) {
+      const localPath = path.join(localDir, diff.path);
+      const remotePath = diff.path; // posix 风格
 
-    const remotePath = path.relative(dir, doc.uri.fsPath).replace(/\\/g, '/');
-
-    try {
-      const api = await this.getFileApi();
-      if (!api) {
-        vscode.window.showWarningMessage('Ecode: Not connected, file not synced');
-        return;
+      if (!fs.existsSync(localPath)) {
+        // 文件在 diff 后、push 前被删除
+        result.failed++;
+        result.errors.push(`${diff.path}: file deleted before push`);
+        continue;
       }
-      await api.push(doc.uri.fsPath, remotePath);
-      this.output.info(`Synced: ${remotePath}`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.output.error(`Sync failed: ${msg}`);
-      vscode.window.showErrorMessage(`Ecode sync failed: ${msg}`);
+
+      try {
+        await api.push(localPath, remotePath);
+        store.updateEntry(diff.path);
+        result.pushed++;
+        this.output.info(`Pushed: ${diff.path}`);
+      } catch (err: unknown) {
+        result.failed++;
+        const msg = err instanceof Error ? err.message : String(err);
+        result.errors.push(`${diff.path}: ${msg}`);
+        this.output.error(`Push failed: ${diff.path} — ${msg}`);
+      }
     }
+
+    // 已删除的文件从清单中清理（服务器无删除 API）
+    const deleted = diffs.filter(d => d.status === 'deleted');
+    for (const d of deleted) {
+      store.removeEntry(d.path);
+      this.output.info(`Removed from manifest (deleted locally): ${d.path}`);
+    }
+
+    result.success = result.failed === 0;
+    this.output.info(`Push done: ${result.pushed} pushed, ${result.failed} failed`);
+    return result;
   }
+
+  // ==================== UTIL ====================
 
   getLocalDir(workspaceFolder?: vscode.WorkspaceFolder): string {
     const wsFolder = workspaceFolder || vscode.workspace.workspaceFolders?.[0];
     if (wsFolder) {
-      return path.join(wsFolder.uri.fsPath, this.localDir);
+      return path.join(wsFolder.uri.fsPath, LOCAL_SYNC_DIR);
     }
-    return path.join(vscode.workspace.rootPath || '', this.localDir);
+    return path.join(vscode.workspace.rootPath || '', LOCAL_SYNC_DIR);
   }
 }

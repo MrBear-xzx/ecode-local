@@ -81,7 +81,6 @@ export class SetupPanel {
     const config = vscode.workspace.getConfiguration('ecode');
     const savedUrl = config.get<string>('server.url') || 'http://localhost:8099';
     const savedUser = config.get<string>('server.username') || 'sysadmin';
-    const savedDir = config.get<string>('localDir') || 'ecode';
     // 对密码做 HTML 转义，防止 XSS
     const pwdValue = this.savedPwd.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -142,12 +141,6 @@ export class SetupPanel {
         <input id="password" type="password" value="${pwdValue}" placeholder="请输入密码" />
       </div>
 
-      <div class="form-group">
-        <label for="localDir">本地目录</label>
-        <input id="localDir" type="text" value="${savedDir}" placeholder="ecode" />
-        <div class="hint">代码下载到工作区的哪个目录（相对于项目根目录）</div>
-      </div>
-
       <div class="actions">
         <button type="submit" class="btn btn-primary" id="connectBtn">🔗 连接测试 & 保存</button>
         <button type="button" class="btn btn-secondary" id="skipBtn">跳过</button>
@@ -173,7 +166,6 @@ export class SetupPanel {
       const url = document.getElementById('url').value.trim();
       const username = document.getElementById('username').value.trim();
       const password = document.getElementById('password').value;
-      const localDir = document.getElementById('localDir').value.trim();
 
       if (!url || !username || !password) {
         setStatus('error', '请填写所有必填字段');
@@ -185,7 +177,7 @@ export class SetupPanel {
 
       vscode.postMessage({
         type: 'connect',
-        url, username, password, localDir,
+        url, username, password,
       });
     });
 
@@ -217,15 +209,11 @@ export class SetupPanel {
           const url = msg.url as string;
           const username = msg.username as string;
           const password = msg.password as string;
-          const localDir = msg.localDir as string | undefined;
 
           // 保存配置
           const config = vscode.workspace.getConfiguration('ecode');
           await config.update('server.url', url, vscode.ConfigurationTarget.Workspace);
           await config.update('server.username', username, vscode.ConfigurationTarget.Workspace);
-          if (localDir) {
-            await config.update('localDir', localDir, vscode.ConfigurationTarget.Workspace);
-          }
 
           // 测试连接
           if (password) {

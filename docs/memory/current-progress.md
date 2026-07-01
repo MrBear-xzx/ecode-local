@@ -21,10 +21,10 @@ Ecode Local v0.1.0 已实现功能一览。
 
 ## 同步引擎
 
-- [x] `EcodeSyncEngine.ts` — 递归全量拉取（system + typeList 分类 → 目录树遍历）
-- [x] 保存自动推送 — `onDidSaveTextDocument` 监听 → FormData upload
+- [x] `EcodeSyncEngine.ts` — 递归全量拉取（system + typeList 分类 → 目录树遍历） + 冲突保护
+- [x] `SyncStateStore.ts` — 本地同步状态清单（SHA-256 哈希基线 + diff）
+- [x] 手动推送 — 版本比对 + 增量推送（仅推送有变更的文件）
 - [x] 取消支持 — pull 过程支持 CancellationToken
-- [x] 防抖 — 可配 debounceMs（默认 300ms）
 
 ## UI
 
@@ -35,12 +35,9 @@ Ecode Local v0.1.0 已实现功能一览。
 
 - [x] `ecode.server.url` / `username` / `appId`
 - [x] `ecode.localDir` / `server.autoConnect`
-- [x] `ecode.sync.autoPushOnSave` / `debounceMs`
 
 ## 待实现
 
-- [ ] `ecode.menuPush` — 手动推送命令（菜单已预留，逻辑未实现）
-- [ ] 增量同步 / 差异对比
 - [ ] 文件删除同步
 
 ## 分支状态

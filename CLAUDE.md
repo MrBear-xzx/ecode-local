@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Ecode Local — 泛微 Ecode VSCode 本地开发插件，将 E-cology 9 OA 系统中的 Ecode 在线代码同步到本地编辑。核心功能：**保存即自动同步**到服务器。
+Ecode Local — 泛微 Ecode VSCode 本地开发插件，将 E-cology 9 OA 系统中的 Ecode 在线代码同步到本地编辑。核心功能：**手动推送**本地代码到服务器。
 
 - 技术栈：TypeScript + esbuild + VSCode Extension API
 - 目标 VSCode 版本：^1.93.0
@@ -23,20 +23,22 @@ npm run package        # 打包 .vsix
 
 ```
 extension.ts (入口 — activate/deactivate + 命令注册 + 状态栏)
-  ├── sync/auth/        鉴权子系统（Weaver RSA + Cookie 会话）
-  │   ├── RSACrypto.ts    Weaver 自定义 RSA 加密
-  │   ├── AuthManager.ts  登录 + 会话管理 + 自动登录
-  │   └── TokenStore.ts   VSCode SecretStorage 持久化 Cookie/密码
-  ├── sync/api/
-  │   ├── EcodeApiClient.ts   HTTP 客户端（Cookie 鉴权 + 超时控制）
-  │   └── FileApi.ts          Ecode 文件 CRUD（tree/view/upload）
-  ├── sync/EcodeSyncEngine.ts  同步编排器（递归 pull + save→push）
+  ├── sync/
+  │   ├── auth/
+  │   │   ├── RSACrypto.ts      Weaver 自定义 RSA 加密
+  │   │   ├── AuthManager.ts    登录 + 会话管理 + 自动登录
+  │   │   └── TokenStore.ts     VSCode SecretStorage 持久化 Cookie/密码
+  │   ├── api/
+  │   │   ├── EcodeApiClient.ts   HTTP 客户端（Cookie 鉴权 + 超时控制）
+  │   │   └── FileApi.ts          Ecode 文件 CRUD（tree/view/upload）
+  │   ├── EcodeSyncEngine.ts     同步编排器（递归 pull + 手动 push + 版本比对）
+  │   └── SyncStateStore.ts      本地同步状态清单（SHA-256 基线 + diff）
   └── ui/webview/SetupPanel.ts 配置向导 Webview（表单 + 连接测试）
 ```
 
 ### 启动流程
 
-1. `activate()` → 注册命令、启用自动同步
+1. `activate()` → 注册命令
 2. 检查 SecretStorage 是否有 Cookie → 有则验证有效性
 3. Cookie 有效 → 自动登录成功；无效/无 → 检查是否有密码
 4. 有密码+服务器地址 → 自动 RSA 登录
@@ -70,22 +72,18 @@ extension.ts (入口 — activate/deactivate + 命令注册 + 状态栏)
 - `ecode.server.appId` — Ecode App ID（可选，UUID）
 - `ecode.localDir` — 本地代码目录（默认 ecode）
 - `ecode.server.autoConnect` — 启动时自动连接（默认 true）
-- `ecode.sync.autoPushOnSave` — 保存自动推送（默认 true）
-- `ecode.sync.debounceMs` — 推送防抖延迟（默认 300ms）
 - Secrets via `vscode.SecretStorage` — Cookie 和密码持久化
 
 ### Current Status (v0.1.0)
 
 **已实现：**
 - Weaver RSA 登录（Cookie 会话鉴权）
-- 全量递归文件树拉取
-- 保存文件自动推送到服务器（FormData upload）
+- 全量递归文件树拉取（带冲突保护）
+- 手动推送（SHA-256 版本比对 + 增量推送）
 - Webview 配置向导
 - 状态栏快捷操作（拉取/推送入口）
 
 **待实现：**
-- 手动推送命令（菜单入口已预留，逻辑未实现）
-- 增量同步 / 差异对比
 - 文件删除同步
 
 ## Git Workflow
