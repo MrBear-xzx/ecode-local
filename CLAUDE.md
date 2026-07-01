@@ -70,7 +70,6 @@ extension.ts (入口 — activate/deactivate + 命令注册 + 状态栏)
 - `ecode.server.url` — E-cology 服务器地址
 - `ecode.server.username` — 登录用户名（默认 sysadmin）
 - `ecode.server.appId` — Ecode App ID（可选，UUID）
-- `ecode.localDir` — 本地代码目录（默认 ecode）
 - `ecode.server.autoConnect` — 启动时自动连接（默认 true）
 - Secrets via `vscode.SecretStorage` — Cookie 和密码持久化
 
