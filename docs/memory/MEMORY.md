@@ -1,3 +1,2 @@
 - [Ecode Local 项目概述](ecode-vscode-project.md)
-- [Phase 0 脚手架进度](phase-0-scaffold-progress.md)
-- [Phase 1 鉴权模块进度](phase-1-auth-progress.md)
+- [当前已实现功能进度](current-progress.md)

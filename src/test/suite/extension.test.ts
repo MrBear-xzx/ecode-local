@@ -19,10 +19,8 @@ suite('Ecode Extension Test Suite', () => {
 
   test('Ecode commands should be registered', async () => {
     const commands = await vscode.commands.getCommands(true);
-    assert.ok(commands.includes('ecode.configure'));
-    assert.ok(commands.includes('ecode.login'));
-    assert.ok(commands.includes('ecode.logout'));
-    assert.ok(commands.includes('ecode.pull'));
-    assert.ok(commands.includes('ecode.importZip'));
+    assert.ok(commands.includes('ecode.setup'));
+    assert.ok(commands.includes('ecode.menuPull'));
+    assert.ok(commands.includes('ecode.menuPush'));
   });
 });
