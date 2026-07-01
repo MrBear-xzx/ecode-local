@@ -19,7 +19,6 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(statusBar);
 
   registerCommands(context);
-  syncEngine.enableAutoSync(context);
   resetStatusBar();
 
   // 自动登录（仅连接，不触发下载）
@@ -38,7 +37,7 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  syncEngine.disableAutoSync();
+  // 当前版本无自动任务需要清理
 }
 
 // ==================== 命令注册 ====================
@@ -56,7 +55,59 @@ function registerCommands(context: vscode.ExtensionContext) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('ecode.menuPush', async () => {
-    vscode.window.showInformationMessage('推送代码功能开发中，敬请期待');
+    const client = await authManager.autoLogin();
+    if (!client) {
+      vscode.window.showErrorMessage('Ecode: 未连接，请先配置服务器');
+      vscode.commands.executeCommand('ecode.setup');
+      return;
+    }
+
+    // 获取变更状态
+    const status = await syncEngine.getStatus();
+    const changes = status.filter(d => d.status === 'added' || d.status === 'modified');
+
+    if (changes.length === 0) {
+      vscode.window.showInformationMessage('Ecode: 没有需要推送的更改');
+      return;
+    }
+
+    // 展示变更摘要
+    const summary = changes.slice(0, 5).map(d =>
+      `${d.status === 'added' ? '+' : '~'} ${d.path}`
+    ).join('\n');
+    const more = changes.length > 5 ? `\n  ... 还有 ${changes.length - 5} 个文件` : '';
+
+    const choice = await vscode.window.showInformationMessage(
+      `将推送 ${changes.length} 个文件:\n${summary}${more}`,
+      { modal: false },
+      '确认推送',
+    );
+    if (choice !== '确认推送') { return; }
+
+    // 推送
+    statusBar.text = '$(sync~spin) 推送中...';
+    try {
+      const result = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'Ecode: 推送代码...',
+        cancellable: false,
+      }, async () => {
+        return syncEngine.pushChanged();
+      });
+
+      if (result.success) {
+        vscode.window.showInformationMessage(`推送完成: ${result.pushed} 个文件`);
+      } else {
+        vscode.window.showWarningMessage(
+          `推送完成: ${result.pushed} 成功, ${result.failed} 失败. 查看 Ecode Output 面板`,
+        );
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      vscode.window.showErrorMessage(`推送失败: ${msg}`);
+      output.error(`Push failed: ${err}`);
+    }
+    resetStatusBar();
   }));
 
   // Setup
@@ -105,10 +156,14 @@ async function pullCode(source: 'auto' | 'setup' | 'manual'): Promise<void> {
 
     resetStatusBar();
 
+    if (result.conflicts.length > 0) {
+      output.warn(`${result.conflicts.length} files skipped due to local modifications`);
+    }
+
     if (result.failed === 0) {
-      vscode.window.showInformationMessage(`下载完成: ${result.downloaded} 个文件 → ${syncEngine.getLocalDir()}`);
-    } else if (result.downloaded > 0) {
-      vscode.window.showWarningMessage(`${result.downloaded} 成功, ${result.failed} 失败. 查看 Ecode Output 面板`);
+      vscode.window.showInformationMessage(`下载完成: ${result.pulled} 个文件 → ${syncEngine.getLocalDir()}`);
+    } else if (result.pulled > 0) {
+      vscode.window.showWarningMessage(`${result.pulled} 成功, ${result.failed} 失败. 查看 Ecode Output 面板`);
     } else {
       vscode.window.showErrorMessage(`下载失败: ${result.failed} 个文件. 查看 Ecode Output 面板`);
     }
@@ -125,7 +180,7 @@ function buildHoverMenu(): vscode.MarkdownString {
   const m = new vscode.MarkdownString(
     '**⚙ [基础配置](command:ecode.setup)**  &nbsp; 服务器、账号密码\n\n' +
     '**⬇ [拉取代码](command:ecode.menuPull)**  &nbsp; 全量下载到本地\n\n' +
-    '**⬆ [推送代码](command:ecode.menuPush)**  &nbsp; TODO 后续实现',
+    '**⬆ [推送代码](command:ecode.menuPush)**  &nbsp; 推送本地更改到服务器',
     true,
   );
   m.isTrusted = true;
