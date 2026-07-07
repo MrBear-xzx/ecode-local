@@ -351,7 +351,7 @@ function buildHoverMenu(branchName: string): vscode.MarkdownString {
   ];
 
   if (branchName) {
-    parts.push(`当前分支: **${branchName}**`);
+    parts.push(`当前分支: **${escapeMarkdown(branchName)}**`);
   }
 
   parts.push('');
@@ -361,4 +361,9 @@ function buildHoverMenu(branchName: string): vscode.MarkdownString {
   const m = new vscode.MarkdownString(parts.join('\n'), true);
   m.isTrusted = true;
   return m;
+}
+
+/** 转义 Markdown 特殊字符，防止在 isTrusted MarkdownString 中注入 */
+function escapeMarkdown(text: string): string {
+  return text.replace(/([\\[\](){}*_~`#+\-.!|><])/g, '\\$1');
 }
