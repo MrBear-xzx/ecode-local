@@ -140,6 +140,9 @@ export class EcodeSyncEngine {
     const api = await this.getFileApi();
     if (!api) { throw new Error('Not connected'); }
 
+    // 一次性获取所有本地有变更的文件列表（供每个 downloadOne 复用，避免每文件调一次 git diff）
+    const dirtyFiles = await this.getDirtyFileSet();
+
     const localDir = this.getLocalDir();
     const result: SyncResult = { success: true, pulled: 0, pushed: 0, failed: 0, conflicts: [], errors: [] };
 
@@ -150,18 +153,29 @@ export class EcodeSyncEngine {
     // system 节点（工具包等）
     if (systemNode?.hasChild) {
       if (token?.isCancellationRequested) { return result; }
-      await this.pullType(api, systemNode.id, systemNode.name, localDir, result, onProgress, token);
+      await this.pullType(api, systemNode.id, systemNode.name, localDir, result, onProgress, token, dirtyFiles);
     }
 
     // 各分类
     for (const t of types) {
       if (token?.isCancellationRequested) { break; }
-      await this.pullType(api, t.id, t.name, localDir, result, onProgress, token);
+      await this.pullType(api, t.id, t.name, localDir, result, onProgress, token, dirtyFiles);
     }
 
     result.success = result.failed === 0;
     this.output.info(`pull done: ${result.pulled} ok, ${result.failed} failed, ${result.conflicts.length} conflicts`);
     return result;
+  }
+
+  /** 获取本地有变更的文件路径集合（用于 pull 冲突检测） */
+  private async getDirtyFileSet(): Promise<Set<string>> {
+    if (!this.gitManager) { return new Set(); }
+    try {
+      const files = await this.gitManager.getChangedFiles();
+      return new Set(files);
+    } catch {
+      return new Set();
+    }
   }
 
   private async pullType(
@@ -172,23 +186,24 @@ export class EcodeSyncEngine {
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     const result = await this.fetchTree(api, '', typeId);
     if (!result || token?.isCancellationRequested) { return; }
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, typePath, localDir, syncResult, onProgress);
+      await this.downloadOne(file, typePath, localDir, syncResult, onProgress, dirtyFiles);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir, syncResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir, syncResult, onProgress, token);
+      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
   }
 
@@ -200,23 +215,24 @@ export class EcodeSyncEngine {
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     const result = await this.fetchTree(api, folderId, '');
     if (!result || token?.isCancellationRequested) { return; }
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, folderPath, localDir, syncResult, onProgress);
+      await this.downloadOne(file, folderPath, localDir, syncResult, onProgress, dirtyFiles);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir, syncResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir, syncResult, onProgress, token);
+      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
   }
 
@@ -226,6 +242,7 @@ export class EcodeSyncEngine {
     localDir: string,
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     onProgress(parentPath);
     const localPath = path.join(localDir, parentPath, file.name);
@@ -239,18 +256,13 @@ export class EcodeSyncEngine {
         throw new Error(content.msg || 'Failed to get file content');
       }
 
-      // 保护拉取：检查本地是否有未提交的修改（git tracked + dirty）
-      if (fs.existsSync(localPath) && this.gitManager) {
-        try {
-          const relPath = path.relative(this.getLocalDir(), localPath).replace(/\\/g, '/');
-          const rawDiff = await this.gitManager.getRawDiff();
-          if (rawDiff.includes(relPath)) {
-            this.output.warn(`Conflict: ${remotePath} — local modifications would be overwritten`);
-            syncResult.conflicts.push(remotePath);
-            return;
-          }
-        } catch {
-          // git 检查失败，允许覆盖
+      // 保护拉取：检查本地是否有未提交的修改（使用预计算的 dirtyFiles 集合）
+      if (fs.existsSync(localPath) && dirtyFiles) {
+        const relPath = path.relative(this.getLocalDir(), localPath).replace(/\\/g, '/');
+        if (dirtyFiles.has(relPath)) {
+          this.output.warn(`Conflict: ${remotePath} — local modifications would be overwritten`);
+          syncResult.conflicts.push(remotePath);
+          return;
         }
       }
 
@@ -326,9 +338,12 @@ export class EcodeSyncEngine {
 
     let changes = await this.gitManager.getDiffSummary();
 
-    // 如果 git diff 为空（如同在 main 分支上），检查是否有未跟踪的新文件
-    if (changes.length === 0 && currentBranch === MAIN_BRANCH) {
-      changes = await this.getUntrackedChanges();
+    // 检查未跟踪的新文件（git diff 不会包含未 add 的新增文件）
+    const untracked = await this.getUntrackedChanges();
+    for (const u of untracked) {
+      if (!changes.some(c => c.path === u.path)) {
+        changes.push(u);
+      }
     }
 
     const totalAdditions = changes.reduce((s, d) => s + d.additions, 0);
