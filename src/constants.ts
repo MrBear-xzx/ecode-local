@@ -7,3 +7,9 @@
 
 /** 本地同步目录（相对于工作区根目录，固定值） */
 export const LOCAL_SYNC_DIR = 'ecode';
+
+/** git 基线分支名 */
+export const MAIN_BRANCH = 'main';
+
+/** 单文件行级别 diff 最大输出行数（变更行 + 上下文行），超出则截断 */
+export const DIFF_MAX_LINES_PER_FILE = 30;
