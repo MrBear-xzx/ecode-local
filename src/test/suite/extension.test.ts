@@ -22,5 +22,6 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.setup'));
     assert.ok(commands.includes('ecode.menuPull'));
     assert.ok(commands.includes('ecode.menuPush'));
+    assert.ok(commands.includes('ecode.branchNew'));
   });
 });

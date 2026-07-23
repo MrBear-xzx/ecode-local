@@ -3,9 +3,9 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { AuthManager } from './auth/AuthManager';
 import { FileApi } from './api/FileApi';
-import { SyncStateStore } from './SyncStateStore';
-import { LOCAL_SYNC_DIR } from '../constants';
-import type { FileDiff, SyncResult } from './api/types';
+import { GitManager } from './GitManager';
+import { LOCAL_SYNC_DIR, MAIN_BRANCH } from '../constants';
+import type { FileDiff, FileLineDiff, PushSummary, SyncResult } from './api/types';
 
 interface TreeNode {
   id: string;
@@ -20,12 +20,70 @@ interface TreeNode {
  */
 export class EcodeSyncEngine {
   private fileApi: FileApi | null = null;
-  private stateStore: SyncStateStore | null = null;
+  private gitManager: GitManager | null = null;
 
   constructor(
     private authManager: AuthManager,
     private output: vscode.LogOutputChannel,
   ) {}
+
+  // ==================== 初始化 ====================
+
+  /**
+   * 首次启动初始化：检查 git 环境、初始化仓库、确保 main 分支存在
+   * 不执行拉取操作（拉取由上层 pullCode 负责，含 UI 交互）
+   * @returns true 表示初始化/就绪成功，false 表示用户需要手动处理
+   */
+  async initialize(): Promise<boolean> {
+    // 1. 检查 git 是否安装
+    if (!(await GitManager.isGitInstalled())) {
+      vscode.window.showErrorMessage(
+        'Ecode: 未检测到 Git，请先安装 Git 并添加到 PATH 环境变量',
+      );
+      this.output.error('Git not installed');
+      return false;
+    }
+
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!wsFolder) {
+      vscode.window.showErrorMessage('Ecode: 请先打开一个工作区文件夹');
+      return false;
+    }
+
+    this.gitManager = new GitManager(wsFolder.uri.fsPath);
+
+    // 2. 检查是否已 git init
+    const isRepo = await this.gitManager.isGitRepo();
+
+    if (!isRepo) {
+      // 3.1 未初始化：git init → 重命名为 main
+      try {
+        await this.gitManager.initRepo();
+        this.output.info('git init + branch main created');
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Ecode 初始化失败: ${msg}`);
+        this.output.error(`Init failed: ${err}`);
+        return false;
+      }
+    } else {
+      // 3.2 已初始化：确保 main 分支存在（master → main 自动迁移）
+      await this.gitManager.ensureMainBranch();
+      this.output.info('main branch ensured');
+    }
+
+    return true;
+  }
+
+  /** 检查 git 环境是否就绪 */
+  async isGitReady(): Promise<boolean> {
+    return this.gitManager !== null && (await this.gitManager.isGitRepo());
+  }
+
+  /** 获取 GitManager 实例 */
+  getGitManager(): GitManager | null {
+    return this.gitManager;
+  }
 
   private async getFileApi(): Promise<FileApi | null> {
     if (this.fileApi) { return this.fileApi; }
@@ -33,15 +91,6 @@ export class EcodeSyncEngine {
     if (!client) { return null; }
     this.fileApi = new FileApi(client);
     return this.fileApi;
-  }
-
-  private getStateStore(): SyncStateStore {
-    if (!this.stateStore) {
-      const wsFolder = vscode.workspace.workspaceFolders?.[0];
-      const manifestDir = wsFolder?.uri.fsPath ?? vscode.workspace.rootPath ?? '';
-      this.stateStore = new SyncStateStore(this.getLocalDir(), manifestDir);
-    }
-    return this.stateStore;
   }
 
   // ==================== PULL ====================
@@ -91,6 +140,9 @@ export class EcodeSyncEngine {
     const api = await this.getFileApi();
     if (!api) { throw new Error('Not connected'); }
 
+    // 一次性获取所有本地有变更的文件列表（供每个 downloadOne 复用，避免每文件调一次 git diff）
+    const dirtyFiles = await this.getDirtyFileSet();
+
     const localDir = this.getLocalDir();
     const result: SyncResult = { success: true, pulled: 0, pushed: 0, failed: 0, conflicts: [], errors: [] };
 
@@ -101,18 +153,32 @@ export class EcodeSyncEngine {
     // system 节点（工具包等）
     if (systemNode?.hasChild) {
       if (token?.isCancellationRequested) { return result; }
-      await this.pullType(api, systemNode.id, systemNode.name, localDir, result, onProgress, token);
+      await this.pullType(api, systemNode.id, systemNode.name, localDir, result, onProgress, token, dirtyFiles);
     }
 
     // 各分类
     for (const t of types) {
       if (token?.isCancellationRequested) { break; }
-      await this.pullType(api, t.id, t.name, localDir, result, onProgress, token);
+      await this.pullType(api, t.id, t.name, localDir, result, onProgress, token, dirtyFiles);
     }
 
     result.success = result.failed === 0;
     this.output.info(`pull done: ${result.pulled} ok, ${result.failed} failed, ${result.conflicts.length} conflicts`);
     return result;
+  }
+
+  /** 获取本地有变更的文件路径集合（用于 pull 冲突检测） */
+  private async getDirtyFileSet(): Promise<Set<string>> {
+    if (!this.gitManager) { return new Set(); }
+    try {
+      const [changed, untracked] = await Promise.all([
+        this.gitManager.getChangedFiles(),
+        this.gitManager.getUntrackedFiles(),
+      ]);
+      return new Set([...changed, ...untracked]);
+    } catch {
+      return new Set();
+    }
   }
 
   private async pullType(
@@ -123,23 +189,24 @@ export class EcodeSyncEngine {
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     const result = await this.fetchTree(api, '', typeId);
     if (!result || token?.isCancellationRequested) { return; }
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, typePath, localDir, syncResult, onProgress);
+      await this.downloadOne(file, typePath, localDir, syncResult, onProgress, dirtyFiles);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir, syncResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${typePath}/${folder.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir, syncResult, onProgress, token);
+      await this.pullType(api, sub.id, `${typePath}/${sub.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
   }
 
@@ -151,23 +218,24 @@ export class EcodeSyncEngine {
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
     token?: { isCancellationRequested: boolean },
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     const result = await this.fetchTree(api, folderId, '');
     if (!result || token?.isCancellationRequested) { return; }
 
     for (const file of result.childFile) {
       if (token?.isCancellationRequested) { return; }
-      await this.downloadOne(file, folderPath, localDir, syncResult, onProgress);
+      await this.downloadOne(file, folderPath, localDir, syncResult, onProgress, dirtyFiles);
     }
 
     for (const folder of result.childFolder) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir, syncResult, onProgress, token);
+      await this.pullFolder(api, folder.id, `${folderPath}/${folder.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
 
     for (const sub of result.typeList) {
       if (token?.isCancellationRequested) { return; }
-      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir, syncResult, onProgress, token);
+      await this.pullType(api, sub.id, `${folderPath}/${sub.name}`, localDir, syncResult, onProgress, token, dirtyFiles);
     }
   }
 
@@ -177,6 +245,7 @@ export class EcodeSyncEngine {
     localDir: string,
     syncResult: SyncResult,
     onProgress: (msg: string) => void,
+    dirtyFiles?: Set<string>,
   ): Promise<void> {
     onProgress(parentPath);
     const localPath = path.join(localDir, parentPath, file.name);
@@ -190,20 +259,10 @@ export class EcodeSyncEngine {
         throw new Error(content.msg || 'Failed to get file content');
       }
 
-      const store = this.getStateStore();
-
-      // 保护拉取：检查本地是否有未推送的修改
-      if (fs.existsSync(localPath)) {
-        let localHash: string;
-        try {
-          localHash = store.computeHash(localPath);
-        } catch {
-          localHash = '';
-        }
-
-        const storedEntry = store.getEntry(remotePath);
-        if (storedEntry && localHash && localHash !== storedEntry.hash) {
-          // 本地有未推送的修改 → 跳过，记录冲突
+      // 保护拉取：检查本地是否有未提交的修改（使用预计算的 dirtyFiles 集合）
+      if (dirtyFiles) {
+        const relPath = path.relative(this.getLocalDir(), localPath).replace(/\\/g, '/');
+        if (dirtyFiles.has(relPath)) {
           this.output.warn(`Conflict: ${remotePath} — local modifications would be overwritten`);
           syncResult.conflicts.push(remotePath);
           return;
@@ -214,9 +273,6 @@ export class EcodeSyncEngine {
       const dir = path.dirname(localPath);
       if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
       fs.writeFileSync(localPath, content.data, 'utf-8');
-
-      // 更新清单基线
-      store.updateEntry(remotePath, content.data, file.id);
 
       syncResult.pulled++;
     } catch (err: unknown) {
@@ -259,18 +315,114 @@ export class EcodeSyncEngine {
     };
   }
 
+  // ==================== 分支 ====================
+
+  /** 从 main 分支创建开发分支 */
+  async startDevBranch(branchName: string): Promise<void> {
+    if (!this.gitManager) {
+      throw new Error('Git 环境未初始化');
+    }
+    await this.gitManager.createBranch(branchName);
+    this.output.info(`Branch created: ${branchName}`);
+  }
+
   // ==================== PUSH ====================
 
   /**
-   * 获取本地变更状态（added / modified / deleted）
+   * 获取推送摘要（含行级别差异）
+   */
+  async getPushSummary(): Promise<PushSummary> {
+    if (!this.gitManager) {
+      throw new Error('Git 环境未初始化');
+    }
+
+    const currentBranch = await this.gitManager.getCurrentBranch();
+    const serverUrl = vscode.workspace.getConfiguration('ecode').get<string>('server.url') || '';
+
+    const changes = await this.getAllChanges();
+
+    const totalAdditions = changes.reduce((s, d) => s + d.additions, 0);
+    const totalDeletions = changes.reduce((s, d) => s + d.deletions, 0);
+
+    return {
+      baseBranch: MAIN_BRANCH,
+      currentBranch,
+      serverUrl,
+      changes,
+      totalAdditions,
+      totalDeletions,
+    };
+  }
+
+  /**
+   * 检查 main 分支是否有未提交更改（dirty 检查）
+   */
+  async isMainDirty(): Promise<boolean> {
+    if (!this.gitManager) { return false; }
+    const branch = await this.gitManager.getCurrentBranch();
+    if (branch !== MAIN_BRANCH) { return false; }
+    return this.gitManager.isDirty();
+  }
+
+  /**
+   * 获取本地变更状态（基于 main 与当前工作区的差异）
+   * 向后兼容 pushChanged()
    */
   async getStatus(): Promise<FileDiff[]> {
-    const store = this.getStateStore();
-    const diffs = store.diff();
+    if (!this.gitManager) {
+      // 降级：无 git 环境时返回空
+      return [];
+    }
+
+    const diffs: FileDiff[] = (await this.getAllChanges()).map(change => ({
+      path: change.path,
+      status: change.status,
+    }));
+
     const counts: Record<string, number> = { added: 0, modified: 0, deleted: 0 };
-    for (const d of diffs) { counts[d.status]++; }
+    for (const d of diffs) { counts[d.status] = (counts[d.status] || 0) + 1; }
     this.output.info(`Status: ${counts.added} added, ${counts.modified} modified, ${counts.deleted} deleted`);
     return diffs;
+  }
+
+  /** 合并已跟踪差异与真正的未跟踪文件。 */
+  private async getAllChanges(): Promise<FileLineDiff[]> {
+    if (!this.gitManager) { return []; }
+
+    const changes = await this.gitManager.getDiffSummary();
+    const untracked = await this.getUntrackedChanges();
+    for (const change of untracked) {
+      if (!changes.some(existing => existing.path === change.path)) {
+        changes.push(change);
+      }
+    }
+    return changes;
+  }
+
+  /** 检查本地是否有未跟踪的新增文件 */
+  private async getUntrackedChanges(): Promise<FileLineDiff[]> {
+    const localDir = this.getLocalDir();
+    const result: FileLineDiff[] = [];
+    if (!this.gitManager || !fs.existsSync(localDir)) { return result; }
+
+    const files = await this.gitManager.getUntrackedFiles();
+    for (const relPath of files) {
+      const absPath = path.join(localDir, relPath);
+      try {
+        const content = fs.readFileSync(absPath, 'utf-8');
+        const lineCount = content.length === 0 ? 0 : content.split(/\r?\n/).length;
+        result.push({
+          path: relPath,
+          status: 'added',
+          additions: lineCount,
+          deletions: 0,
+          hunks: [],
+          truncated: false,
+        });
+      } catch { /* skip unreadable files */ }
+    }
+
+    return result;
   }
 
   /**
@@ -281,7 +433,6 @@ export class EcodeSyncEngine {
     const api = await this.getFileApi();
     if (!api) { throw new Error('Not connected'); }
 
-    const store = this.getStateStore();
     const diffs = files ?? await this.getStatus();
     const toPush = diffs.filter(d => d.status === 'added' || d.status === 'modified');
 
@@ -301,7 +452,6 @@ export class EcodeSyncEngine {
 
       try {
         await api.push(localPath, remotePath);
-        store.updateEntry(diff.path);
         result.pushed++;
         this.output.info(`Pushed: ${diff.path}`);
       } catch (err: unknown) {
@@ -310,13 +460,6 @@ export class EcodeSyncEngine {
         result.errors.push(`${diff.path}: ${msg}`);
         this.output.error(`Push failed: ${diff.path} — ${msg}`);
       }
-    }
-
-    // 已删除的文件从清单中清理（服务器无删除 API）
-    const deleted = diffs.filter(d => d.status === 'deleted');
-    for (const d of deleted) {
-      store.removeEntry(d.path);
-      this.output.info(`Removed from manifest (deleted locally): ${d.path}`);
     }
 
     result.success = result.failed === 0;

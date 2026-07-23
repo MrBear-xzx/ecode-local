@@ -56,6 +56,43 @@ export interface FileDiff {
   remoteHash?: string;
 }
 
+/** 行级别变更行 */
+export interface LineChange {
+  kind: 'add' | 'remove' | 'context';
+  content: string;
+  oldLine?: number;
+  newLine?: number;
+}
+
+/** 差异块（一个 @@ hunk） */
+export interface LineDiffHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: LineChange[];
+}
+
+/** 单个文件的行级别差异 */
+export interface FileLineDiff {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  additions: number;
+  deletions: number;
+  hunks: LineDiffHunk[];
+  truncated: boolean;
+}
+
+/** 推送摘要 */
+export interface PushSummary {
+  baseBranch: string;
+  currentBranch: string;
+  serverUrl: string;
+  changes: FileLineDiff[];
+  totalAdditions: number;
+  totalDeletions: number;
+}
+
 /** Ecode 项目配置 */
 export interface EcodeConfig {
   server: {
