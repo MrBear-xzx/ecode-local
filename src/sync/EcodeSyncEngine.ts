@@ -171,8 +171,11 @@ export class EcodeSyncEngine {
   private async getDirtyFileSet(): Promise<Set<string>> {
     if (!this.gitManager) { return new Set(); }
     try {
-      const files = await this.gitManager.getChangedFiles();
-      return new Set(files);
+      const [changed, untracked] = await Promise.all([
+        this.gitManager.getChangedFiles(),
+        this.gitManager.getUntrackedFiles(),
+      ]);
+      return new Set([...changed, ...untracked]);
     } catch {
       return new Set();
     }
@@ -257,7 +260,7 @@ export class EcodeSyncEngine {
       }
 
       // 保护拉取：检查本地是否有未提交的修改（使用预计算的 dirtyFiles 集合）
-      if (fs.existsSync(localPath) && dirtyFiles) {
+      if (dirtyFiles) {
         const relPath = path.relative(this.getLocalDir(), localPath).replace(/\\/g, '/');
         if (dirtyFiles.has(relPath)) {
           this.output.warn(`Conflict: ${remotePath} — local modifications would be overwritten`);
@@ -336,15 +339,7 @@ export class EcodeSyncEngine {
     const currentBranch = await this.gitManager.getCurrentBranch();
     const serverUrl = vscode.workspace.getConfiguration('ecode').get<string>('server.url') || '';
 
-    let changes = await this.gitManager.getDiffSummary();
-
-    // 检查未跟踪的新文件（git diff 不会包含未 add 的新增文件）
-    const untracked = await this.getUntrackedChanges();
-    for (const u of untracked) {
-      if (!changes.some(c => c.path === u.path)) {
-        changes.push(u);
-      }
-    }
+    const changes = await this.getAllChanges();
 
     const totalAdditions = changes.reduce((s, d) => s + d.additions, 0);
     const totalDeletions = changes.reduce((s, d) => s + d.deletions, 0);
@@ -370,7 +365,7 @@ export class EcodeSyncEngine {
   }
 
   /**
-   * 获取本地变更状态（基于 git diff main..HEAD）
+   * 获取本地变更状态（基于 main 与当前工作区的差异）
    * 向后兼容 pushChanged()
    */
   async getStatus(): Promise<FileDiff[]> {
@@ -379,19 +374,10 @@ export class EcodeSyncEngine {
       return [];
     }
 
-    const files = await this.gitManager.getChangedFiles();
-    const diffs: FileDiff[] = files.map(f => ({
-      path: f,
-      status: 'modified' as const,
+    const diffs: FileDiff[] = (await this.getAllChanges()).map(change => ({
+      path: change.path,
+      status: change.status,
     }));
-
-    // 检查是否有未跟踪的新文件
-    const untracked = await this.getUntrackedChanges();
-    for (const u of untracked) {
-      if (!diffs.find(d => d.path === u.path)) {
-        diffs.push({ path: u.path, status: 'added' as const });
-      }
-    }
 
     const counts: Record<string, number> = { added: 0, modified: 0, deleted: 0 };
     for (const d of diffs) { counts[d.status] = (counts[d.status] || 0) + 1; }
@@ -399,37 +385,43 @@ export class EcodeSyncEngine {
     return diffs;
   }
 
+  /** 合并已跟踪差异与真正的未跟踪文件。 */
+  private async getAllChanges(): Promise<FileLineDiff[]> {
+    if (!this.gitManager) { return []; }
+
+    const changes = await this.gitManager.getDiffSummary();
+    const untracked = await this.getUntrackedChanges();
+    for (const change of untracked) {
+      if (!changes.some(existing => existing.path === change.path)) {
+        changes.push(change);
+      }
+    }
+    return changes;
+  }
+
   /** 检查本地是否有未跟踪的新增文件 */
   private async getUntrackedChanges(): Promise<FileLineDiff[]> {
     const localDir = this.getLocalDir();
     const result: FileLineDiff[] = [];
-    if (!fs.existsSync(localDir)) { return result; }
+    if (!this.gitManager || !fs.existsSync(localDir)) { return result; }
 
-    const walkDir = (dir: string, prefix: string) => {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          walkDir(path.join(dir, entry.name), `${prefix}${entry.name}/`);
-        } else if (entry.isFile()) {
-          const relPath = prefix + entry.name;
-          const absPath = path.join(localDir, relPath);
-          try {
-            const content = fs.readFileSync(absPath, 'utf-8');
-            const lineCount = content.split(/\r?\n/).length;
-            result.push({
-              path: relPath,
-              status: 'added',
-              additions: lineCount,
-              deletions: 0,
-              hunks: [],
-              truncated: false,
-            });
-          } catch { /* skip binary */ }
-        }
-      }
-    };
+    const files = await this.gitManager.getUntrackedFiles();
+    for (const relPath of files) {
+      const absPath = path.join(localDir, relPath);
+      try {
+        const content = fs.readFileSync(absPath, 'utf-8');
+        const lineCount = content.length === 0 ? 0 : content.split(/\r?\n/).length;
+        result.push({
+          path: relPath,
+          status: 'added',
+          additions: lineCount,
+          deletions: 0,
+          hunks: [],
+          truncated: false,
+        });
+      } catch { /* skip unreadable files */ }
+    }
 
-    walkDir(localDir, '');
     return result;
   }
 

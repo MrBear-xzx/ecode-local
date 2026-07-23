@@ -162,17 +162,33 @@ export class GitManager {
     return !status.isClean();
   }
 
+  /** 获取 ecode/ 下未跟踪的文件，路径相对于 ecode/。 */
+  async getUntrackedFiles(): Promise<string[]> {
+    const status = await this.git.status();
+    const prefix = `${LOCAL_SYNC_DIR}/`;
+
+    return status.not_added
+      .map(file => file.replace(/\\/g, '/'))
+      .filter(file => file.startsWith(prefix))
+      .map(file => file.slice(prefix.length))
+      .filter(Boolean);
+  }
+
   // ==================== 差异比较 ====================
 
   /**
-   * 获取当前分支相对于 main 的变更文件列表
-   * 等价于: git diff main..HEAD --name-only -- ecode/
+   * 获取当前工作区相对于 main 的已跟踪变更文件列表。
+   * 同时包含分支提交、暂存区和未暂存修改，路径相对于 ecode/。
    */
   async getChangedFiles(): Promise<string[]> {
     try {
-      const output = await this.git.diff([
-        `${MAIN_BRANCH}..HEAD`,
+      const output = await this.git.raw([
+        '-c',
+        'core.quotePath=false',
+        'diff',
+        MAIN_BRANCH,
         '--name-only',
+        `--relative=${LOCAL_SYNC_DIR}`,
         '--',
         LOCAL_SYNC_DIR,
       ]);
@@ -185,13 +201,17 @@ export class GitManager {
   }
 
   /**
-   * 获取当前分支相对于 main 的原始 unified diff
-   * 等价于: git diff main..HEAD -- ecode/
+   * 获取当前工作区相对于 main 的原始 unified diff。
+   * 同时包含分支提交、暂存区和未暂存修改，路径相对于 ecode/。
    */
   async getRawDiff(): Promise<string> {
     try {
-      return await this.git.diff([
-        `${MAIN_BRANCH}..HEAD`,
+      return await this.git.raw([
+        '-c',
+        'core.quotePath=false',
+        'diff',
+        MAIN_BRANCH,
+        `--relative=${LOCAL_SYNC_DIR}`,
         '--',
         LOCAL_SYNC_DIR,
       ]);
@@ -215,13 +235,13 @@ export class GitManager {
   /**
    * 提交 ecode/ 目录的所有更改
    */
-  async commit(message: string): Promise<void> {
+  async commit(message: string): Promise<boolean> {
     await this.git.add([`${LOCAL_SYNC_DIR}/`, '.gitignore']);
-    try {
-      await this.git.commit(message);
-    } catch {
-      // nothing to commit 时忽略
-    }
+    const status = await this.git.status();
+    if (status.staged.length === 0) { return false; }
+
+    await this.git.commit(message);
+    return true;
   }
 
   // ==================== unified diff 解析器 ====================
@@ -313,49 +333,37 @@ export class GitManager {
     let totalLines = 0;
     let truncated = false;
 
+    const recordHunk = (start: number, end: number) => {
+      const parsed = this.parseHunkLines(lines, start, end, () => true);
+      if (!parsed) { return; }
+
+      for (const line of parsed.lines) {
+        if (line.kind === 'add') { additions++; }
+        else if (line.kind === 'remove') { deletions++; }
+      }
+
+      const remaining = Math.max(0, DIFF_MAX_LINES_PER_FILE - totalLines);
+      const visibleLines = parsed.lines.slice(0, remaining);
+      if (visibleLines.length < parsed.lines.length) { truncated = true; }
+      if (visibleLines.length > 0) {
+        hunks.push({ ...parsed, lines: visibleLines });
+        totalLines += visibleLines.length;
+      }
+    };
+
     let hunkStart = -1;
     for (let i = 0; i < lines.length; i++) {
       const hunkHeaderMatch = lines[i].match(/^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@/);
       if (hunkHeaderMatch) {
         // 先处理上一个 hunk
-        if (hunkStart >= 0 && !truncated) {
-          const hunkLines = this.parseHunkLines(lines, hunkStart, i, () => {
-            if (totalLines >= DIFF_MAX_LINES_PER_FILE) {
-              truncated = true;
-            }
-            return !truncated;
-          });
-          if (hunkLines) {
-            for (const l of hunkLines.lines) {
-              if (l.kind === 'add') { additions++; }
-              else if (l.kind === 'remove') { deletions++; }
-              totalLines++;
-            }
-            hunks.push(hunkLines);
-          }
-        }
+        if (hunkStart >= 0) { recordHunk(hunkStart, i); }
 
         hunkStart = i;
       }
     }
 
     // 处理最后一个 hunk
-    if (hunkStart >= 0 && !truncated) {
-      const hunkLines = this.parseHunkLines(lines, hunkStart, lines.length, () => {
-        if (totalLines >= DIFF_MAX_LINES_PER_FILE) {
-          truncated = true;
-        }
-        return !truncated;
-      });
-      if (hunkLines) {
-        for (const l of hunkLines.lines) {
-          if (l.kind === 'add') { additions++; }
-          else if (l.kind === 'remove') { deletions++; }
-          totalLines++;
-        }
-        hunks.push(hunkLines);
-      }
-    }
+    if (hunkStart >= 0) { recordHunk(hunkStart, lines.length); }
 
     return {
       path: filePath,

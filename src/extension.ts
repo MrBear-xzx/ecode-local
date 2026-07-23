@@ -299,8 +299,8 @@ async function pullCode(source: 'auto' | 'setup' | 'manual'): Promise<void> {
     if (result.pulled > 0) {
       const gitMgr = syncEngine.getGitManager();
       if (gitMgr) {
-        await gitMgr.commit('sync: 从服务器拉取代码');
-        output.info('Pull committed to git');
+        const committed = await gitMgr.commit('sync: 从服务器拉取代码');
+        output.info(committed ? 'Pull committed to git' : 'Pull produced no git changes');
       }
     }
 
