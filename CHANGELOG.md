@@ -1,5 +1,23 @@
 # 更新日志
 
+## 0.2.3 - 2026-07-24
+
+### 修复
+
+- 修复启用统一认证时，登录接口刷新 `ecology_JSessionid` 后扩展仍使用旧会话，导致登录成功但读取远端文件树提示“登录信息超时”的问题。
+- 登录过程中会持续接收 RSA 和登录响应返回的最新 session Cookie，并将最终认证会话保存到 VS Code `SecretStorage`。
+
+### 兼容性
+
+- 支持 VS Code 1.93.0 或更高版本，以及泛微 E-cology 9 Ecode。
+- 其他 E-cology 或 Ecode 版本尚未验证。
+
+### 验证
+
+- `node_modules/.bin/tsc --noEmit`
+- `npm test`：61 项通过
+- `npm run package`
+
 ## 0.2.2 - 2026-07-24
 
 ### 新增

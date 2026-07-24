@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 安全本地开发扩展：手动拉取、差异预览、冲突保护与选择性推送",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {

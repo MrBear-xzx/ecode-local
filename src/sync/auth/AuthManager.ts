@@ -116,7 +116,7 @@ export class AuthManager {
       this.sessionIdentity = '';
 
       const initResponse = await fetchWithTimeout(`${normalizedUrl}/`);
-      const sessionCookie = extractSessionCookie(initResponse.headers.get('set-cookie'));
+      let sessionCookie = extractSessionCookie(initResponse.headers.get('set-cookie'));
 
       const rsaResponse = await fetchWithTimeout(`${normalizedUrl}/rsa/weaver.rsa.GetRsaInfo`, {
         headers: sessionCookie ? { Cookie: sessionCookie } : {},
@@ -124,6 +124,7 @@ export class AuthManager {
       if (!rsaResponse.ok) {
         return { success: false, message: `获取 RSA 公钥失败: HTTP ${rsaResponse.status}` };
       }
+      sessionCookie = extractSessionCookie(rsaResponse.headers.get('set-cookie')) ?? sessionCookie;
 
       const rsaInfo = await rsaResponse.json() as RsaInfo;
       const params = new URLSearchParams({
@@ -149,6 +150,7 @@ export class AuthManager {
       if (!response.ok) {
         return { success: false, message: `登录失败: HTTP ${response.status}` };
       }
+      sessionCookie = extractSessionCookie(response.headers.get('set-cookie')) ?? sessionCookie;
 
       const result = await response.json() as { msgcode?: string; msg?: string };
       if (result.msgcode !== '0') {
