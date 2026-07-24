@@ -1,369 +1,535 @@
+import * as fs from 'fs';
 import * as vscode from 'vscode';
+import { resolveSafeLocalPath, resolveSafeSyncRoot } from './domain/paths';
+import { serverFingerprint } from './domain/text';
+import type { ConnectionProfile, SyncChange, SyncOperationResult } from './domain/types';
+import { WorkspaceStore } from './storage/WorkspaceStore';
+import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
 import { AuthManager } from './sync/auth/AuthManager';
-import { EcodeSyncEngine } from './sync/EcodeSyncEngine';
-import { SetupPanel } from './ui/webview/SetupPanel';
-import { MAIN_BRANCH } from './constants';
-import type { PushSummary } from './sync/api/types';
+import { EcodeTreeProvider } from './ui/EcodeTreeProvider';
+import {
+  BASELINE_SCHEME,
+  EMPTY_SCHEME,
+  REMOTE_SCHEME,
+  VirtualDocumentProvider,
+  virtualUri,
+} from './ui/VirtualDocumentProvider';
 
-let authManager: AuthManager;
-let syncEngine: EcodeSyncEngine;
-let statusBar: vscode.StatusBarItem;
 let output: vscode.LogOutputChannel;
 
-export async function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel('Ecode', { log: true });
-  output.info('Ecode extension activating...');
+  const store = new WorkspaceStore(context);
+  const auth = new AuthManager(context);
+  const service = new EcodeSyncService(store, auth, output);
+  const tree = new EcodeTreeProvider();
+  const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  const controller = new ExtensionController(context, store, auth, service, tree, status);
 
-  authManager = new AuthManager(context);
-  syncEngine = new EcodeSyncEngine(authManager, output);
+  context.subscriptions.push(
+    output,
+    status,
+    controller,
+    vscode.window.registerTreeDataProvider('ecode.workspace', tree),
+    vscode.workspace.registerTextDocumentContentProvider(
+      BASELINE_SCHEME,
+      new VirtualDocumentProvider(BASELINE_SCHEME, service),
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      REMOTE_SCHEME,
+      new VirtualDocumentProvider(REMOTE_SCHEME, service),
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      EMPTY_SCHEME,
+      new VirtualDocumentProvider(EMPTY_SCHEME, service),
+    ),
+    ...controller.registerCommands(),
+  );
 
-  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  context.subscriptions.push(statusBar);
+  await controller.initialize();
+  output.info('Ecode Local 0.2.0 activated without network access');
+}
 
-  registerCommands(context);
-  await updateStatusBar();
+export function deactivate(): void {
+  // 没有后台任务或自动同步需要清理。
+}
 
-  // 自动登录（不影响 git 初始化，初始化在 Setup 完成后触发）
-  const loginReady = await authManager.isLoginReady();
-  if (loginReady) {
-    const client = await authManager.autoLogin();
-    if (client) {
-      output.info('Auto-login succeeded');
-      // 已有凭据且登录成功 → 执行 git 初始化
-      await syncEngine.initialize();
-    }
-  } else {
-    output.info('No credentials — opening setup');
-    vscode.commands.executeCommand('ecode.setup');
+class ExtensionController {
+  private busy = false;
+  private changes: SyncChange[] = [];
+  private localWatcher: vscode.Disposable | undefined;
+  private localRefreshTimer: NodeJS.Timeout | undefined;
+
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly store: WorkspaceStore,
+    private readonly auth: AuthManager,
+    private readonly service: EcodeSyncService,
+    private readonly tree: EcodeTreeProvider,
+    private readonly status: vscode.StatusBarItem,
+  ) {}
+
+  registerCommands(): vscode.Disposable[] {
+    return [
+      vscode.commands.registerCommand('ecode.configure', () => this.configure()),
+      vscode.commands.registerCommand('ecode.setup', () => this.configure()),
+      vscode.commands.registerCommand('ecode.pull', () => this.pull()),
+      vscode.commands.registerCommand('ecode.refreshChanges', () => this.refreshChanges()),
+      vscode.commands.registerCommand('ecode.pushSelected', () => this.pushSelected()),
+      vscode.commands.registerCommand('ecode.openDiff', (change: SyncChange) => this.openDiff(change)),
+      vscode.commands.registerCommand('ecode.resolveConflict', (change: SyncChange) =>
+        this.resolveConflict(change)),
+    ];
   }
 
-  output.info('Ecode extension activated');
-}
-
-export function deactivate() {
-  // 当前版本无自动任务需要清理
-}
-
-// ==================== 命令注册 ====================
-
-function registerCommands(context: vscode.ExtensionContext) {
-
-  // ============ 拉取 ============
-
-  context.subscriptions.push(vscode.commands.registerCommand('ecode.menuPull', async () => {
-    const client = await authManager.autoLogin();
-    if (!client) {
-      vscode.commands.executeCommand('ecode.setup');
-    } else {
-      pullCode('manual').catch(err => output.error(`Pull failed: ${err}`));
+  async initialize(): Promise<void> {
+    const profile = await this.store.getProfile();
+    if (profile) {
+      try {
+        this.changes = await this.service.refreshLocalChanges();
+      } catch (error: unknown) {
+        output.warn(`Initial local scan failed: ${errorMessage(error)}`);
+      }
+      this.configureLocalWatcher(profile);
     }
-  }));
+    await this.updateViews();
+  }
 
-  // ============ 推送 ============
+  dispose(): void {
+    this.localWatcher?.dispose();
+    this.localWatcher = undefined;
+    if (this.localRefreshTimer) {
+      clearTimeout(this.localRefreshTimer);
+      this.localRefreshTimer = undefined;
+    }
+  }
 
-  context.subscriptions.push(vscode.commands.registerCommand('ecode.menuPush', async () => {
-    const client = await authManager.autoLogin();
-    if (!client) {
-      vscode.window.showErrorMessage('Ecode: 未连接，请先配置服务器');
-      vscode.commands.executeCommand('ecode.setup');
+  private async configure(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    const workspaceFolder = await selectWorkspaceFolder();
+    if (!workspaceFolder) {
       return;
     }
 
-    // Git 环境检查
-    if (!(await syncEngine.isGitReady())) {
-      vscode.window.showErrorMessage('Ecode: 工作区不是 Git 仓库，请先使用 git init 初始化');
+    const previous = await this.store.getProfile();
+    const serverUrl = await vscode.window.showInputBox({
+      title: '配置 Ecode 连接 (1/4)',
+      prompt: 'E-cology 服务器地址',
+      value: previous?.serverUrl ?? 'http://localhost:8099',
+      ignoreFocusOut: true,
+      validateInput: validateServerUrl,
+    });
+    if (!serverUrl) {
       return;
     }
 
-    // main 分支 dirty 检查
-    if (await syncEngine.isMainDirty()) {
-      vscode.window.showErrorMessage(
-        'Ecode: main 分支存在未提交的更改，请先提交或切换到开发分支再推送',
-      );
+    const username = await vscode.window.showInputBox({
+      title: '配置 Ecode 连接 (2/4)',
+      prompt: '登录用户名',
+      value: previous?.username ?? 'sysadmin',
+      ignoreFocusOut: true,
+      validateInput: value => value.trim() ? undefined : '用户名不能为空',
+    });
+    if (!username) {
       return;
     }
 
-    // 获取行级别差异摘要
-    let summary: PushSummary;
-    try {
-      summary = await syncEngine.getPushSummary();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`Ecode: 获取变更失败 — ${msg}`);
+    const password = await vscode.window.showInputBox({
+      title: '配置 Ecode 连接 (3/4)',
+      prompt: '密码将保存到 VS Code SecretStorage',
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: value => value ? undefined : '密码不能为空',
+    });
+    if (!password) {
       return;
     }
 
-    // 获取变更文件列表用于推送
-    const status = await syncEngine.getStatus();
-    const changes = status.filter(d => d.status === 'added' || d.status === 'modified');
-
-    if (changes.length === 0) {
-      vscode.window.showInformationMessage('Ecode: 没有需要推送的更改');
+    const localDirectory = await vscode.window.showInputBox({
+      title: '配置 Ecode 连接 (4/4)',
+      prompt: '工作区内的本地同步子目录',
+      value: previous?.localDirectory ?? 'ecode',
+      ignoreFocusOut: true,
+      validateInput: value => validateLocalDirectory(workspaceFolder.uri.fsPath, value),
+    });
+    if (!localDirectory) {
       return;
     }
 
-    // 构建行差异摘要
-    const summaryText = buildPushSummary(summary);
-    // 写入完整差异到 Output 面板
-    output.info(buildFullDiff(summary));
+    const profile: ConnectionProfile = {
+      version: 2,
+      workspaceFolder: workspaceFolder.uri.fsPath,
+      serverUrl: serverUrl.trim().replace(/\/+$/, ''),
+      username: username.trim(),
+      localDirectory: localDirectory.trim(),
+    };
 
-    const choice = await vscode.window.showInformationMessage(
-      summaryText,
+    await this.runExclusive('正在测试连接...', async () => {
+      const result = await this.auth.connect(profile, password);
+      if (!result.success) {
+        throw new Error(result.message);
+      }
+      await this.store.saveProfile(profile);
+      this.changes = await this.service.refreshLocalChanges();
+      this.configureLocalWatcher(profile);
+      vscode.window.showInformationMessage('Ecode: 连接配置已保存，请手动执行拉取');
+    });
+  }
+
+  private async pull(): Promise<void> {
+    const profile = await this.requireProfile();
+    if (!profile) {
+      return;
+    }
+    const syncRoot = resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory);
+    const choice = await vscode.window.showWarningMessage(
+      `将全量检查远端源码并安全拉取到 ${syncRoot}。本地修改不会被覆盖。`,
+      { modal: true },
+      '开始拉取',
+    );
+    if (choice !== '开始拉取') {
+      return;
+    }
+
+    await this.runExclusive('正在拉取...', async () => {
+      const result = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'Ecode: 全量拉取',
+        cancellable: true,
+      }, (progress, token) => this.service.pull(
+        message => progress.report({ message }),
+        token,
+      ));
+      this.changes = this.service.getLastPlan()?.changes ?? [];
+      showResult('拉取', result);
+    });
+  }
+
+  private async refreshChanges(): Promise<void> {
+    await this.runExclusive('正在扫描本地变更...', async () => {
+      this.changes = await this.service.refreshLocalChanges();
+    });
+  }
+
+  private async pushSelected(): Promise<void> {
+    const profile = await this.requireProfile();
+    if (!profile) {
+      return;
+    }
+    this.changes = await this.service.refreshLocalChanges();
+    const pushable = this.changes.filter(change =>
+      change.status === 'localAdded' || change.status === 'localModified',
+    );
+    if (pushable.length === 0) {
+      vscode.window.showInformationMessage('Ecode: 没有可推送的新增或修改文件');
+      await this.updateViews();
+      return;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      pushable.map(change => ({
+        label: change.path,
+        description: change.status === 'localAdded' ? '新增' : '修改',
+        change,
+        picked: true,
+      })),
+      {
+        title: '选择本次推送的文件',
+        canPickMany: true,
+        ignoreFocusOut: true,
+        placeHolder: '推送前会重新核对远端内容',
+      },
+    );
+    if (!selected?.length) {
+      return;
+    }
+
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认向 ${profile.serverUrl} 推送 ${selected.length} 个文件？`
+        + ' JavaScript 将使用与 Ecode 在线编辑器一致的 Babel 7.5.5 配置生成编译内容。',
       { modal: true },
       '确认推送',
     );
-    if (choice !== '确认推送') { return; }
+    if (confirmation !== '确认推送') {
+      return;
+    }
 
-    // 执行推送
-    statusBar.text = '$(sync~spin) 推送中...';
-    try {
+    await this.runExclusive('正在推送...', async () => {
       const result = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
-        title: 'Ecode: 推送代码...',
-        cancellable: false,
-      }, async () => {
-        return syncEngine.pushChanged(changes);
-      });
+        title: 'Ecode: 安全推送',
+        cancellable: true,
+      }, (progress, token) => this.service.pushSelected(
+        selected.map(item => item.change.path),
+        message => progress.report({ message }),
+        token,
+      ));
+      this.changes = this.service.getLastPlan()?.changes ?? [];
+      showResult('推送', result);
+    });
+  }
 
-      if (result.success) {
-        vscode.window.showInformationMessage(`推送完成: ${result.pushed} 个文件`);
-      } else {
-        vscode.window.showWarningMessage(
-          `推送完成: ${result.pushed} 成功, ${result.failed} 失败. 查看 Ecode Output 面板`,
+  private async openDiff(change: SyncChange): Promise<void> {
+    if (!change?.path || change.status === 'unsupported') {
+      return;
+    }
+    const profile = await this.requireProfile();
+    if (!profile) {
+      return;
+    }
+    const local = vscode.Uri.file(
+      resolveSafeLocalPath(
+        resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory),
+        change.path,
+      ),
+    );
+    const baseline = virtualUri(BASELINE_SCHEME, change.path);
+    const remote = virtualUri(REMOTE_SCHEME, change.path);
+    const empty = virtualUri(EMPTY_SCHEME, change.path);
+    const localOrEmpty = fs.existsSync(local.fsPath) ? local : empty;
+
+    if (change.status === 'conflict') {
+      const comparison = await vscode.window.showQuickPick([
+        { label: '本地 ↔ 最新远端', left: localOrEmpty, right: remote },
+        { label: '基线 ↔ 本地', left: baseline, right: localOrEmpty },
+        { label: '基线 ↔ 最新远端', left: baseline, right: remote },
+      ], { title: `查看冲突: ${change.path}` });
+      if (comparison) {
+        await vscode.commands.executeCommand(
+          'vscode.diff',
+          comparison.left,
+          comparison.right,
+          `${change.path} — ${comparison.label}`,
         );
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`推送失败: ${msg}`);
-      output.error(`Push failed: ${err}`);
-    }
-    updateStatusBar();
-  }));
-
-  // ============ 新建开发分支 ============
-
-  context.subscriptions.push(vscode.commands.registerCommand('ecode.branchNew', async () => {
-    if (!(await syncEngine.isGitReady())) {
-      vscode.window.showErrorMessage('Ecode: 工作区不是 Git 仓库');
       return;
     }
 
-    const branchName = await vscode.window.showInputBox({
-      prompt: '请输入新分支名称',
-      placeHolder: 'feature-xxx',
-      validateInput: (value) => {
-        if (!value.trim()) { return '分支名不能为空'; }
-        if (/[\s~^:?*[\\\]]/.test(value)) { return '分支名包含非法字符'; }
-        return null;
+    const right = change.status === 'remoteModified' || change.status === 'remoteAdded'
+      ? remote
+      : change.status === 'localDeleted' || change.status === 'remoteDeleted'
+        ? empty
+        : localOrEmpty;
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      baseline,
+      right,
+      `${change.path} — Ecode 差异`,
+    );
+  }
+
+  private async resolveConflict(change: SyncChange): Promise<void> {
+    if (change?.status !== 'conflict') {
+      return;
+    }
+    if (change.conflictReason === 'remoteDeletedLocalModified') {
+      vscode.window.showWarningMessage(
+        'Ecode 0.2.0 只检测远端删除，不执行删除冲突解决。请在服务器恢复文件或另存本地代码。',
+      );
+      return;
+    }
+    const action = await vscode.window.showQuickPick([
+      {
+        label: '接受最新远端',
+        description: '先备份本地内容，再以远端内容替换本地',
+        value: 'acceptRemote' as const,
       },
-    });
-
-    if (!branchName) { return; }
-
-    try {
-      await syncEngine.startDevBranch(branchName.trim());
-      vscode.window.showInformationMessage(`已创建并切换到分支: ${branchName}`);
-      updateStatusBar();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`创建分支失败: ${msg}`);
-    }
-  }));
-
-  // ============ Setup ============
-
-  context.subscriptions.push(vscode.commands.registerCommand('ecode.setup', async () => {
-    const result = await SetupPanel.show(context, authManager);
-    if (result?.configured) {
-      // Setup 完成 → 先执行 git 初始化 → 再拉取代码
-      await syncEngine.initialize();
-      pullCode('setup').catch(err => output.error(`Pull after setup failed: ${err}`));
-    }
-  }));
-
-  output.info('Commands registered');
-}
-
-// ==================== 推送摘要构建 ====================
-
-function buildPushSummary(summary: PushSummary): string {
-  const MAX_FILES = 5;
-  const lines: string[] = [];
-
-  lines.push(`推送至 ${summary.serverUrl}`);
-  lines.push(`基线: ${summary.baseBranch}  |  当前: ${summary.currentBranch}`);
-  lines.push(`${summary.changes.length} 个文件 (+${summary.totalAdditions} -${summary.totalDeletions})`);
-  lines.push('');
-
-  const shown = summary.changes.slice(0, MAX_FILES);
-  const remaining = summary.changes.length - MAX_FILES;
-
-  for (const diff of shown) {
-    const prefix = diff.status === 'added' ? '+' : diff.status === 'deleted' ? '-' : '~';
-
-    if (diff.status === 'added') {
-      lines.push(`${prefix} ${diff.path} (新文件, ${diff.additions} 行)`);
-    } else if (diff.status === 'deleted') {
-      lines.push(`${prefix} ${diff.path} (已删除, ${diff.deletions} 行)`);
-    } else {
-      lines.push(`${prefix} ${diff.path} (+${diff.additions} -${diff.deletions})`);
-    }
-
-    // 展示 hunks（最多 2 个 hunk，每个 hunk 最多 8 行）
-    if (diff.hunks.length > 0) {
-      const maxHunks = 2;
-      for (const hunk of diff.hunks.slice(0, maxHunks)) {
-        lines.push(`  @@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
-        const maxLines = 8;
-        for (const line of hunk.lines.slice(0, maxLines)) {
-          const sign = line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' ';
-          lines.push(`  ${sign} ${line.content.trimEnd()}`);
-        }
-        if (hunk.lines.length > maxLines) {
-          lines.push(`  ... (${hunk.lines.length - maxLines} 行省略)`);
-        }
-      }
-      if (diff.hunks.length > maxHunks) {
-        lines.push(`  ... 共 ${diff.hunks.length} 个变更块`);
-      }
-    }
-
-    if (diff.truncated) {
-      lines.push('  [差异已截断，完整内容见 Ecode Output 面板]');
-    }
-    lines.push('');
-  }
-
-  if (remaining > 0) {
-    lines.push(`... 还有 ${remaining} 个文件`);
-  }
-
-  return lines.join('\n');
-}
-
-function buildFullDiff(summary: PushSummary): string {
-  const lines: string[] = ['=== 完整变更差异 ==='];
-  for (const diff of summary.changes) {
-    if (diff.hunks.length === 0) {
-      lines.push(`\n${diff.status === 'added' ? '+' : '-'} ${diff.path} (${diff.additions}/${diff.deletions})`);
-      continue;
-    }
-    lines.push(`\n--- ${diff.path} ---`);
-    for (const hunk of diff.hunks) {
-      lines.push(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
-      for (const line of hunk.lines) {
-        const sign = line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' ';
-        lines.push(`${sign} ${line.content.trimEnd()}`);
-      }
-    }
-  }
-  return lines.join('\n');
-}
-
-// ==================== 拉取 ====================
-
-async function pullCode(source: 'auto' | 'setup' | 'manual'): Promise<void> {
-  try {
-    const client = await authManager.autoLogin();
-    if (!client) {
-      output.warn(`pullCode(${source}): autoLogin failed`);
+      {
+        label: '已手工合并，保留当前本地',
+        description: '将最新远端设为新基线，当前本地内容仍待推送',
+        value: 'markMerged' as const,
+      },
+    ], { title: `解决冲突: ${change.path}` });
+    if (!action) {
       return;
     }
 
-    if (source !== 'manual') {
-      const choice = await vscode.window.showInformationMessage(
-        `从 Ecode 服务器拉取代码到 ${syncEngine.getLocalDir()}？`,
-        '开始下载',
-      );
-      if (choice !== '开始下载') { return; }
+    const confirmed = await vscode.window.showWarningMessage(
+      action.value === 'acceptRemote'
+        ? '本地文件将被最新远端内容替换，替换前会保存恢复副本。'
+        : '仅在已经检查并手工合并远端修改后使用此操作。',
+      { modal: true },
+      '确认',
+    );
+    if (confirmed !== '确认') {
+      return;
     }
 
-    statusBar.text = '$(sync~spin) 下载中...';
-    statusBar.tooltip = '正在从服务器拉取代码';
-
-    const result = await vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: 'Ecode: 全量下载代码...',
-      cancellable: true,
-    }, async (progress, token) => {
-      const r = await syncEngine.pull(
-        msg => progress.report({ message: msg }),
-        token,
-      );
-      return r;
+    await this.runExclusive('正在解决冲突...', async () => {
+      if (action.value === 'acceptRemote') {
+        const recovery = await this.service.acceptRemote(change.path);
+        vscode.window.showInformationMessage(
+          recovery ? `已接受远端；本地恢复副本: ${recovery}` : '已接受最新远端内容',
+        );
+      } else {
+        await this.service.markMerged(change.path);
+        vscode.window.showInformationMessage('已更新基线，当前本地内容可重新检查后推送');
+      }
+      this.changes = this.service.getLastPlan()?.changes ?? [];
     });
+  }
 
-    updateStatusBar();
+  private async requireProfile(): Promise<ConnectionProfile | undefined> {
+    const profile = await this.store.getProfile();
+    if (!profile) {
+      vscode.window.showErrorMessage('Ecode: 请先配置连接');
+      await this.configure();
+      return this.store.getProfile();
+    }
+    return profile;
+  }
 
-    // 拉取成功且有文件更新 → 提交到 git
-    if (result.pulled > 0) {
-      const gitMgr = syncEngine.getGitManager();
-      if (gitMgr) {
-        const committed = await gitMgr.commit('sync: 从服务器拉取代码');
-        output.info(committed ? 'Pull committed to git' : 'Pull produced no git changes');
+  private async runExclusive(label: string, operation: () => Promise<void>): Promise<void> {
+    if (this.busy) {
+      vscode.window.showWarningMessage('Ecode: 已有同步操作正在执行');
+      return;
+    }
+    this.busy = true;
+    await this.updateViews(label);
+    try {
+      await operation();
+    } catch (error: unknown) {
+      if (error instanceof SyncCancelledError) {
+        vscode.window.showInformationMessage('Ecode: 操作已取消');
+      } else {
+        const message = errorMessage(error);
+        output.error(message);
+        vscode.window.showErrorMessage(`Ecode: ${message}`);
+      }
+    } finally {
+      this.busy = false;
+      await this.updateViews();
+    }
+  }
+
+  private configureLocalWatcher(profile: ConnectionProfile): void {
+    this.localWatcher?.dispose();
+    this.localWatcher = undefined;
+    if (this.localRefreshTimer) {
+      clearTimeout(this.localRefreshTimer);
+      this.localRefreshTimer = undefined;
+    }
+
+    const syncRoot = resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory);
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(syncRoot, '**/*'),
+    );
+    const schedule = (): void => this.scheduleLocalRefresh();
+    this.localWatcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidCreate(schedule),
+      watcher.onDidChange(schedule),
+      watcher.onDidDelete(schedule),
+    );
+  }
+
+  private scheduleLocalRefresh(): void {
+    if (this.localRefreshTimer) {
+      clearTimeout(this.localRefreshTimer);
+    }
+    this.localRefreshTimer = setTimeout(() => {
+      this.localRefreshTimer = undefined;
+      void this.refreshLocalChangesAutomatically();
+    }, 5000);
+  }
+
+  private async refreshLocalChangesAutomatically(): Promise<void> {
+    if (this.busy) {
+      this.scheduleLocalRefresh();
+      return;
+    }
+    this.busy = true;
+    try {
+      this.changes = await this.service.refreshLocalChanges();
+      await this.updateViews();
+    } catch (error: unknown) {
+      output.warn(`Automatic local scan failed: ${errorMessage(error)}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async updateViews(busyMessage?: string): Promise<void> {
+    const profile = await this.store.getProfile();
+    let lastSync: string | undefined;
+    if (profile) {
+      try {
+        const syncRoot = resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory);
+        const manifest = await this.store.loadManifest(
+          serverFingerprint(profile.serverUrl, profile.username),
+          syncRoot,
+        );
+        if (Date.parse(manifest.updatedAt) > 0) {
+          lastSync = new Date(manifest.updatedAt).toLocaleString();
+        }
+      } catch (error: unknown) {
+        output.warn(`Unable to read last sync state: ${errorMessage(error)}`);
       }
     }
-
-    if (result.conflicts.length > 0) {
-      output.warn(`${result.conflicts.length} files skipped due to local modifications`);
-    }
-
-    if (result.failed === 0) {
-      vscode.window.showInformationMessage(`下载完成: ${result.pulled} 个文件 → ${syncEngine.getLocalDir()}`);
-    } else if (result.pulled > 0) {
-      vscode.window.showWarningMessage(`${result.pulled} 成功, ${result.failed} 失败. 查看 Ecode Output 面板`);
-    } else {
-      vscode.window.showErrorMessage(`下载失败: ${result.failed} 个文件. 查看 Ecode Output 面板`);
-    }
-  } catch (err: unknown) {
-    vscode.window.showErrorMessage(`代码拉取失败: ${err instanceof Error ? err.message : String(err)}`);
-    output.error(`pullCode failed: ${err}`);
-    updateStatusBar();
+    this.tree.update(profile, this.changes, busyMessage, lastSync);
+    const count = this.changes.filter(change => change.status !== 'clean').length;
+    this.status.text = busyMessage
+      ? '$(sync~spin) Ecode'
+      : count > 0 ? `$(cloud) Ecode ${count}` : '$(cloud) Ecode';
+    this.status.tooltip = profile
+      ? `${profile.serverUrl}\n${count} 项变更或警告`
+      : '尚未配置 Ecode 连接';
+    this.status.command = profile ? 'ecode.refreshChanges' : 'ecode.configure';
+    this.status.show();
   }
 }
 
-// ==================== 状态栏 ====================
+async function selectWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) {
+    vscode.window.showErrorMessage('Ecode: 请先打开一个工作区文件夹');
+    return undefined;
+  }
+  if (folders.length === 1) {
+    return folders[0];
+  }
+  const selected = await vscode.window.showQuickPick(
+    folders.map(folder => ({ label: folder.name, description: folder.uri.fsPath, folder })),
+    { title: '选择 Ecode 同步所在的工作区文件夹' },
+  );
+  return selected?.folder;
+}
 
-async function updateStatusBar() {
-  let branchName = '';
+function validateServerUrl(value: string): string | undefined {
   try {
-    const gitMgr = syncEngine.getGitManager();
-    if (gitMgr) {
-      branchName = await gitMgr.getCurrentBranch();
-    }
+    const parsed = new URL(value);
+    return ['http:', 'https:'].includes(parsed.protocol)
+      ? undefined
+      : '仅支持 http:// 或 https:// 地址';
   } catch {
-    // 忽略
+    return '请输入有效的服务器地址';
   }
-
-  statusBar.text = branchName
-    ? `$(cloud) Ecode [${branchName}]`
-    : '$(cloud) Ecode';
-  statusBar.tooltip = buildHoverMenu(branchName);
-  statusBar.command = 'ecode.setup';
-  statusBar.show();
 }
 
-function buildHoverMenu(branchName: string): vscode.MarkdownString {
-  const parts: string[] = [
-    '**⚙ [基础配置](command:ecode.setup)**  &nbsp; 服务器、账号密码',
-    '',
-    '**⎇ [新建开发分支](command:ecode.branchNew)**  &nbsp; 从 main 创建新分支',
-  ];
-
-  if (branchName) {
-    parts.push(`当前分支: **${escapeMarkdown(branchName)}**`);
+function validateLocalDirectory(workspaceFolder: string, value: string): string | undefined {
+  try {
+    resolveSafeSyncRoot(workspaceFolder, value);
+    return undefined;
+  } catch (error: unknown) {
+    return errorMessage(error);
   }
-
-  parts.push('');
-  parts.push('**⬇ [拉取代码](command:ecode.menuPull)**  &nbsp; 全量下载到本地');
-  parts.push('**⬆ [推送代码](command:ecode.menuPush)**  &nbsp; 对比 main 并推送变更');
-
-  const m = new vscode.MarkdownString(parts.join('\n'), true);
-  m.isTrusted = true;
-  return m;
 }
 
-/** 转义 Markdown 特殊字符，防止在 isTrusted MarkdownString 中注入 */
-function escapeMarkdown(text: string): string {
-  return text.replace(/([\\[\](){}*_~`#+\-.!|><])/g, '\\$1');
+function showResult(operation: string, result: SyncOperationResult): void {
+  const summary = `${operation}完成：${result.pulled} 拉取，${result.pushed} 推送，`
+    + `${result.conflicts} 冲突，${result.unsupported} 不支持，${result.failed} 失败`;
+  if (result.errors.length > 0) {
+    output.error(result.errors.join('\n'));
+  }
+  if (!result.success) {
+    vscode.window.showWarningMessage(`${summary}。详情见 Ecode Output`);
+  } else {
+    vscode.window.showInformationMessage(summary);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
