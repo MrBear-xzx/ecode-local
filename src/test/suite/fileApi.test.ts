@@ -147,6 +147,26 @@ suite('File API', () => {
     assert.strictEqual(file?.get('content'), '');
     assert.strictEqual(file?.get('compiledContent'), '');
   });
+
+  test('deletes a file using the Ecode file identifier', async () => {
+    const api = new FileApi(new EcodeApiClient(baseUrl));
+
+    const result = await api.deleteFile('file-1');
+    const form = posted.get('/api/cloudstore/ecode/logicalDeleteFile');
+
+    assert.strictEqual(result.status, true);
+    assert.strictEqual(form?.get('id'), 'file-1');
+  });
+
+  test('deletes a folder using the Ecode folder identifier', async () => {
+    const api = new FileApi(new EcodeApiClient(baseUrl));
+
+    const result = await api.deleteFolder('folder-1');
+    const form = posted.get('/api/cloudstore/ecode/logicalDeleteFolder');
+
+    assert.strictEqual(result.status, true);
+    assert.strictEqual(form?.get('folderId'), 'folder-1');
+  });
 });
 
 async function collectForm(request: http.IncomingMessage): Promise<URLSearchParams> {

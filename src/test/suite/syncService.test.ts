@@ -28,6 +28,7 @@ suite('Ecode sync service', () => {
   let duplicateFolders: boolean;
   let expiredTreeResponses: number;
   let rootTreeRequests: number;
+  let folderDeleteRequests: number;
 
   setup(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-service-'));
@@ -38,6 +39,7 @@ suite('Ecode sync service', () => {
     duplicateFolders = false;
     expiredTreeResponses = 0;
     rootTreeRequests = 0;
+    folderDeleteRequests = 0;
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
       const url = new URL(request.url ?? '/', 'http://localhost');
@@ -147,6 +149,56 @@ suite('Ecode sync service', () => {
             name: form.get('name') ?? '',
             parentId: form.get('parentId') || form.get('typeId') || '',
           });
+          response.end(JSON.stringify({ api_status: true, status: true }));
+        });
+        return;
+      }
+      if (
+        url.pathname === '/api/cloudstore/ecode/logicalDeleteFile'
+        && request.method === 'POST'
+      ) {
+        const chunks: Buffer[] = [];
+        request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+          const index = files.findIndex(file => file.id === form.get('id'));
+          if (index < 0) {
+            response.end(JSON.stringify({ api_status: false, msg: 'file not found' }));
+            return;
+          }
+          files.splice(index, 1);
+          response.end(JSON.stringify({ api_status: true, status: true }));
+        });
+        return;
+      }
+      if (
+        url.pathname === '/api/cloudstore/ecode/logicalDeleteFolder'
+        && request.method === 'POST'
+      ) {
+        const chunks: Buffer[] = [];
+        request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+          const folderId = form.get('folderId');
+          const index = folders.findIndex(folder => folder.id === folderId);
+          if (index < 0) {
+            response.end(JSON.stringify({ api_status: false, msg: 'folder not found' }));
+            return;
+          }
+          const descendantIds = new Set<string>([folderId ?? '']);
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const folder of folders) {
+              if (descendantIds.has(folder.parentId) && !descendantIds.has(folder.id)) {
+                descendantIds.add(folder.id);
+                changed = true;
+              }
+            }
+          }
+          folders = folders.filter(folder => !descendantIds.has(folder.id));
+          files = files.filter(file => !file.parentId || !descendantIds.has(file.parentId));
+          folderDeleteRequests++;
           response.end(JSON.stringify({ api_status: true, status: true }));
         });
         return;
@@ -296,6 +348,20 @@ suite('Ecode sync service', () => {
     );
   });
 
+  test('does not delete a tracked local file when its remote content cannot be read', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    files[0].status = 500;
+    const localPath = path.join(root, 'ecode', 'Type', 'a.js');
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.failed, 1);
+    assert.strictEqual(result.deletedLocal, 0);
+    assert.strictEqual(fs.readFileSync(localPath, 'utf8'), 'const remote = true;\n');
+    assert.ok(harness.store.manifest.files['Type/a.js']);
+  });
+
   test('pushes a selected new file and records the verified remote result', async () => {
     const localPath = path.join(root, 'ecode', 'Type', 'new.js');
     fs.mkdirSync(path.dirname(localPath), { recursive: true });
@@ -313,6 +379,151 @@ suite('Ecode sync service', () => {
     assert.match(files.find(file => file.name === 'new.js')?.compiledContent ?? '', /var created/);
     assert.ok(harness.store.manifest.files['Type/new.js']);
     assert.strictEqual(rootTreeRequests, 1);
+  });
+
+  test('applies a remote deletion to an unchanged local file with a recovery copy', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    files.splice(0, 1);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedLocal, 1);
+    assert.ok(!fs.existsSync(path.join(root, 'ecode', 'Type', 'a.js')));
+    assert.ok(!harness.store.manifest.files['Type/a.js']);
+    assert.deepStrictEqual(harness.store.recoveries, [{
+      path: 'Type/a.js',
+      content: 'const remote = true;\n',
+    }]);
+  });
+
+  test('removes an empty local directory after the matching remote folder is deleted', async () => {
+    folders = [{ id: 'folder-10', name: 'Deleted', parentId: 'type-1' }];
+    files = [
+      {
+        id: 'file-10',
+        name: 'first.js',
+        content: 'const first = true;\n',
+        parentId: 'folder-10',
+      },
+      {
+        id: 'file-11',
+        name: 'second.js',
+        content: 'const second = true;\n',
+        parentId: 'folder-10',
+      },
+    ];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localFolder = path.join(root, 'ecode', 'Type', 'Deleted');
+    assert.ok(fs.existsSync(localFolder));
+    folders = [];
+    files = [];
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedLocal, 2);
+    assert.ok(!fs.existsSync(localFolder));
+  });
+
+  test('pushes a local deletion only when the remote content still matches the baseline', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    fs.unlinkSync(path.join(root, 'ecode', 'Type', 'a.js'));
+
+    const result = await harness.service.pushSelected(['Type/a.js'], () => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedRemote, 1);
+    assert.ok(!files.some(file => file.id === 'file-1'));
+    assert.ok(!harness.store.manifest.files['Type/a.js']);
+  });
+
+  test('deletes the matching remote folder when a selected local directory was removed', async () => {
+    folders = [{ id: 'folder-10', name: 'Deleted', parentId: 'type-1' }];
+    files = [
+      {
+        id: 'file-10',
+        name: 'first.js',
+        content: 'const first = true;\n',
+        parentId: 'folder-10',
+      },
+      {
+        id: 'file-11',
+        name: 'second.js',
+        content: 'const second = true;\n',
+        parentId: 'folder-10',
+      },
+    ];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localFolder = path.join(root, 'ecode', 'Type', 'Deleted');
+    fs.rmSync(localFolder, { recursive: true });
+
+    const result = await harness.service.pushSelected(
+      ['Type/Deleted/first.js', 'Type/Deleted/second.js'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedRemote, 2);
+    assert.strictEqual(folderDeleteRequests, 1);
+    assert.ok(!folders.some(folder => folder.id === 'folder-10'));
+    assert.ok(!files.some(file => file.parentId === 'folder-10'));
+    assert.ok(!harness.store.manifest.files['Type/Deleted/first.js']);
+    assert.ok(!harness.store.manifest.files['Type/Deleted/second.js']);
+  });
+
+  test('keeps a remote folder when it contains a file outside the selected local deletion', async () => {
+    folders = [{ id: 'folder-10', name: 'Deleted', parentId: 'type-1' }];
+    files = [
+      {
+        id: 'file-10',
+        name: 'tracked.js',
+        content: 'const tracked = true;\n',
+        parentId: 'folder-10',
+      },
+    ];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localFolder = path.join(root, 'ecode', 'Type', 'Deleted');
+    fs.rmSync(localFolder, { recursive: true });
+    files.push({
+      id: 'file-11',
+      name: 'remote-only.js',
+      content: 'const remoteOnly = true;\n',
+      parentId: 'folder-10',
+    });
+
+    const result = await harness.service.pushSelected(
+      ['Type/Deleted/tracked.js'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedRemote, 1);
+    assert.strictEqual(folderDeleteRequests, 0);
+    assert.ok(folders.some(folder => folder.id === 'folder-10'));
+    assert.ok(files.some(file => file.id === 'file-11'));
+  });
+
+  test('keeps a local deletion when the remote file changed and records a conflict', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    fs.unlinkSync(path.join(root, 'ecode', 'Type', 'a.js'));
+    files[0].content = 'const changedRemotely = true;\n';
+
+    const result = await harness.service.pushSelected(['Type/a.js'], () => undefined);
+
+    assert.strictEqual(result.deletedRemote, 0);
+    assert.strictEqual(result.conflicts, 1);
+    assert.strictEqual(files[0].content, 'const changedRemotely = true;\n');
+    assert.strictEqual(
+      harness.store.conflicts.get('Type/a.js')?.reason,
+      'localDeletedRemoteModified',
+    );
   });
 
   test('creates nested directories without rebuilding the complete remote index', async () => {
@@ -423,6 +634,63 @@ suite('Ecode sync service', () => {
     assert.ok(!harness.store.conflicts.has('Type/a.js'));
   });
 
+  test('turns a modified local file into an addition when keeping a remote deletion conflict', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'a.js');
+    fs.writeFileSync(localPath, 'const localChanged = true;\n');
+    files.splice(0, 1);
+    await harness.service.pull(() => undefined);
+
+    await harness.service.keepLocalAfterRemoteDeletion('Type/a.js');
+
+    assert.strictEqual(fs.readFileSync(localPath, 'utf8'), 'const localChanged = true;\n');
+    assert.ok(!harness.store.manifest.files['Type/a.js']);
+    assert.strictEqual(
+      (await harness.service.refreshLocalChanges())[0]?.status,
+      'localAdded',
+    );
+  });
+
+  test('backs up a modified local file before accepting a remote deletion conflict', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'a.js');
+    fs.writeFileSync(localPath, 'const localChanged = true;\n');
+    files.splice(0, 1);
+    await harness.service.pull(() => undefined);
+
+    const recovery = await harness.service.acceptRemoteDeletion('Type/a.js');
+
+    assert.strictEqual(recovery, 'recovery.txt');
+    assert.ok(!fs.existsSync(localPath));
+    assert.ok(!harness.store.manifest.files['Type/a.js']);
+    assert.deepStrictEqual(harness.store.recoveries.at(-1), {
+      path: 'Type/a.js',
+      content: 'const localChanged = true;\n',
+    });
+  });
+
+  test('reverts added, modified, and deleted local changes to the baseline', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const directory = path.join(root, 'ecode', 'Type');
+    const baselinePath = path.join(directory, 'a.js');
+    const addedPath = path.join(directory, 'added.js');
+
+    fs.writeFileSync(baselinePath, 'const localChanged = true;\n');
+    await harness.service.revertLocalChange('Type/a.js');
+    assert.strictEqual(fs.readFileSync(baselinePath, 'utf8'), 'const remote = true;\n');
+
+    fs.unlinkSync(baselinePath);
+    await harness.service.revertLocalChange('Type/a.js');
+    assert.strictEqual(fs.readFileSync(baselinePath, 'utf8'), 'const remote = true;\n');
+
+    fs.writeFileSync(addedPath, 'const added = true;\n');
+    await harness.service.revertLocalChange('Type/added.js');
+    assert.ok(!fs.existsSync(addedPath));
+  });
+
   test('honors cancellation before traversing a remote category', async () => {
     const harness = createHarness(root, baseUrl);
 
@@ -474,6 +742,7 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
 class MemoryStore {
   manifest: SyncManifest;
   conflicts = new Map<string, StoredConflict>();
+  recoveries: Array<{ path: string; content: string }> = [];
   private snapshots = new Map<string, string>();
 
   constructor(private profile: ConnectionProfile) {
@@ -526,7 +795,8 @@ class MemoryStore {
     this.conflicts.delete(remotePath);
   }
 
-  async saveRecovery(): Promise<string> {
+  async saveRecovery(remotePath: string, content: string): Promise<string> {
+    this.recoveries.push({ path: remotePath, content });
     return 'recovery.txt';
   }
 }

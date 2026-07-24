@@ -34,6 +34,8 @@ interface CancellationLike {
 
 interface RemoteScan {
   files: Map<string, RemoteFileContent>;
+  presentPaths: Set<string>;
+  presentDirectories: Set<string>;
   unsupported: SyncChange[];
   errors: string[];
 }
@@ -51,6 +53,11 @@ interface RemoteIndex {
 }
 
 interface RemoteTreeTask extends RemoteDirectoryEntry {}
+
+interface RemoteFolderDeletion {
+  directory: RemoteDirectoryEntry;
+  filePaths: string[];
+}
 
 export class EcodeSyncService {
   private lastPlan: SyncPlan | undefined;
@@ -109,10 +116,12 @@ export class EcodeSyncService {
       local.files,
       remote.files,
       [...remote.unsupported, ...local.unsupported],
+      remote.presentPaths,
     );
     const result = emptyResult();
     result.failed += remote.errors.length;
     result.errors.push(...remote.errors);
+    const deletedLocalParents = new Set<string>();
 
     for (const item of plan.changes) {
       if (item.status === 'conflict') {
@@ -127,6 +136,8 @@ export class EcodeSyncService {
             detectedAt: new Date().toISOString(),
             reason: item.conflictReason,
           });
+        } else if (item.conflictReason === 'remoteDeletedLocalModified') {
+          await this.saveRemoteDeletionConflict(context.manifest, item.path);
         }
       } else if (item.status === 'unsupported') {
         result.unsupported++;
@@ -138,16 +149,40 @@ export class EcodeSyncService {
       this.throwIfCancelled(cancellation);
       applied++;
       onProgress(`正在应用远端变更 ${applied}/${plan.executable.length}: ${item.path}`);
-      const remoteFile = remote.files.get(item.path);
-      if (!remoteFile) {
-        continue;
-      }
       if (local.unsupported.some(change => change.path === item.path)) {
         continue;
       }
       try {
         const localPath = resolveSafeLocalPath(context.syncRoot, item.path);
         assertNoSymlinkSegments(context.syncRoot, localPath);
+        if (item.status === 'remoteDeleted') {
+          const baseline = context.manifest.files[item.path];
+          if (!baseline) {
+            continue;
+          }
+          const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
+          if (currentLocal && currentLocal.hash !== baseline.baselineHash) {
+            await this.saveRemoteDeletionConflict(context.manifest, item.path);
+            result.conflicts++;
+            continue;
+          }
+          if (currentLocal) {
+            const recovery = await this.store.saveRecovery(item.path, currentLocal.content);
+            await fs.unlink(localPath);
+            deletedLocalParents.add(path.posix.dirname(item.path));
+            this.output.info(`Remote deletion applied: ${item.path}; recovery: ${recovery}`);
+            result.deletedLocal++;
+          }
+          delete context.manifest.files[item.path];
+          await this.store.deleteConflict(item.path);
+          await this.store.saveManifest(context.manifest);
+          continue;
+        }
+
+        const remoteFile = remote.files.get(item.path);
+        if (!remoteFile) {
+          continue;
+        }
         const localFile = local.files.get(item.path);
         const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
         if (currentLocal?.hash !== localFile?.hash) {
@@ -170,6 +205,12 @@ export class EcodeSyncService {
       }
     }
 
+    await this.pruneRemoteDeletedLocalDirectories(
+      context.syncRoot,
+      deletedLocalParents,
+      remote.presentDirectories,
+    );
+
     for (const [remotePath, remoteFile] of remote.files) {
       const change = plan.changes.find(item => item.path === remotePath);
       if (change?.status === 'clean') {
@@ -190,6 +231,7 @@ export class EcodeSyncService {
       refreshedLocal.files,
       remote.files,
       [...remote.unsupported, ...refreshedLocal.unsupported],
+      remote.presentPaths,
     );
     result.success = result.failed === 0;
     return result;
@@ -215,6 +257,20 @@ export class EcodeSyncService {
         message => onProgress(`准备推送：${message}`),
       ),
     );
+    const folderDeletions = await this.findSelectedRemoteFolderDeletions(
+      context.syncRoot,
+      selectedPaths,
+      localChanges,
+      remoteIndex,
+    );
+    const folderDeletionByFile = new Map<string, RemoteFolderDeletion>();
+    for (const deletion of folderDeletions) {
+      for (const filePath of deletion.filePaths) {
+        folderDeletionByFile.set(filePath, deletion);
+      }
+    }
+    const handledFolderDeletions = new Set<string>();
+    const handledDeletedFiles = new Set<string>();
 
     for (let selectedIndex = 0; selectedIndex < selectedPaths.length; selectedIndex++) {
       const remotePath = selectedPaths[selectedIndex];
@@ -223,13 +279,123 @@ export class EcodeSyncService {
 
       const change = localChanges.get(remotePath);
       const localFile = local.files.get(remotePath);
-      if (!change || !localFile || !['localAdded', 'localModified'].includes(change.status)) {
+      if (
+        !change
+        || !['localAdded', 'localModified', 'localDeleted'].includes(change.status)
+      ) {
         result.failed++;
         result.errors.push(`${remotePath}: 文件不再是可推送状态`);
         continue;
       }
 
       try {
+        if (change.status === 'localDeleted') {
+          if (handledDeletedFiles.has(remotePath)) {
+            continue;
+          }
+          const folderDeletion = folderDeletionByFile.get(remotePath);
+          if (
+            folderDeletion
+            && !handledFolderDeletions.has(folderDeletion.directory.path)
+          ) {
+            handledFolderDeletions.add(folderDeletion.directory.path);
+            const folderDeleted = await this.withAuthentication(context.profile, api =>
+              this.deleteRemoteFolderIfUnchanged(
+                api,
+                context.syncRoot,
+                context.manifest,
+                remoteIndex,
+                folderDeletion,
+              ),
+            );
+            if (folderDeleted) {
+              for (const deletedPath of folderDeletion.filePaths) {
+                handledDeletedFiles.add(deletedPath);
+                delete context.manifest.files[deletedPath];
+                await this.store.deleteConflict(deletedPath);
+              }
+              await this.store.saveManifest(context.manifest);
+              result.deletedRemote += folderDeletion.filePaths.length;
+              continue;
+            }
+          }
+          await this.withAuthentication(context.profile, async api => {
+            const baseline = context.manifest.files[remotePath];
+            if (!baseline) {
+              throw new Error('未找到本地删除对应的同步基线');
+            }
+            const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
+            assertNoSymlinkSegments(context.syncRoot, localPath);
+            if (await this.readLocalFileIfExists(localPath, remotePath)) {
+              throw new Error('本地文件已重新出现，请刷新变更后重试');
+            }
+
+            const existing = remoteIndex.files.get(remotePath);
+            if (existing) {
+              if (existing.id !== baseline.remoteId) {
+                await this.recordPushConflict(api, remotePath, existing, 'remotePathCollision');
+                result.conflicts++;
+                pushConflicts.set(remotePath, {
+                  path: remotePath,
+                  status: 'conflict',
+                  remoteId: existing.id,
+                  baselineHash: baseline.baselineHash,
+                  conflictReason: 'remotePathCollision',
+                  message: '远端同路径文件标识已变化',
+                });
+                return;
+              }
+
+              const latest = await this.readRemote(api, existing);
+              if (latest.hash !== baseline.baselineHash) {
+                await this.store.saveConflict(toStoredConflict(latest, 'localDeletedRemoteModified'));
+                this.lastRemoteFiles.set(remotePath, latest);
+                result.conflicts++;
+                pushConflicts.set(remotePath, {
+                  path: remotePath,
+                  status: 'conflict',
+                  remoteId: existing.id,
+                  baselineHash: baseline.baselineHash,
+                  remoteHash: latest.hash,
+                  conflictReason: 'localDeletedRemoteModified',
+                  message: '本地已删除，同时远端已修改',
+                });
+                return;
+              }
+
+              if (await this.readLocalFileIfExists(localPath, remotePath)) {
+                throw new Error('本地文件在远端删除前重新出现，请刷新变更后重试');
+              }
+              const deletion = await api.deleteFile(existing.id);
+              this.requireMutationSuccess(deletion, `删除远端文件失败: ${remotePath}`);
+              const parentPath = path.posix.dirname(remotePath);
+              const parent = remoteIndex.directories.get(parentPath);
+              if (!parent) {
+                throw new Error(`删除后无法验证远端父目录: ${parentPath}`);
+              }
+              const remaining = await this.findRemoteFileInDirectory(
+                api,
+                parent,
+                path.posix.basename(remotePath),
+                remotePath,
+              );
+              if (remaining) {
+                throw new Error('删除后远端文件仍然存在');
+              }
+              remoteIndex.files.delete(remotePath);
+            }
+
+            delete context.manifest.files[remotePath];
+            await this.store.deleteConflict(remotePath);
+            await this.store.saveManifest(context.manifest);
+            result.deletedRemote++;
+          });
+          continue;
+        }
+
+        if (!localFile) {
+          throw new Error('本地文件不存在');
+        }
         const compiledContent = this.compiler.compile(remotePath, localFile.content);
         await this.withAuthentication(context.profile, async api => {
           let existing = remoteIndex.files.get(remotePath);
@@ -464,6 +630,83 @@ export class EcodeSyncService {
     await this.refreshLocalChanges();
   }
 
+  async revertLocalChange(remotePath: string): Promise<string | undefined> {
+    const context = await this.loadContext();
+    const local = await this.scanLocalFiles(context.syncRoot);
+    const change = buildLocalChanges(context.manifest, local.files)
+      .find(item => item.path === remotePath);
+    if (!change || !['localAdded', 'localModified', 'localDeleted'].includes(change.status)) {
+      throw new Error('该文件已不再是可回退的本地变更');
+    }
+
+    const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
+    assertNoSymlinkSegments(context.syncRoot, localPath);
+    const scannedLocal = local.files.get(remotePath);
+    const currentLocal = await this.readLocalFileIfExists(localPath, remotePath);
+    if (currentLocal?.hash !== scannedLocal?.hash) {
+      throw new Error('本地文件在回退前再次变化，请刷新后重试');
+    }
+
+    let recovery: string | undefined;
+    if (change.status === 'localAdded') {
+      if (!currentLocal) {
+        throw new Error('本地新增文件已不存在');
+      }
+      recovery = await this.store.saveRecovery(remotePath, currentLocal.content);
+      await fs.unlink(localPath);
+    } else {
+      const baseline = context.manifest.files[remotePath];
+      if (!baseline) {
+        throw new Error('未找到可用于回退的同步基线');
+      }
+      const baselineContent = await this.store.readSnapshot(baseline.snapshotKey);
+      if (hashText(baselineContent) !== baseline.baselineHash) {
+        throw new Error('同步基线快照校验失败，已停止回退');
+      }
+      if (currentLocal) {
+        recovery = await this.store.saveRecovery(remotePath, currentLocal.content);
+      }
+      await fs.mkdir(path.dirname(localPath), { recursive: true });
+      await fs.writeFile(localPath, baselineContent, 'utf8');
+    }
+
+    await this.refreshLocalChanges();
+    return recovery;
+  }
+
+  async acceptRemoteDeletion(remotePath: string): Promise<string | undefined> {
+    const context = await this.loadContext();
+    await this.requireRemoteDeletionConflict(context.profile, remotePath);
+    const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
+    assertNoSymlinkSegments(context.syncRoot, localPath);
+    const currentLocal = await this.readLocalFileIfExists(localPath, remotePath);
+    const recovery = currentLocal
+      ? await this.store.saveRecovery(remotePath, currentLocal.content)
+      : undefined;
+    if (currentLocal) {
+      await fs.unlink(localPath);
+    }
+    delete context.manifest.files[remotePath];
+    await this.store.deleteConflict(remotePath);
+    await this.store.saveManifest(context.manifest);
+    await this.refreshLocalChanges();
+    return recovery;
+  }
+
+  async keepLocalAfterRemoteDeletion(remotePath: string): Promise<void> {
+    const context = await this.loadContext();
+    await this.requireRemoteDeletionConflict(context.profile, remotePath);
+    const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
+    assertNoSymlinkSegments(context.syncRoot, localPath);
+    if (!await this.readLocalFileIfExists(localPath, remotePath)) {
+      throw new Error('本地文件已不存在，无法保留并重新创建远端文件');
+    }
+    delete context.manifest.files[remotePath];
+    await this.store.deleteConflict(remotePath);
+    await this.store.saveManifest(context.manifest);
+    await this.refreshLocalChanges();
+  }
+
   private async loadContext(): Promise<{
     profile: ConnectionProfile;
     syncRoot: string;
@@ -484,7 +727,8 @@ export class EcodeSyncService {
     onProgress: (message: string) => void,
     cancellation?: CancellationLike,
   ): Promise<RemoteScan> {
-    const entries = (await this.listRemoteIndex(api, cancellation, onProgress)).files;
+    const index = await this.listRemoteIndex(api, cancellation, onProgress);
+    const entries = index.files;
     const unsupported: SyncChange[] = [];
     const errors: string[] = [];
     const total = entries.size;
@@ -521,6 +765,8 @@ export class EcodeSyncService {
           .filter((item): item is RemoteFileContent => Boolean(item))
           .map(item => [item.entry.path, item]),
       ),
+      presentPaths: new Set(entries.keys()),
+      presentDirectories: new Set(index.directories.keys()),
       unsupported,
       errors,
     };
@@ -712,6 +958,117 @@ export class EcodeSyncService {
     return index;
   }
 
+  private async findSelectedRemoteFolderDeletions(
+    syncRoot: string,
+    selectedPaths: string[],
+    localChanges: Map<string, SyncChange>,
+    remoteIndex: RemoteIndex,
+  ): Promise<RemoteFolderDeletion[]> {
+    const selectedDeleted = new Set(
+      selectedPaths.filter(remotePath =>
+        localChanges.get(remotePath)?.status === 'localDeleted',
+      ),
+    );
+    const candidates = [...remoteIndex.directories.values()]
+      .filter(directory => directory.kind === 'folder')
+      .sort((left, right) =>
+        left.path.split('/').length - right.path.split('/').length,
+      );
+    const deletions: RemoteFolderDeletion[] = [];
+
+    for (const directory of candidates) {
+      if (deletions.some(item => isDescendantPath(directory.path, item.directory.path))) {
+        continue;
+      }
+      const filePaths = [...remoteIndex.files.keys()].filter(remotePath =>
+        isDescendantPath(remotePath, directory.path),
+      );
+      if (
+        filePaths.length === 0
+        || filePaths.some(remotePath => !selectedDeleted.has(remotePath))
+      ) {
+        continue;
+      }
+      const localPath = resolveSafeLocalPath(syncRoot, directory.path);
+      assertNoSymlinkSegments(syncRoot, localPath);
+      if (!await this.isLocalPathMissing(localPath)) {
+        continue;
+      }
+      deletions.push({ directory, filePaths });
+    }
+    return deletions;
+  }
+
+  private async deleteRemoteFolderIfUnchanged(
+    api: FileApi,
+    syncRoot: string,
+    manifest: SyncManifest,
+    remoteIndex: RemoteIndex,
+    deletion: RemoteFolderDeletion,
+  ): Promise<boolean> {
+    for (const remotePath of deletion.filePaths) {
+      const baseline = manifest.files[remotePath];
+      const existing = remoteIndex.files.get(remotePath);
+      if (!baseline || !existing || existing.id !== baseline.remoteId) {
+        return false;
+      }
+      const latest = await this.readRemote(api, existing);
+      if (latest.hash !== baseline.baselineHash) {
+        return false;
+      }
+    }
+
+    const localPath = resolveSafeLocalPath(syncRoot, deletion.directory.path);
+    assertNoSymlinkSegments(syncRoot, localPath);
+    if (!await this.isLocalPathMissing(localPath)) {
+      return false;
+    }
+
+    const response = await api.deleteFolder(deletion.directory.id);
+    this.requireMutationSuccess(
+      response,
+      `删除远端目录失败: ${deletion.directory.path}`,
+    );
+    const parentPath = path.posix.dirname(deletion.directory.path);
+    const parent = remoteIndex.directories.get(parentPath);
+    if (!parent) {
+      throw new Error(`删除后无法验证远端父目录: ${parentPath}`);
+    }
+    const remaining = await this.findRemoteFoldersInDirectory(
+      api,
+      parent,
+      path.posix.basename(deletion.directory.path),
+    );
+    if (remaining.length > 0) {
+      throw new Error(`删除后远端目录仍然存在: ${deletion.directory.path}`);
+    }
+
+    for (const remotePath of deletion.filePaths) {
+      remoteIndex.files.delete(remotePath);
+    }
+    for (const remotePath of [...remoteIndex.directories.keys()]) {
+      if (
+        remotePath === deletion.directory.path
+        || isDescendantPath(remotePath, deletion.directory.path)
+      ) {
+        remoteIndex.directories.delete(remotePath);
+      }
+    }
+    return true;
+  }
+
+  private async isLocalPathMissing(localPath: string): Promise<boolean> {
+    try {
+      await fs.lstat(localPath);
+      return false;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return true;
+      }
+      throw error;
+    }
+  }
+
   private listDirectory(
     api: FileApi,
     directory: RemoteDirectoryEntry,
@@ -774,6 +1131,35 @@ export class EcodeSyncService {
       throw new Error('当前版本不支持二进制或非 UTF-8 文件');
     }
     return { entry, content, hash: hashText(content) };
+  }
+
+  private async pruneRemoteDeletedLocalDirectories(
+    syncRoot: string,
+    parentPaths: Set<string>,
+    presentDirectories: Set<string>,
+  ): Promise<void> {
+    const candidates = [...parentPaths].sort((left, right) =>
+      right.split('/').length - left.split('/').length,
+    );
+    for (const initialPath of candidates) {
+      let remotePath = initialPath;
+      while (remotePath !== '.' && !presentDirectories.has(remotePath)) {
+        const localPath = resolveSafeLocalPath(syncRoot, remotePath);
+        assertNoSymlinkSegments(syncRoot, localPath);
+        try {
+          await fs.rmdir(localPath);
+        } catch (error: unknown) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') {
+            throw error;
+          }
+          if (code !== 'ENOENT') {
+            break;
+          }
+        }
+        remotePath = path.posix.dirname(remotePath);
+      }
+    }
   }
 
   private async scanLocalFiles(syncRoot: string): Promise<{
@@ -878,6 +1264,25 @@ export class EcodeSyncService {
     this.output.warn(`Push blocked by conflict: ${remotePath}`);
   }
 
+  private async saveRemoteDeletionConflict(
+    manifest: SyncManifest,
+    remotePath: string,
+  ): Promise<void> {
+    const baseline = manifest.files[remotePath];
+    if (!baseline) {
+      return;
+    }
+    await this.store.saveConflict({
+      path: remotePath,
+      remoteId: baseline.remoteId,
+      remoteContent: '',
+      remoteHash: '',
+      detectedAt: new Date().toISOString(),
+      reason: 'remoteDeletedLocalModified',
+      remoteDeleted: true,
+    });
+  }
+
   private async mergeStoredConflicts(
     manifest: SyncManifest,
     localFiles: Map<string, LocalFileState>,
@@ -887,6 +1292,22 @@ export class EcodeSyncService {
     for (const conflict of await this.store.listConflicts()) {
       const baseline = manifest.files[conflict.path];
       const local = localFiles.get(conflict.path);
+      if (conflict.remoteDeleted) {
+        if (baseline && local && local.hash !== baseline.baselineHash) {
+          merged.set(conflict.path, {
+            path: conflict.path,
+            status: 'conflict',
+            remoteId: conflict.remoteId,
+            baselineHash: baseline.baselineHash,
+            localHash: local.hash,
+            conflictReason: 'remoteDeletedLocalModified',
+            message: conflictMessage('remoteDeletedLocalModified'),
+          });
+        } else {
+          await this.store.deleteConflict(conflict.path);
+        }
+        continue;
+      }
       if (baseline?.baselineHash === conflict.remoteHash) {
         continue;
       }
@@ -924,6 +1345,9 @@ export class EcodeSyncService {
     if (!stored) {
       throw new Error('未找到可处理的冲突记录，请先重新拉取');
     }
+    if (stored.remoteDeleted) {
+      throw new Error('该冲突表示远端文件已删除，请选择删除冲突处理方式');
+    }
     const latest = await this.withAuthentication(profile, async api => {
       const entry: RemoteFileEntry = {
         id: stored.remoteId,
@@ -937,6 +1361,27 @@ export class EcodeSyncService {
       const refreshed = toStoredConflict(latest, stored.reason);
       await this.store.saveConflict(refreshed);
       throw new Error('远端在冲突处理期间再次变化，请重新查看差异');
+    }
+    return stored;
+  }
+
+  private async requireRemoteDeletionConflict(
+    profile: ConnectionProfile,
+    remotePath: string,
+  ): Promise<StoredConflict> {
+    const stored = await this.store.loadConflict(remotePath);
+    if (
+      !stored
+      || !stored.remoteDeleted
+      || stored.reason !== 'remoteDeletedLocalModified'
+    ) {
+      throw new Error('未找到远端删除冲突记录，请先重新拉取');
+    }
+    const existing = await this.withAuthentication(profile, async api =>
+      (await this.listRemoteIndex(api)).files.get(remotePath),
+    );
+    if (existing) {
+      throw new Error('远端文件已重新出现，请重新拉取并检查差异');
     }
     return stored;
   }
@@ -1013,6 +1458,10 @@ function joinRemote(parent: string, name: string): string {
   return parent ? `${parent}/${name}` : name;
 }
 
+function isDescendantPath(remotePath: string, directoryPath: string): boolean {
+  return remotePath.startsWith(`${directoryPath}/`);
+}
+
 function toStoredConflict(
   remote: RemoteFileContent,
   reason: StoredConflict['reason'],
@@ -1032,6 +1481,8 @@ function emptyResult(): SyncOperationResult {
     success: true,
     pulled: 0,
     pushed: 0,
+    deletedLocal: 0,
+    deletedRemote: 0,
     conflicts: 0,
     unsupported: 0,
     failed: 0,

@@ -84,6 +84,8 @@ export interface SyncOperationResult {
   success: boolean;
   pulled: number;
   pushed: number;
+  deletedLocal: number;
+  deletedRemote: number;
   conflicts: number;
   unsupported: number;
   failed: number;
@@ -97,4 +99,5 @@ export interface StoredConflict {
   remoteHash: string;
   detectedAt: string;
   reason: ConflictReason;
+  remoteDeleted?: boolean;
 }
