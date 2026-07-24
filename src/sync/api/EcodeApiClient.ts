@@ -1,96 +1,67 @@
 import type { ApiResponse } from './types';
 
-/**
- * Ecode HTTP 客户端
- *
- * 使用 Cookie（ecology_JSessionid）进行会话鉴权。
- */
 export class EcodeApiClient {
-  private cookie: string | null = null;
-  private timeout: number;
+  private cookie: string | undefined;
 
   constructor(
-    private baseUrl: string,
-    timeoutMs = 30000,
-  ) {
-    this.timeout = timeoutMs;
+    private readonly baseUrl: string,
+    private readonly timeoutMs = 30000,
+  ) {}
+
+  setCookie(cookie: string): void {
+    this.cookie = cookie;
   }
 
-  setCookie(cookie: string): void { this.cookie = cookie; }
-  clearAuth(): void { this.cookie = null; }
-  getCookie(): string | null { return this.cookie; }
-  getBaseUrl(): string { return this.baseUrl; }
-
-  buildUrl(path: string): string {
-    const base = this.baseUrl.replace(/\/+$/, '');
-    const p = path.replace(/^\/+/, '');
-    return `${base}/${p}`;
+  clearAuth(): void {
+    this.cookie = undefined;
   }
 
-  async get<T>(path: string, extraHeaders?: Record<string, string>): Promise<ApiResponse<T>> {
-    return this.request<T>('GET', path, undefined, extraHeaders);
+  getBaseUrl(): string {
+    return this.baseUrl;
   }
 
-  async post<T>(path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<ApiResponse<T>> {
-    return this.request<T>('POST', path, body, extraHeaders);
+  buildUrl(requestPath: string): string {
+    return `${this.baseUrl.replace(/\/+$/, '')}/${requestPath.replace(/^\/+/, '')}`;
   }
 
-  /**
-   * 上传文件（FormData），不走 JSON 序列化
-   */
-  async uploadForm<T>(path: string, form: import('form-data'), extraHeaders?: Record<string, string>): Promise<ApiResponse<T>> {
-    const url = this.buildUrl(path);
-    const headers: Record<string, string> = { ...form.getHeaders(), ...extraHeaders };
-    if (this.cookie) { headers['Cookie'] = this.cookie; }
+  async get<T>(requestPath: string): Promise<ApiResponse<T>> {
+    return this.request<T>('GET', requestPath);
+  }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: form as never,
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        return { status: false, msg: `HTTP ${response.status}`, code: response.status };
-      }
-      const json = await response.json();
-      return { status: true, data: json as T };
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        return { status: false, msg: `请求超时 (${this.timeout}ms)`, code: -1 };
-      }
-      return { status: false, msg: err instanceof Error ? err.message : String(err), code: -1 };
+  async postForm<T>(requestPath: string, values: Record<string, string>): Promise<ApiResponse<T>> {
+    const body = new URLSearchParams(values).toString();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      'Content-Length': String(Buffer.byteLength(body)),
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    if (this.cookie) {
+      headers.Cookie = this.cookie;
     }
+    return this.fetchResponse<T>(this.buildUrl(requestPath), {
+      method: 'POST',
+      headers,
+      body,
+    });
   }
 
-  private async request<T>(
-    method: string,
-    path: string,
-    body?: unknown,
-    extraHeaders?: Record<string, string>,
-  ): Promise<ApiResponse<T>> {
-    const url = this.buildUrl(path);
-    const headers: Record<string, string> = { ...extraHeaders };
-    if (this.cookie) { headers['Cookie'] = this.cookie; }
+  private async request<T>(method: string, requestPath: string): Promise<ApiResponse<T>> {
+    const headers: Record<string, string> = {};
+    if (this.cookie) {
+      headers.Cookie = this.cookie;
+    }
+    return this.fetchResponse<T>(this.buildUrl(requestPath), { method, headers });
+  }
 
+  private async fetchResponse<T>(url: string, init: RequestInit): Promise<ApiResponse<T>> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       const response = await fetch(url, {
-        method,
-        headers,
-        body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
+        ...init,
+        redirect: 'manual',
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
-
       if (response.status === 401 || response.status === 302) {
         return { status: false, msg: 'Session expired', code: 401 };
       }
@@ -98,32 +69,46 @@ export class EcodeApiClient {
         return { status: false, msg: `HTTP ${response.status}`, code: response.status };
       }
 
-      const contentType = response.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const json = await response.json() as Record<string, unknown>;
-        if ('status' in json || 'msg' in json) {
-          return json as unknown as ApiResponse<T>;
-        }
-        return { status: true, data: json as T };
-      }
-
-      // 服务器可能不设 Content-Type，尝试 JSON 解析
       const text = await response.text();
+      if (!text) {
+        return { status: true };
+      }
       try {
-        const json = JSON.parse(text) as Record<string, unknown>;
-        if ('status' in json || 'msg' in json) {
-          return json as unknown as ApiResponse<T>;
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        if (
+          'status' in parsed || 'api_status' in parsed || 'msg' in parsed ||
+          'errcode' in parsed || 'errorCode' in parsed
+        ) {
+          return normalizeResponse<T>(parsed);
         }
-        return { status: true, data: json as T };
+        return { status: true, data: parsed as T };
       } catch {
-        return { status: true, data: text as unknown as T };
+        return { status: true, data: text as T };
       }
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        return { status: false, msg: `请求超时 (${this.timeout}ms)`, code: -1 };
-      }
-      return { status: false, msg: err instanceof Error ? err.message : String(err), code: -1 };
+    } catch (error: unknown) {
+      const message = error instanceof Error && error.name === 'AbortError'
+        ? `请求超时 (${this.timeoutMs}ms)`
+        : error instanceof Error ? error.message : String(error);
+      return { status: false, msg: message, code: -1 };
+    } finally {
+      clearTimeout(timeout);
     }
   }
+}
+
+function normalizeResponse<T>(parsed: Record<string, unknown>): ApiResponse<T> {
+  const rawStatus = parsed.api_status ?? parsed.status;
+  const status = rawStatus === true || rawStatus === 1 || rawStatus === '1' || rawStatus === 'true';
+  const rawCode = parsed.code ?? parsed.errorCode ?? parsed.errcode;
+  const code = typeof rawCode === 'number' || typeof rawCode === 'string'
+    ? rawCode
+    : undefined;
+  const rawMessage = parsed.msg ?? parsed.errorMsg ?? parsed.message;
+  const msg = typeof rawMessage === 'string' ? rawMessage : undefined;
+  return {
+    ...parsed,
+    status,
+    code,
+    msg,
+  } as unknown as ApiResponse<T>;
 }

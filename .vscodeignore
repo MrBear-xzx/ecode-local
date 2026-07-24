@@ -1,0 +1,12 @@
+.vscode/**
+src/**
+docs/**
+AGENTS.md
+tsconfig.json
+esbuild.mjs
+node_modules/**
+out/**
+!out/extension.js
+**/*.map
+**/*.d.ts
+**/*.d.ts.map

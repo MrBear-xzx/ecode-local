@@ -1,177 +1,220 @@
-import * as vscode from 'vscode';
+import type * as vscode from 'vscode';
+import type { ConnectionProfile } from '../../domain/types';
+import { serverFingerprint } from '../../domain/text';
+import { EcodeApiClient } from '../api/EcodeApiClient';
+import type { ApiResponse } from '../api/types';
 import { TokenStore } from './TokenStore';
 import { RSACrypto, type RsaInfo } from './RSACrypto';
-import { EcodeApiClient } from '../api/EcodeApiClient';
 
-/**
- * Ecode 鉴权管理器
- */
+export interface LoginResult {
+  success: boolean;
+  message: string;
+}
+
 export class AuthManager {
-  private tokenStore: TokenStore;
-  private rsa: RSACrypto;
-  private client: EcodeApiClient | null = null;
-  private sessionCookie: string | null = null;
+  private readonly secrets: vscode.SecretStorage;
+  private readonly rsa = new RSACrypto();
+  private client: EcodeApiClient | undefined;
+  private clientUrl = '';
+  private sessionVerified = false;
+  private sessionIdentity = '';
 
-  private readonly rsaEndpoint = '/rsa/weaver.rsa.GetRsaInfo';
-  private readonly loginEndpoint = '/api/hrm/login/checkLogin';
-
-  constructor(private context: vscode.ExtensionContext) {
-    this.tokenStore = new TokenStore(context.secrets);
-    this.rsa = new RSACrypto();
+  constructor(context: vscode.ExtensionContext) {
+    this.secrets = context.secrets;
   }
 
-  /** 登录 */
-  async login(serverUrl: string, username: string, password: string): Promise<{ success: boolean; message: string }> {
-    try {
-      this.client = new EcodeApiClient(serverUrl);
+  async connect(profile: ConnectionProfile, password: string): Promise<LoginResult> {
+    const tokens = this.tokens(profile);
+    const result = await this.login(profile.serverUrl, profile.username, password, tokens);
+    if (!result.success) {
+      return result;
+    }
 
-      // Step 0: 获取 session cookie
-      const initResponse = await fetch(`${serverUrl.replace(/\/+$/, '')}/`);
-      const setCookie = initResponse.headers.get('set-cookie');
-      if (setCookie) {
-        const match = setCookie.match(/ecology_JSessionid=([^;]+)/);
-        if (match) {
-          this.sessionCookie = `ecology_JSessionid=${match[1]}`;
-        }
+    const client = this.client;
+    const tree = client
+      ? await client.get('/api/ecode/type/tree')
+      : { status: false, msg: '未创建 API 客户端' };
+    if (!tree.status) {
+      await tokens.clearSession();
+      client?.clearAuth();
+      this.sessionVerified = false;
+      this.sessionIdentity = '';
+      return {
+        success: false,
+        message: `登录成功，但无法读取远端文件树${apiFailureDetail(tree)}`,
+      };
+    }
+
+    await tokens.storePassword(password);
+    return result;
+  }
+
+  async getAuthenticatedClient(profile: ConnectionProfile): Promise<EcodeApiClient | undefined> {
+    const client = this.clientFor(profile.serverUrl);
+    const identity = serverFingerprint(profile.serverUrl, profile.username);
+    const tokens = new TokenStore(this.secrets, identity);
+    if (this.sessionVerified && this.sessionIdentity === identity) {
+      return client;
+    }
+    client.clearAuth();
+    this.sessionVerified = false;
+    this.sessionIdentity = '';
+    const cookie = await tokens.getCookie();
+    if (cookie) {
+      client.setCookie(cookie);
+      const verified = await client.get('/api/ecode/type/tree');
+      if (verified.status) {
+        this.sessionVerified = true;
+        this.sessionIdentity = identity;
+        return client;
       }
+      await tokens.clearSession();
+      client.clearAuth();
+    }
 
-      // Step 1: 获取 RSA 公钥
-      const rsaResponse = await fetch(`${serverUrl.replace(/\/+$/, '')}${this.rsaEndpoint}`, {
-        headers: this.sessionCookie ? { Cookie: this.sessionCookie } : {},
+    const password = await tokens.getPassword();
+    if (!password) {
+      return undefined;
+    }
+    const result = await this.login(profile.serverUrl, profile.username, password, tokens);
+    return result.success ? this.client : undefined;
+  }
+
+  async reconnect(profile: ConnectionProfile): Promise<EcodeApiClient | undefined> {
+    const tokens = this.tokens(profile);
+    await tokens.clearSession();
+    this.client?.clearAuth();
+    this.sessionVerified = false;
+    this.sessionIdentity = '';
+    const password = await tokens.getPassword();
+    if (!password) {
+      return undefined;
+    }
+    const result = await this.login(profile.serverUrl, profile.username, password, tokens);
+    return result.success ? this.client : undefined;
+  }
+
+  async clearV2Credentials(): Promise<void> {
+    await new TokenStore(this.secrets, 'all').clearAllV2();
+    this.client = undefined;
+    this.clientUrl = '';
+    this.sessionVerified = false;
+    this.sessionIdentity = '';
+  }
+
+  private async login(
+    serverUrl: string,
+    username: string,
+    password: string,
+    tokens: TokenStore,
+  ): Promise<LoginResult> {
+    const normalizedUrl = serverUrl.trim().replace(/\/+$/, '');
+    try {
+      const client = this.clientFor(normalizedUrl);
+      client.clearAuth();
+      this.sessionVerified = false;
+      this.sessionIdentity = '';
+
+      const initResponse = await fetchWithTimeout(`${normalizedUrl}/`);
+      const sessionCookie = extractSessionCookie(initResponse.headers.get('set-cookie'));
+
+      const rsaResponse = await fetchWithTimeout(`${normalizedUrl}/rsa/weaver.rsa.GetRsaInfo`, {
+        headers: sessionCookie ? { Cookie: sessionCookie } : {},
       });
       if (!rsaResponse.ok) {
         return { success: false, message: `获取 RSA 公钥失败: HTTP ${rsaResponse.status}` };
       }
+
       const rsaInfo = await rsaResponse.json() as RsaInfo;
+      const params = new URLSearchParams({
+        islanguid: '7',
+        loginid: this.rsa.encryptWithRsa(rsaInfo, username),
+        userpassword: this.rsa.encryptWithRsa(rsaInfo, password),
+        logintype: '1',
+        isie: 'false',
+      });
 
-      // Step 2: RSA 加密凭据
-      const encryptedLoginId = this.rsa.encryptWithRsa(rsaInfo, username);
-      const encryptedPassword = this.rsa.encryptWithRsa(rsaInfo, password);
-
-      // Step 3: 提交登录
-      const params = new URLSearchParams();
-      params.append('islanguid', '7');
-      params.append('loginid', encryptedLoginId);
-      params.append('userpassword', encryptedPassword);
-      params.append('logintype', '1');
-      params.append('isie', 'false');
-
-      const loginUrl = this.client.buildUrl(this.loginEndpoint);
       const headers: Record<string, string> = {
         'Content-Type': 'application/x-www-form-urlencoded',
       };
-      if (this.sessionCookie) { headers['Cookie'] = this.sessionCookie; }
+      if (sessionCookie) {
+        headers.Cookie = sessionCookie;
+      }
 
-      const response = await fetch(loginUrl, { method: 'POST', headers, body: params });
-
-      if (response.status !== 200) {
+      const response = await fetchWithTimeout(client.buildUrl('/api/hrm/login/checkLogin'), {
+        method: 'POST',
+        headers,
+        body: params,
+      });
+      if (!response.ok) {
         return { success: false, message: `登录失败: HTTP ${response.status}` };
       }
 
-      const result = await response.json() as { msgcode: string; msg?: string };
+      const result = await response.json() as { msgcode?: string; msg?: string };
       if (result.msgcode !== '0') {
         return { success: false, message: result.msg || '登录被服务器拒绝' };
       }
-
-      if (!this.sessionCookie) {
+      if (!sessionCookie) {
         return { success: false, message: '未获取到 session cookie' };
       }
 
-      this.client.setCookie(this.sessionCookie);
-
-      await this.tokenStore.storeCookie(this.sessionCookie);
-      await this.tokenStore.storeUsername(username);
-
-      return { success: true, message: '登录成功' };
-    } catch (err: unknown) {
-      return { success: false, message: `登录异常: ${err instanceof Error ? err.message : String(err)}` };
+      client.setCookie(sessionCookie);
+      await tokens.storeCookie(sessionCookie);
+      this.sessionVerified = true;
+      this.sessionIdentity = serverFingerprint(normalizedUrl, username);
+      return { success: true, message: '连接测试成功' };
+    } catch (error: unknown) {
+      return {
+        success: false,
+        message: `登录异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
   }
 
-  /** 检查是否具备自动登录条件 */
-  async isLoginReady(): Promise<boolean> {
-    if (await this.tokenStore.getCookie()) { return true; }
-    const hasPassword = !!(await this.tokenStore.getPassword());
-    const serverUrl = vscode.workspace.getConfiguration('ecode').get<string>('server.url');
-    return !!(hasPassword && serverUrl);
-  }
-
-  /**
-   * 自动登录：优先 Cookie → 验证有效性 → 无效则密码登录
-   */
-  async autoLogin(): Promise<EcodeApiClient | null> {
-    const serverUrl = vscode.workspace.getConfiguration('ecode').get<string>('server.url');
-    if (!serverUrl) { return null; }
-
-    // 1. 尝试 Cookie
-    const savedCookie = await this.tokenStore.getCookie();
-    if (savedCookie) {
-      this.sessionCookie = savedCookie;
-      if (!this.client) { this.client = new EcodeApiClient(serverUrl); }
-      this.client.setCookie(savedCookie);
-
-      // 验证 Cookie 有效性
-      const valid = await this.verifySession();
-      if (valid) {
-        return this.client;
-      }
-      // Cookie 过期，清除后走密码登录
-      await this.tokenStore.clear();
-      this.sessionCookie = null;
+  private clientFor(serverUrl: string): EcodeApiClient {
+    const normalized = serverUrl.trim().replace(/\/+$/, '');
+    if (!this.client || this.clientUrl !== normalized) {
+      this.client = new EcodeApiClient(normalized);
+      this.clientUrl = normalized;
+      this.sessionVerified = false;
+      this.sessionIdentity = '';
     }
-
-    // 2. 密码登录
-    const username = vscode.workspace.getConfiguration('ecode').get<string>('server.username');
-    const password = await this.tokenStore.getPassword();
-    if (username && password) {
-      const result = await this.login(serverUrl, username, password);
-      if (result.success) {
-        await this.tokenStore.storePassword(password);
-        return this.client;
-      }
-      // 密码登录也失败，清除密码防止反复重试
-      await this.tokenStore.clear();
-    }
-
-    return null;
-  }
-
-  /** 验证当前会话是否有效 */
-  private async verifySession(): Promise<boolean> {
-    if (!this.client || !this.sessionCookie) { return false; }
-    try {
-      const result = await this.client.get('/api/ecode/type/tree');
-      // status=true 且不是 401 → 有效
-      return result.status === true;
-    } catch {
-      return false;
-    }
-  }
-
-  async savePassword(password: string): Promise<void> {
-    await this.tokenStore.storePassword(password);
-  }
-
-  async getClient(): Promise<EcodeApiClient | null> {
-    if (!this.client) {
-      const serverUrl = vscode.workspace.getConfiguration('ecode').get<string>('server.url');
-      if (!serverUrl) { return null; }
-      this.client = new EcodeApiClient(serverUrl);
-    }
-    if (!this.sessionCookie) {
-      this.sessionCookie = await this.tokenStore.getCookie() ?? null;
-    }
-    if (this.sessionCookie) { this.client.setCookie(this.sessionCookie); }
     return this.client;
   }
 
-  async isLoggedIn(): Promise<boolean> {
-    return !!(await this.tokenStore.getCookie());
+  private tokens(profile: ConnectionProfile): TokenStore {
+    return new TokenStore(
+      this.secrets,
+      serverFingerprint(profile.serverUrl, profile.username),
+    );
   }
+}
 
-  async logout(): Promise<void> {
-    await this.tokenStore.clear();
-    this.client = null;
-    this.sessionCookie = null;
+function extractSessionCookie(setCookie: string | null): string | undefined {
+  const match = setCookie?.match(/ecology_JSessionid=([^;]+)/i);
+  return match ? `ecology_JSessionid=${match[1]}` : undefined;
+}
+
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit = {},
+  timeoutMs = 30000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+function apiFailureDetail(response: ApiResponse<unknown>): string {
+  if (response.msg) {
+    return `: ${response.msg}`;
+  }
+  if (response.code !== undefined) {
+    return `: 错误码 ${response.code}`;
+  }
+  return '：服务端返回 status=false，且未提供错误码或错误消息';
 }

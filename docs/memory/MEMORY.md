@@ -1,2 +1,0 @@
-- [Ecode Local 项目概述](ecode-vscode-project.md)
-- [当前已实现功能进度](current-progress.md)

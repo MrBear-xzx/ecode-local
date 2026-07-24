@@ -1,8 +1,8 @@
 {
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
-  "description": "泛微 Ecode 本地开发 VSCode 插件 — 在线代码同步到本地编辑，手动推送",
-  "version": "0.1.0",
+  "description": "泛微 Ecode 安全本地开发扩展：手动拉取、差异预览、冲突保护与选择性推送",
+  "version": "0.2.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -20,44 +20,105 @@
     "ecode",
     "泛微",
     "e-cology",
-    "低代码"
+    "本地开发",
+    "同步"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onView:ecode.workspace",
+    "onCommand:ecode.configure",
+    "onCommand:ecode.setup",
+    "onCommand:ecode.pull",
+    "onCommand:ecode.refreshChanges",
+    "onCommand:ecode.pushSelected",
+    "onCommand:ecode.openDiff",
+    "onCommand:ecode.resolveConflict"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "ecode.setup",
-        "title": "Ecode: Setup",
+        "command": "ecode.configure",
+        "title": "Ecode: 配置连接",
         "icon": "$(gear)"
+      },
+      {
+        "command": "ecode.pull",
+        "title": "Ecode: 全量拉取",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "ecode.refreshChanges",
+        "title": "Ecode: 刷新本地变更",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ecode.pushSelected",
+        "title": "Ecode: 选择并推送",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "ecode.openDiff",
+        "title": "Ecode: 查看差异",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "ecode.resolveConflict",
+        "title": "Ecode: 解决冲突",
+        "icon": "$(issues)"
       }
     ],
-    "configuration": {
-      "title": "Ecode",
-      "properties": {
-        "ecode.server.url": {
-          "type": "string",
-          "default": "",
-          "description": "Ecode 服务器地址（如 http://localhost:8099）"
-        },
-        "ecode.server.appId": {
-          "type": "string",
-          "default": "",
-          "description": "Ecode App ID（可选，发布列表中获取的 UUID）"
-        },
-        "ecode.server.username": {
-          "type": "string",
-          "default": "sysadmin",
-          "description": "E-cology 登录用户名"
-        },
-        "ecode.server.autoConnect": {
-          "type": "boolean",
-          "default": true,
-          "description": "启动时自动连接服务器"
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ecode",
+          "title": "Ecode",
+          "icon": "media/ecode.svg"
         }
-      }
+      ]
+    },
+    "views": {
+      "ecode": [
+        {
+          "id": "ecode.workspace",
+          "name": "工作区"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ecode.configure",
+          "when": "view == ecode.workspace",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ecode.pull",
+          "when": "view == ecode.workspace",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ecode.refreshChanges",
+          "when": "view == ecode.workspace",
+          "group": "navigation@3"
+        },
+        {
+          "command": "ecode.pushSelected",
+          "when": "view == ecode.workspace",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ecode.openDiff",
+          "when": "view == ecode.workspace && viewItem =~ /ecode.change/",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.resolveConflict",
+          "when": "view == ecode.workspace && viewItem == ecode.change.conflict",
+          "group": "inline@2"
+        }
+      ]
     }
   },
   "scripts": {
@@ -65,26 +126,24 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "lint": "eslint src --ext .ts",
-    "test": "node ./out/test/runTest.js",
-    "package": "vsce package"
+    "test": "node -e \"require('fs').rmSync('out/test',{recursive:true,force:true})\" && tsc && node ./out/test/runTest.js",
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
-    "@types/vscode": "^1.93.0",
-    "@types/node": "^20.0.0",
-    "@vscode/test-electron": "^2.4.0",
-    "esbuild": "^0.24.0",
-    "typescript": "^5.5.0",
-    "mocha": "^10.0.0",
     "@types/mocha": "^10.0.0",
-    "glob": "^11.0.0",
-    "eslint": "^9.0.0",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.93.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "@vscode/vsce": "^3.0.0"
+    "@vscode/test-electron": "^2.4.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.0.0",
+    "glob": "^11.0.0",
+    "mocha": "^10.0.0",
+    "typescript": "^5.5.0"
   },
   "dependencies": {
-    "adm-zip": "^0.5.0",
-    "simple-git": "^3.0.0",
-    "form-data": "^4.0.0"
+    "@babel/standalone": "7.5.5"
   }
 }
