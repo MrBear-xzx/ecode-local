@@ -10,7 +10,9 @@ suite('Auth manager', () => {
   let baseUrl: string;
   let publicKey: string;
   let allowTree: boolean;
+  let rotateSessionOnLogin: boolean;
   let treeRequests: number;
+  let treeCookie: string | undefined;
 
   suiteSetup(() => {
     const generated = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -22,7 +24,9 @@ suite('Auth manager', () => {
 
   setup(async () => {
     allowTree = true;
+    rotateSessionOnLogin = false;
     treeRequests = 0;
+    treeCookie = undefined;
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
       if (request.url === '/') {
@@ -39,12 +43,18 @@ suite('Auth manager', () => {
         return;
       }
       if (request.url === '/api/hrm/login/checkLogin' && request.method === 'POST') {
+        if (rotateSessionOnLogin) {
+          response.setHeader('Set-Cookie', 'ecology_JSessionid=authenticated-session; Path=/');
+        }
         response.end(JSON.stringify({ msgcode: '0' }));
         return;
       }
       if (request.url === '/api/ecode/type/tree') {
         treeRequests++;
-        response.end(JSON.stringify(allowTree
+        treeCookie = request.headers.cookie;
+        const hasValidSession = !rotateSessionOnLogin
+          || treeCookie === 'ecology_JSessionid=authenticated-session';
+        response.end(JSON.stringify(allowTree && hasValidSession
           ? {
               status: true,
               data: {
@@ -79,6 +89,18 @@ suite('Auth manager', () => {
     assert.strictEqual(result.success, true);
     assert.strictEqual(treeRequests, 1);
     assert.ok((await auth.getAuthenticatedClient(createProfile(baseUrl))));
+  });
+
+  test('uses the refreshed session cookie returned after login', async () => {
+    rotateSessionOnLogin = true;
+    const secrets = new MemorySecrets();
+    const auth = new AuthManager({ secrets } as never);
+
+    const result = await auth.connect(createProfile(baseUrl), 'test-password');
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(treeCookie, 'ecology_JSessionid=authenticated-session');
+    assert.strictEqual(treeRequests, 1);
   });
 
   test('rejects a successful login when the root file tree is unavailable', async () => {
