@@ -77,6 +77,8 @@ class ExtensionController {
       vscode.commands.registerCommand('ecode.refreshChanges', () => this.refreshChanges()),
       vscode.commands.registerCommand('ecode.pushSelected', () => this.pushSelected()),
       vscode.commands.registerCommand('ecode.openDiff', (change: SyncChange) => this.openDiff(change)),
+      vscode.commands.registerCommand('ecode.revertChange', (change?: SyncChange) =>
+        this.revertChange(change)),
       vscode.commands.registerCommand('ecode.resolveConflict', (change: SyncChange) =>
         this.resolveConflict(change)),
     ];
@@ -185,7 +187,8 @@ class ExtensionController {
     }
     const syncRoot = resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory);
     const choice = await vscode.window.showWarningMessage(
-      `将全量检查远端源码并安全拉取到 ${syncRoot}。本地修改不会被覆盖。`,
+      `将全量检查远端源码并安全拉取到 ${syncRoot}。`
+        + '远端删除会同步到未修改的本地文件，删除前保存恢复副本；本地修改不会被覆盖。',
       { modal: true },
       '开始拉取',
     );
@@ -220,10 +223,10 @@ class ExtensionController {
     }
     this.changes = await this.service.refreshLocalChanges();
     const pushable = this.changes.filter(change =>
-      change.status === 'localAdded' || change.status === 'localModified',
+      ['localAdded', 'localModified', 'localDeleted'].includes(change.status),
     );
     if (pushable.length === 0) {
-      vscode.window.showInformationMessage('Ecode: 没有可推送的新增或修改文件');
+      vscode.window.showInformationMessage('Ecode: 没有可推送的新增、修改或删除文件');
       await this.updateViews();
       return;
     }
@@ -231,7 +234,9 @@ class ExtensionController {
     const selected = await vscode.window.showQuickPick(
       pushable.map(change => ({
         label: change.path,
-        description: change.status === 'localAdded' ? '新增' : '修改',
+        description: change.status === 'localAdded'
+          ? '新增'
+          : change.status === 'localDeleted' ? '删除' : '修改',
         change,
         picked: true,
       })),
@@ -246,8 +251,10 @@ class ExtensionController {
       return;
     }
 
+    const deletionCount = selected.filter(item => item.change.status === 'localDeleted').length;
     const confirmation = await vscode.window.showWarningMessage(
-      `确认向 ${profile.serverUrl} 推送 ${selected.length} 个文件？`
+      `确认向 ${profile.serverUrl} 推送 ${selected.length} 项变更`
+        + `${deletionCount > 0 ? `（含 ${deletionCount} 个远端删除）` : ''}？`
         + ' JavaScript 将使用与 Ecode 在线编辑器一致的 Babel 7.5.5 配置生成编译内容。',
       { modal: true },
       '确认推送',
@@ -325,23 +332,58 @@ class ExtensionController {
       return;
     }
     if (change.conflictReason === 'remoteDeletedLocalModified') {
-      vscode.window.showWarningMessage(
-        'Ecode 0.2.0 只检测远端删除，不执行删除冲突解决。请在服务器恢复文件或另存本地代码。',
+      const action = await vscode.window.showQuickPick([
+        {
+          label: '接受远端删除',
+          description: '先备份本地修改，再删除本地文件',
+          value: 'acceptRemoteDeletion' as const,
+        },
+        {
+          label: '保留本地并重新创建远端',
+          description: '移除旧基线，将当前本地文件转为待推送的新增文件',
+          value: 'keepLocal' as const,
+        },
+      ], { title: `解决远端删除冲突: ${change.path}` });
+      if (!action) {
+        return;
+      }
+      const confirmed = await vscode.window.showWarningMessage(
+        action.value === 'acceptRemoteDeletion'
+          ? '本地修改将保存为恢复副本，然后删除本地文件。'
+          : '将确认远端文件仍不存在，并把当前本地文件标记为待新增。',
+        { modal: true },
+        '确认',
       );
+      if (confirmed !== '确认') {
+        return;
+      }
+      await this.runExclusive('正在解决删除冲突...', async () => {
+        if (action.value === 'acceptRemoteDeletion') {
+          const recovery = await this.service.acceptRemoteDeletion(change.path);
+          vscode.window.showInformationMessage(
+            recovery ? `已接受远端删除；本地恢复副本: ${recovery}` : '已接受远端删除',
+          );
+        } else {
+          await this.service.keepLocalAfterRemoteDeletion(change.path);
+          vscode.window.showInformationMessage('已保留本地文件，可重新检查后推送为远端新增');
+        }
+        this.changes = this.service.getLastPlan()?.changes ?? [];
+      });
       return;
     }
-    const action = await vscode.window.showQuickPick([
+    const actions = [
       {
         label: '接受最新远端',
         description: '先备份本地内容，再以远端内容替换本地',
         value: 'acceptRemote' as const,
       },
-      {
+      ...(change.conflictReason === 'localDeletedRemoteModified' ? [] : [{
         label: '已手工合并，保留当前本地',
         description: '将最新远端设为新基线，当前本地内容仍待推送',
         value: 'markMerged' as const,
-      },
-    ], { title: `解决冲突: ${change.path}` });
+      }]),
+    ];
+    const action = await vscode.window.showQuickPick(actions, { title: `解决冲突: ${change.path}` });
     if (!action) {
       return;
     }
@@ -368,6 +410,60 @@ class ExtensionController {
         vscode.window.showInformationMessage('已更新基线，当前本地内容可重新检查后推送');
       }
       this.changes = this.service.getLastPlan()?.changes ?? [];
+    });
+  }
+
+  private async revertChange(candidate?: SyncChange): Promise<void> {
+    const profile = await this.requireProfile();
+    if (!profile) {
+      return;
+    }
+    this.changes = await this.service.refreshLocalChanges();
+    const revertible = this.changes.filter(change =>
+      ['localAdded', 'localModified', 'localDeleted'].includes(change.status),
+    );
+    let change = candidate && revertible.some(item =>
+      item.path === candidate.path && item.status === candidate.status)
+      ? candidate
+      : undefined;
+    if (!change) {
+      const selected = await vscode.window.showQuickPick(
+        revertible.map(item => ({
+          label: item.path,
+          description: item.status === 'localAdded'
+            ? '删除本地新增文件'
+            : item.status === 'localDeleted' ? '恢复已删除文件' : '恢复为同步基线',
+          change: item,
+        })),
+        {
+          title: '选择要回退的本地变更',
+          placeHolder: revertible.length > 0 ? undefined : '没有可回退的本地变更',
+        },
+      );
+      change = selected?.change;
+    }
+    if (!change) {
+      return;
+    }
+
+    const confirmed = await vscode.window.showWarningMessage(
+      change.status === 'localAdded'
+        ? `将删除本地新增文件 ${change.path}，删除前保存恢复副本。`
+        : change.status === 'localDeleted'
+          ? `将从同步基线恢复已删除文件 ${change.path}。`
+          : `将使用同步基线回退 ${change.path}，当前内容会先保存为恢复副本。`,
+      { modal: true },
+      '确认回退',
+    );
+    if (confirmed !== '确认回退') {
+      return;
+    }
+    await this.runExclusive('正在回退本地变更...', async () => {
+      const recovery = await this.service.revertLocalChange(change.path);
+      this.changes = this.service.getLastPlan()?.changes ?? [];
+      vscode.window.showInformationMessage(
+        recovery ? `已回退本地变更；恢复副本: ${recovery}` : '已回退本地变更',
+      );
     });
   }
 
@@ -432,7 +528,7 @@ class ExtensionController {
     this.localRefreshTimer = setTimeout(() => {
       this.localRefreshTimer = undefined;
       void this.refreshLocalChangesAutomatically();
-    }, 5000);
+    }, 2000);
   }
 
   private async refreshLocalChangesAutomatically(): Promise<void> {
@@ -519,6 +615,7 @@ function validateLocalDirectory(workspaceFolder: string, value: string): string 
 
 function showResult(operation: string, result: SyncOperationResult): void {
   const summary = `${operation}完成：${result.pulled} 拉取，${result.pushed} 推送，`
+    + `${result.deletedLocal} 个本地删除，${result.deletedRemote} 个远端删除，`
     + `${result.conflicts} 冲突，${result.unsupported} 不支持，${result.failed} 失败`;
   if (result.errors.length > 0) {
     output.error(result.errors.join('\n'));

@@ -25,6 +25,7 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.refreshChanges'));
     assert.ok(commands.includes('ecode.pushSelected'));
     assert.ok(commands.includes('ecode.openDiff'));
+    assert.ok(commands.includes('ecode.revertChange'));
     assert.ok(commands.includes('ecode.resolveConflict'));
     assert.ok(!commands.includes('ecode.branchNew'));
   });

@@ -58,7 +58,7 @@ suite('Sync planner', () => {
     assert.strictEqual(statuses.get('both.js'), 'conflict');
   });
 
-  test('detects local and remote deletions without making them executable', () => {
+  test('plans a clean remote deletion while keeping a local deletion user-selected', () => {
     const state = manifest({
       'local-deleted.js': entry('local-deleted.js', 'base'),
       'remote-deleted.js': entry('remote-deleted.js', 'base'),
@@ -74,7 +74,14 @@ suite('Sync planner', () => {
 
     assert.strictEqual(statuses.get('local-deleted.js'), 'localDeleted');
     assert.strictEqual(statuses.get('remote-deleted.js'), 'remoteDeleted');
-    assert.strictEqual(plan.executable.length, 0);
+    assert.deepStrictEqual(
+      plan.executable.map(change => change.path),
+      ['remote-deleted.js'],
+    );
+    assert.deepStrictEqual(
+      plan.blocked.map(change => change.path),
+      ['local-deleted.js'],
+    );
   });
 
   test('reports new, modified, and deleted local files from a manifest', () => {
@@ -93,6 +100,29 @@ suite('Sync planner', () => {
     assert.strictEqual(statuses.get('modified.js'), 'localModified');
     assert.strictEqual(statuses.get('deleted.js'), 'localDeleted');
     assert.strictEqual(statuses.get('added.js'), 'localAdded');
+  });
+
+  test('does not treat a present but unreadable remote file as deleted', () => {
+    const state = manifest({
+      'unreadable.js': entry('unreadable.js', 'base'),
+    });
+    const plan = buildSyncPlan(
+      state,
+      new Map([['unreadable.js', localFile('unreadable.js', 'base')]]),
+      new Map(),
+      [{
+        path: 'unreadable.js',
+        status: 'unsupported',
+        message: 'read failed',
+      }],
+      new Set(['unreadable.js']),
+    );
+
+    assert.ok(!plan.executable.some(change => change.path === 'unreadable.js'));
+    assert.strictEqual(
+      plan.changes.find(change => change.path === 'unreadable.js')?.status,
+      'unsupported',
+    );
   });
 });
 

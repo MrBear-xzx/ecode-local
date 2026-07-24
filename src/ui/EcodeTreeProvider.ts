@@ -56,8 +56,8 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
       : `${change.path}\n${statusLabel(change.status)}`;
     item.contextValue = change.status === 'conflict'
       ? 'ecode.change.conflict'
-      : ['localAdded', 'localModified'].includes(change.status)
-        ? 'ecode.change.pushable'
+      : ['localAdded', 'localModified', 'localDeleted'].includes(change.status)
+        ? 'ecode.change.revertible'
         : 'ecode.change';
     item.iconPath = new vscode.ThemeIcon(statusIcon(change.status));
     item.command = {
@@ -132,10 +132,10 @@ function statusLabel(status: SyncChange['status']): string {
     clean: '已同步',
     localAdded: '本地新增',
     localModified: '本地修改',
-    localDeleted: '本地删除（未同步）',
+    localDeleted: '本地删除（可推送）',
     remoteAdded: '远端新增',
     remoteModified: '远端修改',
-    remoteDeleted: '远端删除（未同步）',
+    remoteDeleted: '远端删除（待拉取）',
     conflict: '冲突',
     unsupported: '不支持',
   };
@@ -150,7 +150,7 @@ function statusIcon(status: SyncChange['status']): string {
     localDeleted: 'diff-removed',
     remoteAdded: 'cloud-download',
     remoteModified: 'cloud-download',
-    remoteDeleted: 'warning',
+    remoteDeleted: 'cloud-download',
     conflict: 'warning',
     unsupported: 'circle-slash',
   };

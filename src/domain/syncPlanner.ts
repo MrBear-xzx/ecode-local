@@ -11,6 +11,7 @@ export function buildSyncPlan(
   localFiles: Map<string, LocalFileState>,
   remoteFiles: Map<string, RemoteFileContent>,
   unsupported: SyncChange[] = [],
+  presentRemotePaths: ReadonlySet<string> = new Set(remoteFiles.keys()),
 ): SyncPlan {
   const paths = new Set([
     ...Object.keys(manifest.files),
@@ -23,6 +24,9 @@ export function buildSyncPlan(
     const baseline = manifest.files[path];
     const local = localFiles.get(path);
     const remote = remoteFiles.get(path);
+    if (!remote && presentRemotePaths.has(path)) {
+      continue;
+    }
 
     if (!baseline) {
       if (local && remote) {
@@ -83,11 +87,14 @@ export function buildSyncPlan(
   }
 
   changes.push(...unsupported);
-  const executable = changes.filter(item => item.status === 'remoteAdded' || item.status === 'remoteModified');
+  const executable = changes.filter(item =>
+    item.status === 'remoteAdded'
+    || item.status === 'remoteModified'
+    || item.status === 'remoteDeleted',
+  );
   const blocked = changes.filter(item =>
     item.status === 'conflict'
     || item.status === 'localDeleted'
-    || item.status === 'remoteDeleted'
     || item.status === 'unsupported',
   );
 

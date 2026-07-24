@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 安全本地开发扩展：手动拉取、差异预览、冲突保护与选择性推送",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -31,6 +31,7 @@
     "onCommand:ecode.refreshChanges",
     "onCommand:ecode.pushSelected",
     "onCommand:ecode.openDiff",
+    "onCommand:ecode.revertChange",
     "onCommand:ecode.resolveConflict"
   ],
   "main": "./out/extension.js",
@@ -60,6 +61,11 @@
         "command": "ecode.openDiff",
         "title": "Ecode: 查看差异",
         "icon": "$(diff)"
+      },
+      {
+        "command": "ecode.revertChange",
+        "title": "Ecode: 回退本地变更",
+        "icon": "$(discard)"
       },
       {
         "command": "ecode.resolveConflict",
@@ -116,6 +122,11 @@
         {
           "command": "ecode.resolveConflict",
           "when": "view == ecode.workspace && viewItem == ecode.change.conflict",
+          "group": "inline@2"
+        },
+        {
+          "command": "ecode.revertChange",
+          "when": "view == ecode.workspace && viewItem == ecode.change.revertible",
           "group": "inline@2"
         }
       ]

@@ -71,6 +71,18 @@ export class FileApi {
       description: '',
     });
   }
+
+  async deleteFile(remoteId: string): Promise<ApiResponse<unknown>> {
+    return this.client.postForm('/api/cloudstore/ecode/logicalDeleteFile', {
+      id: remoteId,
+    });
+  }
+
+  async deleteFolder(remoteId: string): Promise<ApiResponse<unknown>> {
+    return this.client.postForm('/api/cloudstore/ecode/logicalDeleteFolder', {
+      folderId: remoteId,
+    });
+  }
 }
 
 function encodeContent(content: string): string {
