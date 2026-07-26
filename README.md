@@ -14,7 +14,7 @@ Ecode Local 是面向泛微 E-cology 9 Ecode 的 VS Code 扩展，用于在本�
 也可以在终端中安装：
 
 ```bash
-code --install-extension ecode-vscode-0.2.3.vsix
+code --install-extension ecode-vscode-0.3.0.vsix
 ```
 
 安装完成后，VS Code 活动栏中会出现 **Ecode** 图标。
@@ -75,6 +75,53 @@ code --install-extension ecode-vscode-0.2.3.vsix
 - **本地已删除、远端已修改**：可以接受最新远端并恢复本地文件；如仍需删除，请再次删除本地文件并重新推送。
 - **远端已删除、本地已修改**：可以备份并接受远端删除，也可以保留本地内容，将其转为待推送的远端新增文件。
 
+## 代码智能
+
+代码智能默认覆盖 JavaScript、JSX、TypeScript 和 TSX，可在 VS Code 设置中通过
+`ecode.intelligence.enabled` 统一开关。所有内置知识均随扩展离线提供，打开源码和查看提示不会请求服务器。
+
+### Ecode API
+
+- 收录 `ecodeSDK`、`ModeForm`、`ModeList`、`WfForm` 共 167 个方法、属性或常量，以及 222 个方法参数说明。
+- 输入 `WfForm.`、`ModeForm.`、`ModeList.`、`ecodeSDK.` 或对应的 `window.*` 形式时，会提供成员联想和常用代码片段。
+- 输入方法参数时会显示签名、当前参数、类型、是否必填和具体含义。
+- 悬停成员可快速查看说明；按 F12 或 Ctrl+单击成员名可打开包含参数及二级参数的内置文档。
+- 悬停或 Ctrl+单击 API 对象名，可查看该对象的用途以及全部方法、属性、常量和签名。
+
+### PC 组件与嵌套参数
+
+- 收录 90 个 `ecCom` 组件、37 个 Ecology 9 内置 `antd` 组件和 1911 条 props 参数记录。
+- 支持 `ecCom.`、`antd.`、`window.ecCom.`、`window.antd.` 成员联想，以及命名导入、解构和赋值形成的 JSX 组件别名。
+- 在 JSX 标签中提供 props 联想、类型、必填、默认值和说明；悬停或 F12 可查看完整组件文档。
+- 支持已整理对象和数组项的二级参数，包括 `WeaBrowser.tabs[].browserProps`、`WeaTable/antd.Table.columns[]`、`filters`、`rowSelection`，以及 `WfForm`、`ModeForm`、`ecodeSDK` 常用对象参数。
+- 二级联想会识别当前对象中已经填写的键，避免扩展自身重复建议。
+
+### `setCom/getCom` 跨文件导航
+
+工作区内使用静态字符串注册的组件会建立增量索引：
+
+```javascript
+// components/MyCard.js
+ecodeSDK.setCom('my-app-id', 'MyCard', MyCard);
+
+// pages/index.js
+const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
+```
+
+- 在同一 `appId` 的 `setCom/getCom` 第二个参数中联想已注册组件名。
+- Ctrl+单击或 F12 `getCom` 组件名，可跨文件跳到对应 `setCom` 注册位置。
+- 对组件名执行“查找所有引用”，可查看匹配的注册与获取位置。
+- 索引在扩展启动后后台预热；编辑、保存、新增或删除文件时只更新对应文件。
+
+### 文档入口
+
+- 执行 `Ecode: 搜索开发文档`，可按对象名、方法名、组件名或功能描述搜索内置知识。
+- 执行 `Ecode: 打开官方文档`，可打开
+  [ecodeSDK](https://e-cloudstore.com/doc.html)、
+  [ModeForm / ModeList](https://e-cloudstore.com/doc.html?appId=e783a1d75a784d9b97fbd40fdf569f7d)、
+  [WfForm](https://e-cloudstore.com/doc.html?appId=98cb7a20fae34aa3a7e3a3381dd8764e)
+  或[泛微 PC 组件库](https://cloudstore.e-cology.cn/#/pc/doc/common-index)。
+
 ## 功能
 
 - 使用独立同步基线判断本地变更、远端变更和冲突，不依赖 Git。
@@ -85,6 +132,8 @@ code --install-extension ecode-vscode-0.2.3.vsix
 - 回退未推送的本地新增、修改或删除，并在覆盖或删除现有内容前保存恢复副本。
 - JavaScript 和 JSX 使用 Ecode 在线编辑器对应的 Babel 7.5.5 配置生成编译内容。
 - 冲突时可接受远端，或在手工合并后重新建立同步基线。
+- 提供 Ecode API、PC 组件、嵌套参数和跨文件组件注册的本地代码智能。
+- 提供可搜索的内置开发文档和泛微官方文档入口。
 
 ## 数据与安全
 
@@ -112,6 +161,11 @@ code --install-extension ecode-vscode-0.2.3.vsix
 | `Ecode: 查看差异` | 查看基线、本地和最新远端之间的差异 |
 | `Ecode: 回退本地变更` | 将本地新增、修改或删除回退到同步基线 |
 | `Ecode: 解决冲突` | 接受远端或确认已完成手工合并 |
+| `Ecode: 搜索开发文档` | 按对象名、方法名、组件名或功能描述搜索内置 API 与 PC 组件知识 |
+| `Ecode: 打开官方文档` | 打开 ecodeSDK、ModeForm/ModeList、WfForm 或 PC 组件库官方文档 |
+
+代码智能默认启用；如只需同步功能，可在 VS Code 设置中关闭
+`ecode.intelligence.enabled`。
 
 ## 当前限制
 
@@ -119,6 +173,9 @@ code --install-extension ecode-vscode-0.2.3.vsix
 - 删除同步依赖服务端提供 `/api/cloudstore/ecode/logicalDeleteFile` 和 `/api/cloudstore/ecode/logicalDeleteFolder` 接口。本地整个目录被删除且其中所有远端文件均安全可删时，扩展会同步删除远端目录；不兼容这些接口的 Ecode 版本会返回删除失败，不会提前移除本地同步基线。
 - 不支持多服务器同时连接、后台定时同步和自动推送。
 - 服务端没有事务、版本号或 ETag 时，推送保护无法完全消除检查与上传之间的竞争窗口。
+- 内置 API 与组件说明来自当前已整理的官方文档；Ecology 9、KB 或组件库升级后可能存在新增、删除或行为差异，实际兼容范围以目标环境和官方文档为准。
+- `setCom/getCom` 跨文件导航仅索引静态字符串形式的 `appId` 和组件名；动态变量或运行时拼接无法可靠关联。
+- 大型工作区首次激活时需要后台预热组件注册索引；预热后文件变化采用单文件增量更新。
 
 ## 开发与验证
 

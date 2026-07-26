@@ -1,5 +1,37 @@
 # 更新日志
 
+## 0.3.0 - 2026-07-26
+
+### 新增
+
+- 为 JavaScript、JSX、TypeScript 和 TSX 增加 Ecode 代码智能，收录 `ecodeSDK`、`ModeForm`、`ModeList`、`WfForm` 共 167 个方法、属性或常量，以及 222 个参数说明。
+- 增加成员联想、代码片段、参数签名、悬停说明、对象总览，以及成员和对象级 F12 / Ctrl+单击文档跳转。
+- 内置泛微 PC 组件知识：覆盖 90 个 `ecCom` 组件、37 个 Ecology 9 内置 `antd` 组件和 1911 条 props 参数记录。
+- 为 JSX 组件提供 props 联想，并支持命名导入、解构、赋值及 `window.ecCom/window.antd` 形式。
+- 增加对象和数组项的二级参数联想，覆盖 `WeaBrowser.tabs`、`WeaTable/antd.Table.columns`、`filters`、`rowSelection`，以及 `WfForm`、`ModeForm`、`ecodeSDK` 常用对象参数。
+- 增加 `ecodeSDK.setCom/getCom` 工作区组件名联想、跨文件定义跳转和引用查找。
+- 增加“搜索开发文档”和“打开官方文档”命令。
+
+### 优化
+
+- `setCom/getCom` 索引在启动后后台预热，并在编辑、保存、新增或删除文件时进行单文件增量更新，避免 Ctrl+单击触发全工作区重建。
+- API 成员只使用 VS Code 定义跳转能力，未按 Ctrl 时不会常驻显示链接下划线。
+- 补齐 API 参数类型、是否必填、含义及已整理对象参数的二级说明。
+
+### 兼容性与限制
+
+- 支持 VS Code 1.93.0 或更高版本，以及泛微 E-cology 9 Ecode。
+- 内置知识来自当前已整理的泛微官方文档；不同 Ecology 9、KB 或组件库版本可能存在差异。
+- `setCom/getCom` 跨文件关联仅支持静态字符串形式的 `appId` 和组件名。
+
+### 验证
+
+- `node_modules/.bin/tsc --noEmit`
+- `npm test`：83 项通过
+- `npm run build`
+- `npm run package`
+- `git diff --check`
+
 ## 0.2.3 - 2026-07-24
 
 ### 修复

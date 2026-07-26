@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { resolveSafeLocalPath, resolveSafeSyncRoot } from './domain/paths';
 import { serverFingerprint } from './domain/text';
 import type { ConnectionProfile, SyncChange, SyncOperationResult } from './domain/types';
+import { registerEcodeLanguageFeatures } from './language/EcodeLanguageProvider';
 import { WorkspaceStore } from './storage/WorkspaceStore';
 import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
 import { AuthManager } from './sync/auth/AuthManager';
@@ -43,11 +44,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       EMPTY_SCHEME,
       new VirtualDocumentProvider(EMPTY_SCHEME, service),
     ),
+    ...registerEcodeLanguageFeatures(),
     ...controller.registerCommands(),
   );
 
   await controller.initialize();
-  output.info('Ecode Local 0.2.0 activated without network access');
+  const extensionVersion = String(context.extension.packageJSON.version ?? 'unknown');
+  output.info(`Ecode Local ${extensionVersion} activated without network access`);
 }
 
 export function deactivate(): void {

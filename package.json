@@ -1,8 +1,8 @@
 {
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
-  "description": "泛微 Ecode 安全本地开发扩展：手动拉取、差异预览、冲突保护与选择性推送",
-  "version": "0.2.3",
+  "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
+  "version": "0.3.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -21,7 +21,9 @@
     "泛微",
     "e-cology",
     "本地开发",
-    "同步"
+    "同步",
+    "intellisense",
+    "ecCom"
   ],
   "activationEvents": [
     "onView:ecode.workspace",
@@ -32,7 +34,13 @@
     "onCommand:ecode.pushSelected",
     "onCommand:ecode.openDiff",
     "onCommand:ecode.revertChange",
-    "onCommand:ecode.resolveConflict"
+    "onCommand:ecode.resolveConflict",
+    "onCommand:ecode.searchApiDocumentation",
+    "onCommand:ecode.openOnlineDocumentation",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -71,6 +79,16 @@
         "command": "ecode.resolveConflict",
         "title": "Ecode: 解决冲突",
         "icon": "$(issues)"
+      },
+      {
+        "command": "ecode.searchApiDocumentation",
+        "title": "Ecode: 搜索开发文档",
+        "icon": "$(search)"
+      },
+      {
+        "command": "ecode.openOnlineDocumentation",
+        "title": "Ecode: 打开官方文档",
+        "icon": "$(book)"
       }
     ],
     "viewsContainers": {
@@ -111,6 +129,16 @@
           "command": "ecode.pushSelected",
           "when": "view == ecode.workspace",
           "group": "navigation@4"
+        },
+        {
+          "command": "ecode.searchApiDocumentation",
+          "when": "view == ecode.workspace",
+          "group": "navigation@5"
+        },
+        {
+          "command": "ecode.openOnlineDocumentation",
+          "when": "view == ecode.workspace",
+          "group": "navigation@6"
         }
       ],
       "view/item/context": [
@@ -130,6 +158,16 @@
           "group": "inline@2"
         }
       ]
+    },
+    "configuration": {
+      "title": "Ecode Local",
+      "properties": {
+        "ecode.intelligence.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "为 ecodeSDK、ModeForm、ModeList、WfForm、ecCom 和内置 antd 启用成员与二级对象参数联想、setCom/getCom 工作区导航、参数/props 提示、悬停说明及文档跳转。"
+        }
+      }
     }
   },
   "scripts": {
