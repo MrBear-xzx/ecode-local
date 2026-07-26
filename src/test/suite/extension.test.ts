@@ -27,6 +27,359 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.openDiff'));
     assert.ok(commands.includes('ecode.revertChange'));
     assert.ok(commands.includes('ecode.resolveConflict'));
+    assert.ok(commands.includes('ecode.searchApiDocumentation'));
+    assert.ok(commands.includes('ecode.openOnlineDocumentation'));
     assert.ok(!commands.includes('ecode.branchNew'));
+  });
+
+  test('Ecode language intelligence provides completion, hover, and definition', async () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    if (ext && !ext.isActive) {
+      await ext.activate();
+    }
+    const document = await vscode.workspace.openTextDocument({
+      language: 'javascript',
+      content: [
+        'const value = WfForm.getFieldValue("field110");',
+        'WfForm.',
+        'WfForm.changeFieldValue("field110", ',
+      ].join('\n'),
+    });
+    const completionPosition = new vscode.Position(1, 'WfForm.'.length);
+    const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      completionPosition,
+      '.',
+    );
+    const labels = completions.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(labels.includes('getFieldValue'));
+
+    const methodPosition = new vscode.Position(0, 'const value = WfForm.getF'.length);
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      methodPosition,
+    );
+    assert.ok(hovers.length > 0);
+
+    const definitions = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      methodPosition,
+    );
+    assert.ok(definitions.length > 0);
+    const target = definitions[0] instanceof vscode.Location
+      ? definitions[0].uri
+      : definitions[0].targetUri;
+    assert.strictEqual(target.scheme, 'ecode-doc');
+
+    const objectPosition = new vscode.Position(0, 'const value = Wf'.length);
+    const objectHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      objectPosition,
+    );
+    assert.ok(objectHovers.length > 0);
+    assert.match(
+      objectHovers.flatMap(hover => hover.contents)
+        .map(content => typeof content === 'string' ? content : content.value)
+        .join('\n'),
+      /流程表单前端 API/,
+    );
+
+    const objectDefinitions =
+      await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+        'vscode.executeDefinitionProvider',
+        document.uri,
+        objectPosition,
+      );
+    assert.ok(objectDefinitions.length > 0);
+    const objectTarget = objectDefinitions[0] instanceof vscode.Location
+      ? objectDefinitions[0].uri
+      : objectDefinitions[0].targetUri;
+    assert.strictEqual(objectTarget.toString(), 'ecode-doc:/WfForm/index.md');
+
+    const objectDocument = await vscode.workspace.openTextDocument(objectTarget);
+    assert.match(objectDocument.getText(), /^# WfForm/m);
+    assert.match(objectDocument.getText(), /convertFieldNameToId/);
+    assert.match(objectDocument.getText(), /## 属性与常量/);
+
+    const signaturePosition = new vscode.Position(
+      2,
+      'WfForm.changeFieldValue("field110", '.length,
+    );
+    const signatureHelp = await vscode.commands.executeCommand<vscode.SignatureHelp>(
+      'vscode.executeSignatureHelpProvider',
+      document.uri,
+      signaturePosition,
+      ',',
+    );
+    assert.strictEqual(signatureHelp?.activeParameter, 1);
+    assert.match(
+      String(signatureHelp?.signatures[0].parameters[1].documentation),
+      /specialobj/,
+    );
+
+    const apiDocument = await vscode.workspace.openTextDocument(
+      vscode.Uri.parse('ecode-doc:/WfForm/changeFieldValue.md'),
+    );
+    assert.match(apiDocument.getText(), /\| `valueInfo` \| `object` \| 是 \|/);
+    assert.match(apiDocument.getText(), /specialobj/);
+  });
+
+  test('setCom and getCom support workspace completion, definition, and references', async () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    if (ext && !ext.isActive) {
+      await ext.activate();
+    }
+    const registration = await vscode.workspace.openTextDocument({
+      language: 'javascript',
+      content: [
+        'const CrossFileWidget = () => null;',
+        'ecodeSDK.setCom("app-cross-file-test", "CrossFileWidget", CrossFileWidget);',
+      ].join('\n'),
+    });
+    const usage = await vscode.workspace.openTextDocument({
+      language: 'javascript',
+      content: [
+        'const Widget = ecodeSDK.getCom("app-cross-file-test", "CrossFileWidget");',
+        'const Partial = ecodeSDK.getCom("app-cross-file-test", "Cross',
+      ].join('\n'),
+    });
+
+    const completionPosition = new vscode.Position(
+      1,
+      'const Partial = ecodeSDK.getCom("app-cross-file-test", "Cross'.length,
+    );
+    const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      usage.uri,
+      completionPosition,
+      '"',
+    );
+    const labels = completions.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(labels.includes('CrossFileWidget'));
+
+    const usagePosition = new vscode.Position(
+      0,
+      'const Widget = ecodeSDK.getCom("app-cross-file-test", "Cross'.length,
+    );
+    const definitions =
+      await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+        'vscode.executeDefinitionProvider',
+        usage.uri,
+        usagePosition,
+      );
+    assert.ok(definitions.length > 0);
+    const definitionUri = definitions[0] instanceof vscode.Location
+      ? definitions[0].uri
+      : definitions[0].targetUri;
+    assert.strictEqual(definitionUri.toString(), registration.uri.toString());
+
+    const references = await vscode.commands.executeCommand<vscode.Location[]>(
+      'vscode.executeReferenceProvider',
+      usage.uri,
+      usagePosition,
+    );
+    assert.ok(references.some(location =>
+      location.uri.toString() === registration.uri.toString()));
+    assert.ok(references.some(location =>
+      location.uri.toString() === usage.uri.toString()));
+
+    const incrementalEdit = new vscode.WorkspaceEdit();
+    const registrationNameOffset = registration.lineAt(1).text
+      .indexOf('CrossFileWidget');
+    incrementalEdit.replace(
+      registration.uri,
+      new vscode.Range(
+        1,
+        registrationNameOffset,
+        1,
+        registrationNameOffset + 'CrossFileWidget'.length,
+      ),
+      'IncrementalWidget',
+    );
+    const usageNameOffset = usage.lineAt(0).text.indexOf('CrossFileWidget');
+    incrementalEdit.replace(
+      usage.uri,
+      new vscode.Range(
+        0,
+        usageNameOffset,
+        0,
+        usageNameOffset + 'CrossFileWidget'.length,
+      ),
+      'IncrementalWidget',
+    );
+    assert.strictEqual(await vscode.workspace.applyEdit(incrementalEdit), true);
+
+    const updatedDefinitions =
+      await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+        'vscode.executeDefinitionProvider',
+        usage.uri,
+        new vscode.Position(0, usageNameOffset + 'Incremental'.length),
+      );
+    assert.ok(updatedDefinitions.length > 0);
+    const updatedDefinitionUri = updatedDefinitions[0] instanceof vscode.Location
+      ? updatedDefinitions[0].uri
+      : updatedDefinitions[0].targetUri;
+    assert.strictEqual(updatedDefinitionUri.toString(), registration.uri.toString());
+  });
+
+  test('PC component intelligence provides components, props, hover, and docs', async () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    if (ext && !ext.isActive) {
+      await ext.activate();
+    }
+    const document = await vscode.workspace.openTextDocument({
+      language: 'javascriptreact',
+      content: [
+        'import { WeaInput } from "ecCom";',
+        'const DirectInput = ecCom.WeaInput;',
+        'ecCom.',
+        '<WeaInput ',
+        'const { WeaBrowser } = window.ecCom;',
+        '<WeaBrowser tabs={[{ key: "1", na',
+        '<window.ecCom.WeaTable columns={[{ title: "名称", data',
+        'WfForm.changeFieldValue("field110", { value: "1", spe',
+        'window.ecodeSDK.load({ id: "appId", no',
+        'window.ecCom.',
+      ].join('\n'),
+    });
+
+    const componentPosition = new vscode.Position(2, 'ecCom.'.length);
+    const components = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      componentPosition,
+      '.',
+    );
+    const componentLabels = components.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(componentLabels.includes('WeaInput'));
+    assert.ok(componentLabels.includes('WeaTable'));
+
+    const propPosition = new vscode.Position(3, '<WeaInput '.length);
+    const props = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      propPosition,
+      ' ',
+    );
+    const propLabels = props.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(propLabels.includes('value'));
+    assert.ok(propLabels.includes('viewAttr'));
+    assert.ok(propLabels.includes('onChange'));
+
+    const browserTabPosition = new vscode.Position(
+      5,
+      '<WeaBrowser tabs={[{ key: "1", na'.length,
+    );
+    const browserTabProps = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      browserTabPosition,
+    );
+    const browserTabLabels = browserTabProps.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(browserTabLabels.includes('name'));
+
+    const tableColumnPosition = new vscode.Position(
+      6,
+      '<window.ecCom.WeaTable columns={[{ title: "名称", data'.length,
+    );
+    const tableColumnProps = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      tableColumnPosition,
+    );
+    const tableColumnLabels = tableColumnProps.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(tableColumnLabels.includes('dataIndex'));
+
+    const wfNestedPosition = new vscode.Position(
+      7,
+      'WfForm.changeFieldValue("field110", { value: "1", spe'.length,
+    );
+    const wfNestedProps = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      wfNestedPosition,
+    );
+    const wfNestedLabels = wfNestedProps.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(wfNestedLabels.includes('specialobj'));
+
+    const sdkNestedPosition = new vscode.Position(
+      8,
+      'window.ecodeSDK.load({ id: "appId", no'.length,
+    );
+    const sdkNestedProps = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      sdkNestedPosition,
+    );
+    const sdkNestedLabels = sdkNestedProps.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(sdkNestedLabels.includes('noCss'));
+
+    const windowComponentPosition = new vscode.Position(
+      9,
+      'window.ecCom.'.length,
+    );
+    const windowComponents = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider',
+      document.uri,
+      windowComponentPosition,
+      '.',
+    );
+    const windowComponentLabels = windowComponents.items.map(item =>
+      typeof item.label === 'string' ? item.label : item.label.label);
+    assert.ok(windowComponentLabels.includes('WeaBrowser'));
+
+    const componentWordPosition = new vscode.Position(
+      1,
+      'const DirectInput = ecCom.Wea'.length,
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      componentWordPosition,
+    );
+    assert.ok(hovers.length > 0);
+
+    const definitions = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      componentWordPosition,
+    );
+    assert.ok(definitions.length > 0);
+    const target = definitions[0] instanceof vscode.Location
+      ? definitions[0].uri
+      : definitions[0].targetUri;
+    assert.strictEqual(target.scheme, 'ecode-doc');
+    assert.match(target.path, /component\/ecCom\/WeaInput/);
+
+    const componentDocument = await vscode.workspace.openTextDocument(
+      vscode.Uri.parse('ecode-doc:/component/ecCom/WeaInput.md'),
+    );
+    assert.match(componentDocument.getText(), /Props 参数说明/);
+    assert.match(componentDocument.getText(), /\| `viewAttr` \|/);
+    assert.match(componentDocument.getText(), /泛微 PC 组件库/);
+
+    const browserDocument = await vscode.workspace.openTextDocument(
+      vscode.Uri.parse('ecode-doc:/component/ecCom/WeaBrowser.md'),
+    );
+    assert.match(browserDocument.getText(), /`tabs` 二级参数/);
+    assert.match(browserDocument.getText(), /\| `browserProps` \|/);
+
+    const nestedApiDocument = await vscode.workspace.openTextDocument(
+      vscode.Uri.parse('ecode-doc:/WfForm/changeFieldValue.md'),
+    );
+    assert.match(nestedApiDocument.getText(), /`valueInfo` 二级参数/);
+    assert.match(nestedApiDocument.getText(), /\| `specialobj` \|/);
   });
 });
