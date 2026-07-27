@@ -2,7 +2,12 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { StoredConflict, SyncManifest } from '../../domain/types';
+import type {
+  ConnectionProfile,
+  LegacyConnectionProfile,
+  StoredConflict,
+  SyncManifest,
+} from '../../domain/types';
 import { WorkspaceStore } from '../../storage/WorkspaceStore';
 
 suite('Workspace store', () => {
@@ -48,6 +53,31 @@ suite('Workspace store', () => {
 
     assert.ok(restored.files['Type/a.js']);
     assert.deepStrictEqual(otherIdentity.files, {});
+  });
+
+  test('reads and clears a legacy v2 connection profile separately', async () => {
+    const legacy: LegacyConnectionProfile = {
+      version: 2,
+      workspaceFolder: path.join(root, 'workspace'),
+      serverUrl: 'https://example.test',
+      username: 'sysadmin',
+      localDirectory: 'custom-source',
+    };
+    state.set('ecode.v2.profile', legacy);
+
+    assert.deepStrictEqual(await store.getLegacyProfile(), legacy);
+    assert.strictEqual(await store.getProfile(), undefined);
+    await store.clearLegacyProfile();
+    assert.strictEqual(await store.getLegacyProfile(), undefined);
+
+    const current: ConnectionProfile = {
+      version: 3,
+      workspaceFolder: legacy.workspaceFolder,
+      serverUrl: legacy.serverUrl,
+      username: legacy.username,
+    };
+    await store.saveProfile(current);
+    assert.deepStrictEqual(await store.getProfile(), current);
   });
 
   test('scopes stored conflicts to the active connection identity', async () => {

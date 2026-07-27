@@ -6,7 +6,7 @@ import {
   assertNoCaseCollisions,
   normalizeRemotePath,
   resolveSafeLocalPath,
-  resolveSafeSyncRoot,
+  resolveEcodeSourceRoot,
 } from '../domain/paths';
 import { buildLocalChanges, buildSyncPlan } from '../domain/syncPlanner';
 import { hashText, isSupportedText, serverFingerprint } from '../domain/text';
@@ -716,7 +716,7 @@ export class EcodeSyncService {
     if (!profile) {
       throw new Error('请先配置 Ecode 连接');
     }
-    const syncRoot = resolveSafeSyncRoot(profile.workspaceFolder, profile.localDirectory);
+    const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
     const fingerprint = serverFingerprint(profile.serverUrl, profile.username);
     const manifest = await this.store.loadManifest(fingerprint, syncRoot);
     return { profile, syncRoot, manifest };

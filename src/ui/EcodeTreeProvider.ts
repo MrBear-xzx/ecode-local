@@ -1,5 +1,10 @@
 import * as vscode from 'vscode';
-import type { ConnectionProfile, SyncChange } from '../domain/types';
+import { ECODE_SOURCE_DIRECTORY } from '../domain/constants';
+import type {
+  ConnectionProfile,
+  LegacyConnectionProfile,
+  SyncChange,
+} from '../domain/types';
 
 type EcodeTreeNode =
   | { type: 'message'; label: string; description?: string; command?: vscode.Command }
@@ -11,6 +16,7 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
   readonly onDidChangeTreeData = this.changed.event;
 
   private profile: ConnectionProfile | undefined;
+  private legacyProfile: LegacyConnectionProfile | undefined;
   private changes: SyncChange[] = [];
   private busyMessage: string | undefined;
   private lastSync: string | undefined;
@@ -20,8 +26,10 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
     changes: SyncChange[],
     busyMessage?: string,
     lastSync?: string,
+    legacyProfile?: LegacyConnectionProfile,
   ): void {
     this.profile = profile;
+    this.legacyProfile = legacyProfile;
     this.changes = changes;
     this.busyMessage = busyMessage;
     this.lastSync = lastSync;
@@ -77,6 +85,17 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
     }
 
     if (!this.profile) {
+      if (this.legacyProfile) {
+        return [{
+          type: 'message',
+          label: '旧源码目录需要迁移',
+          description: this.legacyProfile.localDirectory,
+          command: {
+            command: 'ecode.confirmSourceDirectoryMigration',
+            title: '确认改用固定的 ecode/ 目录',
+          },
+        }];
+      }
       return [{
         type: 'message',
         label: '尚未配置 Ecode 连接',
@@ -96,8 +115,8 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
           },
           {
             type: 'message',
-            label: '本地目录',
-            description: this.profile.localDirectory,
+            label: '源码目录（固定）',
+            description: `${ECODE_SOURCE_DIRECTORY}/`,
           },
           {
             type: 'message',

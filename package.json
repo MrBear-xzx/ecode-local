@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -37,6 +37,10 @@
     "onCommand:ecode.resolveConflict",
     "onCommand:ecode.searchApiDocumentation",
     "onCommand:ecode.openOnlineDocumentation",
+    "onCommand:ecode.refreshAiSupport",
+    "onCommand:ecode.openAiGuide",
+    "onCommand:ecode.removeAiSupport",
+    "onCommand:ecode.confirmSourceDirectoryMigration",
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
     "onLanguage:typescript",
@@ -89,6 +93,26 @@
         "command": "ecode.openOnlineDocumentation",
         "title": "Ecode: 打开官方文档",
         "icon": "$(book)"
+      },
+      {
+        "command": "ecode.refreshAiSupport",
+        "title": "Ecode: 刷新 AI Coding 支持",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "ecode.openAiGuide",
+        "title": "Ecode: 打开 AI Coding 指南",
+        "icon": "$(book)"
+      },
+      {
+        "command": "ecode.removeAiSupport",
+        "title": "Ecode: 移除 AI Coding 支持",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ecode.confirmSourceDirectoryMigration",
+        "title": "Ecode: 确认迁移到固定源码目录",
+        "icon": "$(folder-active)"
       }
     ],
     "viewsContainers": {
@@ -113,32 +137,47 @@
         {
           "command": "ecode.configure",
           "when": "view == ecode.workspace",
-          "group": "navigation@1"
+          "group": "1_connection@1"
         },
         {
           "command": "ecode.pull",
           "when": "view == ecode.workspace",
-          "group": "navigation@2"
+          "group": "navigation@1"
         },
         {
           "command": "ecode.refreshChanges",
           "when": "view == ecode.workspace",
-          "group": "navigation@3"
+          "group": "navigation@2"
         },
         {
           "command": "ecode.pushSelected",
           "when": "view == ecode.workspace",
-          "group": "navigation@4"
+          "group": "navigation@3"
         },
         {
           "command": "ecode.searchApiDocumentation",
           "when": "view == ecode.workspace",
-          "group": "navigation@5"
+          "group": "2_documentation@1"
         },
         {
           "command": "ecode.openOnlineDocumentation",
           "when": "view == ecode.workspace",
-          "group": "navigation@6"
+          "group": "2_documentation@2"
+        },
+        {
+          "command": "ecode.openAiGuide",
+          "when": "view == ecode.workspace",
+          "group": "2_documentation@3"
+        },
+        {
+          "command": "ecode.refreshAiSupport",
+          "when": "view == ecode.workspace",
+          "group": "3_ai@1"
+        },
+        {
+          "command": "ecode.removeAiSupport",
+          "when": "view == ecode.workspace",
+          "group": "3_ai@2"
         }
       ],
       "view/item/context": [
@@ -166,6 +205,12 @@
           "type": "boolean",
           "default": true,
           "description": "为 ecodeSDK、ModeForm、ModeList、WfForm、ecCom 和内置 antd 启用成员与二级对象参数联想、setCom/getCom 工作区导航、参数/props 提示、悬停说明及文档跳转。"
+        },
+        "ecode.aiSupport.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "在工作区根目录生成并自动刷新 .ecode-ai 和 AGENTS.md 的 Ecode AI Coding 支持资料。"
         }
       }
     }

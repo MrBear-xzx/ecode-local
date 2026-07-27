@@ -707,11 +707,10 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
   authState: { reconnects: number };
 } {
   const profile: ConnectionProfile = {
-    version: 2,
+    version: 3,
     workspaceFolder,
     serverUrl,
     username: 'test',
-    localDirectory: 'ecode',
   };
   const store = new MemoryStore(profile);
   const client = new EcodeApiClient(serverUrl);

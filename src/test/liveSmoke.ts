@@ -22,11 +22,10 @@ async function main(): Promise<void> {
 
   try {
     const profile: ConnectionProfile = {
-      version: 2,
+      version: 3,
       workspaceFolder: temporaryRoot,
       serverUrl,
       username,
-      localDirectory: 'ecode',
     };
     const secrets = new MemorySecretStorage();
     const auth = new AuthManager({ secrets } as never);
