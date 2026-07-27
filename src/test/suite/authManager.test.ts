@@ -120,11 +120,10 @@ suite('Auth manager', () => {
 
 function createProfile(serverUrl: string): ConnectionProfile {
   return {
-    version: 2,
+    version: 3,
     workspaceFolder: process.cwd(),
     serverUrl,
     username: 'test-user',
-    localDirectory: 'ecode',
   };
 }
 

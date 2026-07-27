@@ -1,5 +1,39 @@
 # 更新日志
 
+## 0.4.0 - 2026-07-27
+
+### 新增
+
+- 连接成功后在工作区根目录生成 `.ecode-ai/`，为 AI Coding 工具提供 Ecode 全局 API、完整参数说明、嵌套参数、`ecCom/antd` 组件 props 和项目组件注册关系。
+- 自动维护根目录 `AGENTS.md` 的 Ecode 标记区块，引导 AI 在生成代码前读取对应声明、平台约束和 `setCom/getCom` 索引。
+- AGENTS 管理区块包含 Ecode 平台定位、运行时全局对象、Babel 兼容范围、目录边界和远端操作限制，使通用 Agent 首次进入工作区即可建立正确上下文。
+- 增加“刷新 AI Coding 支持”“打开 AI Coding 指南”“移除 AI Coding 支持”和“确认迁移到固定源码目录”命令。
+- 增加 `ecode.aiSupport.enabled` 工作区配置。
+
+### 调整
+
+- Ecode 源码目录固定为工作区根目录下的 `ecode/`，配置连接时不再允许修改同步目录。
+- 连接配置升级为 v3；旧配置使用 `ecode/` 时无感迁移，使用其他目录时暂停同步并要求确认，不移动、复制、覆盖或删除旧源码。
+- `WorkspaceComponentRegistry` 由语言服务和 AI 支持服务共享；AI 组件表只导出 `ecode/` 内的静态 `setCom/getCom` 调用。
+- 自动和手动刷新 AI 支持时都会重新扫描 `ecode/` 并清理已删除文件的注册记录，兼容外部 AI Agent 直接操作文件或删除目录。
+- 精简 Ecode 视图标题栏，只保留拉取、刷新变更和选择并推送；连接配置、开发文档和 AI Coding 维护命令移入 `...` 更多操作并分组展示。
+- 版本号升级为 `0.4.0`。
+
+### 类型与安全
+
+- 已知类型转换为有效 TypeScript 类型；资料不足或含义不明确的类型保守输出为 `unknown`，并在 JSDoc 中保留原始类型和参数说明。
+- `.ecode-ai/` 与 `ecode/` 平级，不进入 Ecode 同步扫描；扩展不修改 `jsconfig.json`、`tsconfig.json` 或 Git 配置。
+- 生成文件使用确定性内容和原子写入；AGENTS 标记异常时停止覆盖用户文档。
+
+### 验证
+
+- `node_modules/.bin/tsc --noEmit`
+- `npm test`：93 项通过
+- `npm run build`
+- `npm run package`
+- `git diff --check`
+- 使用 Codex 在查询报表中增加新建按钮并跳转到流程，生成代码及实际功能验证正常。
+
 ## 0.3.0 - 2026-07-26
 
 ### 新增

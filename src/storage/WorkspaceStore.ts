@@ -3,12 +3,14 @@ import * as path from 'path';
 import type * as vscode from 'vscode';
 import type {
   ConnectionProfile,
+  LegacyConnectionProfile,
   StoredConflict,
   SyncManifest,
 } from '../domain/types';
 import { hashText } from '../domain/text';
 
-const PROFILE_KEY = 'ecode.v2.profile';
+const PROFILE_KEY = 'ecode.v3.profile';
+const LEGACY_PROFILE_KEY = 'ecode.v2.profile';
 const MANIFEST_FILE = 'sync-manifest.json';
 
 export class WorkspaceStore {
@@ -18,11 +20,21 @@ export class WorkspaceStore {
 
   async getProfile(): Promise<ConnectionProfile | undefined> {
     const value = this.context.workspaceState.get<ConnectionProfile>(PROFILE_KEY);
+    return value?.version === 3 ? value : undefined;
+  }
+
+  async getLegacyProfile(): Promise<LegacyConnectionProfile | undefined> {
+    const value = this.context.workspaceState
+      .get<LegacyConnectionProfile>(LEGACY_PROFILE_KEY);
     return value?.version === 2 ? value : undefined;
   }
 
   async saveProfile(profile: ConnectionProfile): Promise<void> {
     await this.context.workspaceState.update(PROFILE_KEY, profile);
+  }
+
+  async clearLegacyProfile(): Promise<void> {
+    await this.context.workspaceState.update(LEGACY_PROFILE_KEY, undefined);
   }
 
   async loadManifest(serverFingerprint: string, syncRoot: string): Promise<SyncManifest> {

@@ -56,12 +56,12 @@ const LANGUAGE_SELECTOR: vscode.DocumentSelector = [
   { language: 'typescriptreact' },
 ];
 
-export function registerEcodeLanguageFeatures(): vscode.Disposable[] {
-  const registry = new WorkspaceComponentRegistry();
+export function registerEcodeLanguageFeatures(
+  registry: WorkspaceComponentRegistry,
+): vscode.Disposable[] {
   const provider = new EcodeLanguageProvider(registry);
   const documentation = new EcodeDocumentationProvider();
   return [
-    registry,
     vscode.workspace.registerTextDocumentContentProvider(ECODE_DOC_SCHEME, documentation),
     vscode.languages.registerCompletionItemProvider(
       LANGUAGE_SELECTOR,

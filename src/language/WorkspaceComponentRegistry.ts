@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import {
   parseEcodeComponentCalls,
   type EcodeComponentCall,
@@ -26,6 +27,8 @@ export interface RegisteredEcodeComponent {
 
 export class WorkspaceComponentRegistry implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[];
+  private readonly changed = new vscode.EventEmitter<void>();
+  readonly onDidChange = this.changed.event;
   private readonly callsByUri = new Map<
     string,
     readonly IndexedEcodeComponentCall[]
@@ -36,6 +39,7 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
   constructor() {
     const watcher = vscode.workspace.createFileSystemWatcher(SOURCE_GLOB);
     this.disposables = [
+      this.changed,
       watcher,
       watcher.onDidCreate(uri => {
         void this.refreshFile(uri);
@@ -96,6 +100,44 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
         definitions: calls,
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async getSnapshot(
+    sourceRoot: string,
+  ): Promise<readonly IndexedEcodeComponentCall[]> {
+    await this.ready;
+    const root = path.resolve(sourceRoot);
+    return this.currentCalls()
+      .filter(call =>
+        call.uri.scheme === 'file'
+        && isInside(root, path.resolve(call.uri.fsPath)))
+      .sort(compareCalls);
+  }
+
+  async refreshSourceRoot(sourceRoot: string): Promise<void> {
+    await this.ready;
+    const root = path.resolve(sourceRoot);
+    const fileUris = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(sourceRoot, SOURCE_GLOB),
+      EXCLUDE_GLOB,
+    );
+    const discovered = new Set(fileUris.map(uri => uri.toString()));
+    await Promise.all(fileUris.map(uri => this.loadFile(uri, true)));
+
+    const staleUris = [...this.callsByUri.keys()]
+      .map(key => vscode.Uri.parse(key))
+      .filter(uri =>
+        uri.scheme === 'file'
+        && isInside(root, path.resolve(uri.fsPath))
+        && !discovered.has(uri.toString()));
+    for (const uri of staleUris) {
+      try {
+        await vscode.workspace.fs.stat(uri);
+        await this.loadFile(uri, true);
+      } catch {
+        this.removeUri(uri);
+      }
+    }
   }
 
   async getDefinitions(
@@ -160,7 +202,9 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
       }
     } catch {
       if ((this.uriRevisions.get(key) ?? 0) === revision) {
-        this.callsByUri.delete(key);
+        if (this.callsByUri.delete(key)) {
+          this.changed.fire();
+        }
       }
     }
   }
@@ -174,7 +218,9 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
   private removeUri(uri: vscode.Uri): void {
     const key = uri.toString();
     this.bumpRevision(key);
-    this.callsByUri.delete(key);
+    if (this.callsByUri.delete(key)) {
+      this.changed.fire();
+    }
   }
 
   private bumpRevision(key: string): number {
@@ -187,10 +233,14 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
     key: string,
     calls: readonly IndexedEcodeComponentCall[],
   ): void {
+    const previous = this.callsByUri.get(key) ?? [];
     if (calls.length > 0) {
       this.callsByUri.set(key, calls);
     } else {
       this.callsByUri.delete(key);
+    }
+    if (!sameCalls(previous, calls)) {
+      this.changed.fire();
     }
   }
 
@@ -202,6 +252,42 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
   private currentCalls(): readonly IndexedEcodeComponentCall[] {
     return [...this.callsByUri.values()].flat();
   }
+}
+
+function sameCalls(
+  left: readonly IndexedEcodeComponentCall[],
+  right: readonly IndexedEcodeComponentCall[],
+): boolean {
+  return left.length === right.length
+    && left.every((call, index) => {
+      const candidate = right[index];
+      return candidate !== undefined
+        && call.kind === candidate.kind
+        && call.appId === candidate.appId
+        && call.name === candidate.name
+        && call.nameRange.start === candidate.nameRange.start
+        && call.nameRange.end === candidate.nameRange.end;
+    });
+}
+
+function isInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === ''
+    || (!relative.startsWith(`..${path.sep}`)
+      && relative !== '..'
+      && !path.isAbsolute(relative));
+}
+
+function compareCalls(
+  left: IndexedEcodeComponentCall,
+  right: IndexedEcodeComponentCall,
+): number {
+  return left.appId.localeCompare(right.appId)
+    || left.name.localeCompare(right.name)
+    || left.kind.localeCompare(right.kind)
+    || left.uri.fsPath.localeCompare(right.uri.fsPath)
+    || left.range.start.line - right.range.start.line
+    || left.range.start.character - right.range.start.character;
 }
 
 function isSourceDocument(document: vscode.TextDocument): boolean {

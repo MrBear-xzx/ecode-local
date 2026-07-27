@@ -1,4 +1,11 @@
 export interface ConnectionProfile {
+  version: 3;
+  workspaceFolder: string;
+  serverUrl: string;
+  username: string;
+}
+
+export interface LegacyConnectionProfile {
   version: 2;
   workspaceFolder: string;
   serverUrl: string;

@@ -5,8 +5,9 @@ import * as path from 'path';
 import {
   assertNoCaseCollisions,
   normalizeRemotePath,
+  resolveEcodeSourceRoot,
+  resolveLegacySyncRoot,
   resolveSafeLocalPath,
-  resolveSafeSyncRoot,
 } from '../../domain/paths';
 
 suite('Path safety', () => {
@@ -21,7 +22,7 @@ suite('Path safety', () => {
   });
 
   test('keeps configured and remote paths inside the workspace', () => {
-    const syncRoot = resolveSafeSyncRoot(root, 'ecode');
+    const syncRoot = resolveEcodeSourceRoot(root);
     assert.strictEqual(syncRoot, path.join(root, 'ecode'));
     assert.strictEqual(
       resolveSafeLocalPath(syncRoot, 'type/folder/a.js'),
@@ -30,9 +31,9 @@ suite('Path safety', () => {
   });
 
   test('rejects absolute and traversing local directories', () => {
-    assert.throws(() => resolveSafeSyncRoot(root, path.resolve(root, 'ecode')));
-    assert.throws(() => resolveSafeSyncRoot(root, '../outside'));
-    assert.throws(() => resolveSafeSyncRoot(root, 'ecode/../outside'));
+    assert.throws(() => resolveLegacySyncRoot(root, path.resolve(root, 'ecode')));
+    assert.throws(() => resolveLegacySyncRoot(root, '../outside'));
+    assert.throws(() => resolveLegacySyncRoot(root, 'ecode/../outside'));
   });
 
   test('rejects a configured directory that escapes through a symbolic link', function () {
@@ -48,7 +49,7 @@ suite('Path safety', () => {
         }
         throw error;
       }
-      assert.throws(() => resolveSafeSyncRoot(root, 'linked/ecode'), /工作区范围/);
+      assert.throws(() => resolveLegacySyncRoot(root, 'linked/ecode'), /工作区范围/);
     } finally {
       fs.rmSync(outside, { recursive: true, force: true });
     }

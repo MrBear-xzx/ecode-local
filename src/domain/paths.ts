@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { ECODE_SOURCE_DIRECTORY } from './constants';
 
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const WINDOWS_INVALID = /[<>:"|?*\u0000-\u001F]/;
@@ -52,7 +53,14 @@ export function assertNoCaseCollisions(paths: Iterable<string>): void {
   }
 }
 
-export function resolveSafeSyncRoot(workspaceFolder: string, localDirectory: string): string {
+export function resolveEcodeSourceRoot(workspaceFolder: string): string {
+  return resolveWorkspaceSubdirectory(workspaceFolder, ECODE_SOURCE_DIRECTORY);
+}
+
+export function resolveLegacySyncRoot(
+  workspaceFolder: string,
+  localDirectory: string,
+): string {
   const segments = localDirectory.split(/[\\/]+/);
   if (
     !localDirectory.trim()
@@ -62,6 +70,13 @@ export function resolveSafeSyncRoot(workspaceFolder: string, localDirectory: str
     throw new Error('本地目录必须是工作区内的相对路径');
   }
 
+  return resolveWorkspaceSubdirectory(workspaceFolder, localDirectory);
+}
+
+function resolveWorkspaceSubdirectory(
+  workspaceFolder: string,
+  localDirectory: string,
+): string {
   const workspaceRoot = path.resolve(workspaceFolder);
   const target = path.resolve(workspaceRoot, localDirectory);
   assertInside(workspaceRoot, target);

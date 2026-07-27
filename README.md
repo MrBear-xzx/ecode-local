@@ -1,6 +1,6 @@
 # Ecode Local
 
-Ecode Local 是面向泛微 E-cology 9 Ecode 的 VS Code 扩展，用于在本地安全编辑和发布 Ecode 源码。
+Ecode Local 是面向泛微 E-cology 9 Ecode 的 VS Code 扩展，用于在本地安全编辑和发布 Ecode 源码，并为 VS Code 与通用 AI Coding Agent 提供 Ecode API、组件和工作区上下文。
 
 ## 安装
 
@@ -14,7 +14,7 @@ Ecode Local 是面向泛微 E-cology 9 Ecode 的 VS Code 扩展，用于在本�
 也可以在终端中安装：
 
 ```bash
-code --install-extension ecode-vscode-0.3.0.vsix
+code --install-extension ecode-vscode-0.4.0.vsix
 ```
 
 安装完成后，VS Code 活动栏中会出现 **Ecode** 图标。
@@ -26,6 +26,18 @@ code --install-extension ecode-vscode-0.3.0.vsix
 - 支持统一认证在登录过程中刷新 `ecology_JSessionid` 的部署方式。
 - 其他 E-cology 或 Ecode 版本尚未验证，不保证兼容。
 
+## 从旧版本升级到 0.4.0
+
+0.4.0 将 Ecode 源码目录固定为工作区根目录下的 `ecode/`：
+
+- 原同步目录已经是 `ecode/`：连接配置会无感升级，无需重新输入密码。
+- 原同步目录是其他自定义目录：同步和文件监听会暂停，并要求执行
+  `Ecode: 确认迁移到固定源码目录`。
+- 扩展不会移动、复制、覆盖或删除旧目录；新的 `ecode/` 已有内容时还会要求再次确认。
+- 旧同步清单仅在原同步根目录与新 `ecode/` 一致时复用，否则会从空基线重新检查差异。
+
+建议升级前自行备份重要源码。确认迁移后，由用户决定是否拉取远端或使用已有 `ecode/` 内容，扩展不会自动覆盖文件。
+
 ## 首次使用
 
 使用前请准备 E-cology 服务器地址，以及具备 Ecode 源码读取和发布权限的账号。
@@ -36,14 +48,13 @@ code --install-extension ecode-vscode-0.3.0.vsix
    - **服务器地址**：包含 `http://` 或 `https://` 的 E-cology 地址，例如 `https://ecology.example.com`。
    - **登录用户名**：用于访问 Ecode 的账号。
    - **密码**：仅保存到 VS Code `SecretStorage`。
-   - **本地同步子目录**：相对于当前工作区的目录，默认为 `ecode`；不能指向工作区外部。
-4. 连接测试成功后，点击侧边栏标题栏中的“全量拉取”，确认后建立本地文件与远端文件的同步基线。
+4. 连接测试成功后，扩展固定使用工作区根目录下的 `ecode/` 作为源码目录；点击侧边栏标题栏中的“全量拉取”，确认后建立本地文件与远端文件的同步基线。
 
 首次拉取会检查完整远端源码树。已有本地修改不会被静默覆盖；请根据结果处理侧边栏中显示的变更或冲突。
 
 ## 日常使用
 
-1. 在配置的本地同步目录中编辑源码。
+1. 在工作区根目录的 `ecode/` 中编辑源码。
 2. 停止修改 2 秒后，侧边栏会自动刷新变更；也可以执行 `Ecode: 刷新本地变更`。
 3. 点击变更文件查看基线、本地和最新远端之间的差异。
 4. 点击“选择并推送”，勾选本次要发布的新增、修改或删除文件。
@@ -98,7 +109,7 @@ code --install-extension ecode-vscode-0.3.0.vsix
 
 ### `setCom/getCom` 跨文件导航
 
-工作区内使用静态字符串注册的组件会建立增量索引：
+`ecode/` 内使用静态字符串注册的组件会建立增量索引：
 
 ```javascript
 // components/MyCard.js
@@ -113,7 +124,39 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
 - 对组件名执行“查找所有引用”，可查看匹配的注册与获取位置。
 - 索引在扩展启动后后台预热；编辑、保存、新增或删除文件时只更新对应文件。
 
-### 文档入口
+## AI Coding 支持
+
+连接成功后，扩展默认在工作区根目录生成以下资料：
+
+```text
+workspace/
+├─ ecode/                         # 固定 Ecode 源码目录
+├─ .ecode-ai/
+│  ├─ ecode-globals.d.ts          # 全局 API、签名、参数和嵌套参数
+│  ├─ ecode-components.d.ts       # ecCom/antd 组件及 props
+│  ├─ ecode-ai-guide.md           # 平台约束和生成规则
+│  ├─ workspace-components.md     # setCom/getCom 组件关系
+│  └─ manifest.json               # 生成器版本与知识摘要
+└─ AGENTS.md                      # 仅维护 Ecode 标记区块
+```
+
+- `.ecode-ai/` 与 `ecode/` 平级，不会被拉取、扫描或推送到 Ecode 平台。
+- 类型信息直接由扩展内置 API、参数和组件知识生成；资料不足的类型使用 `unknown`，原始文档类型保留在注释中。
+- `workspace-components.md` 只记录 `ecode/` 中的静态 `setCom/getCom` 调用。
+- 已有 `AGENTS.md` 的其他内容会完整保留；扩展只更新
+  `<!-- ecode-local:ai-start -->` 与 `<!-- ecode-local:ai-end -->` 之间的内容。
+- AGENTS 管理区块会向通用 Agent 说明 Ecode 平台、运行时全局对象、Babel 兼容范围、目录边界和修改前必须读取的知识文件，避免把项目误判为普通 Node.js 或 React 工程。
+- 如果 AGENTS 标记残缺、重复、顺序错误或发生嵌套，扩展会停止覆盖并提示修复，不会重写用户的其他内容。
+- 可通过 `ecode.aiSupport.enabled` 关闭自动生成。扩展不会创建或修改 `jsconfig.json`、`tsconfig.json`、Git 配置或忽略规则。
+
+### 外部 Agent 修改后的刷新机制
+
+- VS Code 与扩展宿主正在运行时，即使文件由命令行、Codex 或其他通用 Agent 直接修改，工作区文件监听也会检测 `ecode/` 中的新增、修改和删除，并在防抖后刷新组件索引及 `workspace-components.md`。
+- 执行 `Ecode: 刷新 AI Coding 支持` 时会重新扫描整个 `ecode/`，因此可以清理已从磁盘删除的文件或目录所留下的旧组件记录。
+- VS Code 已关闭或扩展尚未激活时，没有后台进程可以立即更新文件；下次打开工作区并激活扩展，或手动执行刷新命令时会重新核对。
+- 生成内容没有变化时不会重写文件，避免产生无意义的文件时间戳变化。
+
+## 文档与维护入口
 
 - 执行 `Ecode: 搜索开发文档`，可按对象名、方法名、组件名或功能描述搜索内置知识。
 - 执行 `Ecode: 打开官方文档`，可打开
@@ -121,6 +164,7 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
   [ModeForm / ModeList](https://e-cloudstore.com/doc.html?appId=e783a1d75a784d9b97fbd40fdf569f7d)、
   [WfForm](https://e-cloudstore.com/doc.html?appId=98cb7a20fae34aa3a7e3a3381dd8764e)
   或[泛微 PC 组件库](https://cloudstore.e-cology.cn/#/pc/doc/common-index)。
+- 视图标题栏只保留拉取、刷新变更和选择并推送三个高频操作；配置连接、文档入口和 AI Coding 维护命令收纳在标题栏的 `...` 更多操作中。
 
 ## 功能
 
@@ -140,7 +184,8 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
 - 扩展启动时不会自动联网、拉取或推送。
 - 密码和 Cookie 保存在 VS Code `SecretStorage`。
 - 连接配置、同步基线、内容快照和恢复副本保存在 VS Code 扩展存储中。
-- 同步目录必须位于当前 VS Code 工作区内。
+- Ecode 同步源码固定在当前 VS Code 工作区根目录的 `ecode/`。
+- AI Coding 资料位于工作区根目录的 `.ecode-ai/` 和 `AGENTS.md`，不包含连接凭据。
 - 扩展不会初始化、切换、提交或修改 Git 仓库。
 
 ## 升级与卸载
@@ -150,11 +195,13 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
 
 升级或卸载扩展不会删除工作区中的源码。连接配置、同步基线和恢复副本属于 VS Code 扩展存储；卸载前如需保留重要内容，请先自行备份。
 
+0.4.0 的目录迁移规则见[从旧版本升级到 0.4.0](#从旧版本升级到-040)。
+
 ## 命令
 
 | 命令 | 用途 |
 | --- | --- |
-| `Ecode: 配置连接` | 测试并保存服务器、账号和本地目录 |
+| `Ecode: 配置连接` | 测试并保存服务器和账号；源码目录固定为 `ecode/` |
 | `Ecode: 全量拉取` | 获取完整远端文件树并安全应用远端变化 |
 | `Ecode: 刷新本地变更` | 立即比较本地文件和同步基线；自动刷新遗漏时可手动执行 |
 | `Ecode: 选择并推送` | 勾选新增、修改或删除文件并安全推送 |
@@ -163,9 +210,14 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
 | `Ecode: 解决冲突` | 接受远端或确认已完成手工合并 |
 | `Ecode: 搜索开发文档` | 按对象名、方法名、组件名或功能描述搜索内置 API 与 PC 组件知识 |
 | `Ecode: 打开官方文档` | 打开 ecodeSDK、ModeForm/ModeList、WfForm 或 PC 组件库官方文档 |
+| `Ecode: 刷新 AI Coding 支持` | 重新生成 `.ecode-ai/` 和 AGENTS 管理区块 |
+| `Ecode: 打开 AI Coding 指南` | 打开生成的平台约束和编码指南 |
+| `Ecode: 移除 AI Coding 支持` | 删除受管理的 AI 文件和 AGENTS 区块并关闭自动生成 |
+| `Ecode: 确认迁移到固定源码目录` | 将旧连接改为固定的 `ecode/`，不移动或删除旧目录 |
 
 代码智能默认启用；如只需同步功能，可在 VS Code 设置中关闭
 `ecode.intelligence.enabled`。
+AI Coding 支持也默认启用，可通过 `ecode.aiSupport.enabled` 单独关闭。
 
 ## 当前限制
 

@@ -29,7 +29,37 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.resolveConflict'));
     assert.ok(commands.includes('ecode.searchApiDocumentation'));
     assert.ok(commands.includes('ecode.openOnlineDocumentation'));
+    assert.ok(commands.includes('ecode.refreshAiSupport'));
+    assert.ok(commands.includes('ecode.openAiGuide'));
+    assert.ok(commands.includes('ecode.removeAiSupport'));
+    assert.ok(commands.includes('ecode.confirmSourceDirectoryMigration'));
     assert.ok(!commands.includes('ecode.branchNew'));
+  });
+
+  test('Ecode view title keeps only primary sync actions visible', () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    const menus = ext?.packageJSON.contributes?.menus?.['view/title'] as
+      | Array<{ command: string; group?: string }>
+      | undefined;
+    assert.ok(menus);
+    const visible = menus
+      .filter(item => item.group?.startsWith('navigation'))
+      .map(item => item.command);
+    const overflow = menus
+      .filter(item => !item.group?.startsWith('navigation'))
+      .map(item => item.command);
+
+    assert.deepStrictEqual(visible, [
+      'ecode.pull',
+      'ecode.refreshChanges',
+      'ecode.pushSelected',
+    ]);
+    assert.ok(overflow.includes('ecode.configure'));
+    assert.ok(overflow.includes('ecode.searchApiDocumentation'));
+    assert.ok(overflow.includes('ecode.openOnlineDocumentation'));
+    assert.ok(overflow.includes('ecode.openAiGuide'));
+    assert.ok(overflow.includes('ecode.refreshAiSupport'));
+    assert.ok(overflow.includes('ecode.removeAiSupport'));
   });
 
   test('Ecode language intelligence provides completion, hover, and definition', async () => {
