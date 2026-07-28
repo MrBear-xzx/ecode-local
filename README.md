@@ -14,7 +14,7 @@ Ecode Local 是面向泛微 E-cology 9 Ecode 的 VS Code 扩展，用于在本�
 也可以在终端中安装：
 
 ```bash
-code --install-extension ecode-vscode-0.4.0.vsix
+code --install-extension ecode-vscode-0.5.0.vsix
 ```
 
 安装完成后，VS Code 活动栏中会出现 **Ecode** 图标。
@@ -25,6 +25,18 @@ code --install-extension ecode-vscode-0.4.0.vsix
 - 目前仅在泛微 E-cology 9 Ecode 环境中完成测试和实际使用。
 - 支持统一认证在登录过程中刷新 `ecology_JSessionid` 的部署方式。
 - 其他 E-cology 或 Ecode 版本尚未验证，不保证兼容。
+
+## 从 0.4.0 升级到 0.5.0
+
+0.5.0 将扩展生成内容统一迁移到工作区根目录的 `.ecode-local/`：
+
+- AI Coding 资料迁移到 `.ecode-local/ecode-ai/`；根目录 `AGENTS.md` 保留原位置。
+- 同步清单、字段缓存、源码快照、冲突和恢复副本迁移到 `.ecode-local/storage/`。
+- 首次使用新目录时会复制旧扩展存储，旧存储继续保留作为兜底。
+- 首次刷新 AI Coding 支持时会清理旧 `.ecode-ai/` 中由扩展管理的文件，用户自定义文件不会被删除。
+- Git 工作区会在保留现有规则的前提下向根目录 `.gitignore` 补充 `/.ecode-local/`。
+
+升级并重新加载 VS Code 后，请执行一次 `Ecode: 全量拉取`，以建立或刷新文件与表单字段元数据的关联。
 
 ## 从旧版本升级到 0.4.0
 
@@ -89,7 +101,7 @@ code --install-extension ecode-vscode-0.4.0.vsix
 ## 代码智能
 
 代码智能默认覆盖 JavaScript、JSX、TypeScript 和 TSX，可在 VS Code 设置中通过
-`ecode.intelligence.enabled` 统一开关。所有内置知识均随扩展离线提供，打开源码和查看提示不会请求服务器。
+`ecode.intelligence.enabled` 统一开关。所有内置知识均随扩展离线提供；表单字段元数据在用户执行全量拉取时更新到本地缓存。打开源码、输入代码和查看提示都不会请求服务器。
 
 ### Ecode API
 
@@ -98,6 +110,18 @@ code --install-extension ecode-vscode-0.4.0.vsix
 - 输入方法参数时会显示签名、当前参数、类型、是否必填和具体含义。
 - 悬停成员可快速查看说明；按 F12 或 Ctrl+单击成员名可打开包含参数及二级参数的内置文档。
 - 悬停或 Ctrl+单击 API 对象名，可查看该对象的用途以及全部方法、属性、常量和签名。
+
+### 表单字段元数据
+
+- 全量拉取会静态分析业务入口中的表单守卫，例如 `if (formid !== carRequest.WfFormId) return`，并解析 `pageInfo` 等公共配置里的数值常量。能唯一确定工作流 `formId` 时，再通过 `/api/workflow/formSetting/fieldSet/getFieldList` 和 `/api/ec/dev/table/datas` 读取主表及明细字段，按服务器及远端文件路径缓存；缓存只包含字段结构，不包含表单业务数据或凭据。
+- `/api/cloudstore/ecode/one?id=...` 只用于读取源码；部分 Ecode 版本可能在响应中附带 `tableInfo/fieldinfomap`，扩展会兼容提取，但不再假设该接口一定返回表单元数据。
+- 在 `WfForm`、`ModeForm` 已知的字段参数、明细参数，以及 `initialValues`、`changeDatas`、`changeVariable` 等字段映射对象键中，提供 `field110`、数据库字段名和 `detail_1` 联想。
+- `WfForm.convertFieldNameToId("cfdd")` 和 `ModeForm.convertFieldNameToId("field_name", "detail_1")` 会优先联想数据库字段名；第二个参数为静态 `detail_N` 时只展示对应明细表字段。
+- 联想项同时显示字段标识、字段名称、数据库字段、所属主表/明细表和类型；多个字段字符串只替换光标所在片段。
+- 对这些 API 语义位置中的 `field110`、`field110_行号`、数据库字段名或 `detail_1` 按 F12 / Ctrl+单击，会打开只读元数据文档并定位到对应字段或明细表。
+- 鼠标悬停在上述字段或明细标识上，会显示字段中文名、字段 ID、数据库字段名、所属表、类型和表单上下文。
+- 对 `const fieldId = WfForm.convertFieldNameToId('数据库字段名')` 这类可静态确定且唯一的赋值，悬停变量声明或后续引用也会追加显示对应字段中文名。
+- 表单元数据缺失、格式不兼容或尚未随全量拉取缓存时，不影响源码同步，也不会在普通字符串中提供猜测性建议。
 
 ### PC 组件与嵌套参数
 
@@ -131,18 +155,23 @@ const MyCard = ecodeSDK.getCom('my-app-id', 'MyCard');
 ```text
 workspace/
 ├─ ecode/                         # 固定 Ecode 源码目录
-├─ .ecode-ai/
-│  ├─ ecode-globals.d.ts          # 全局 API、签名、参数和嵌套参数
-│  ├─ ecode-components.d.ts       # ecCom/antd 组件及 props
-│  ├─ ecode-ai-guide.md           # 平台约束和生成规则
-│  ├─ workspace-components.md     # setCom/getCom 组件关系
-│  └─ manifest.json               # 生成器版本与知识摘要
+├─ .ecode-local/
+│  ├─ ecode-ai/
+│  │  ├─ ecode-globals.d.ts          # 全局 API、签名、参数和嵌套参数
+│  │  ├─ ecode-components.d.ts       # ecCom/antd 组件及 props
+│  │  ├─ ecode-ai-guide.md           # 平台约束和生成规则
+│  │  ├─ workspace-components.md     # setCom/getCom 组件关系
+│  │  ├─ workspace-form-metadata.md  # 文件关联的表单、主/明细表和字段中文名
+│  │  └─ manifest.json               # 生成器版本与知识摘要
+│  └─ storage/                       # 清单、字段缓存、快照、冲突与恢复副本
 └─ AGENTS.md                      # 仅维护 Ecode 标记区块
 ```
 
-- `.ecode-ai/` 与 `ecode/` 平级，不会被拉取、扫描或推送到 Ecode 平台。
+- `.ecode-local/` 与 `ecode/` 平级，不会被拉取、扫描或推送到 Ecode 平台。
+- 升级后首次刷新 AI Coding 支持会先在新目录生成完整资料，再清理旧 `.ecode-ai/` 中由扩展管理的文件；旧目录中的自定义文件会保留。
 - 类型信息直接由扩展内置 API、参数和组件知识生成；资料不足的类型使用 `unknown`，原始文档类型保留在注释中。
 - `workspace-components.md` 只记录 `ecode/` 中的静态 `setCom/getCom` 调用。
+- `workspace-form-metadata.md` 按表单上下文列出关联源码、`main/detail_N`、字段 ID、中文名、数据库字段名、类型和查看/编辑/必填属性；全量拉取成功刷新字段缓存后会同步重新生成。
 - 已有 `AGENTS.md` 的其他内容会完整保留；扩展只更新
   `<!-- ecode-local:ai-start -->` 与 `<!-- ecode-local:ai-end -->` 之间的内容。
 - AGENTS 管理区块会向通用 Agent 说明 Ecode 平台、运行时全局对象、Babel 兼容范围、目录边界和修改前必须读取的知识文件，避免把项目误判为普通 Node.js 或 React 工程。
@@ -183,17 +212,19 @@ workspace/
 
 - 扩展启动时不会自动联网、拉取或推送。
 - 密码和 Cookie 保存在 VS Code `SecretStorage`。
-- 连接配置、同步基线、内容快照和恢复副本保存在 VS Code 扩展存储中。
+- 同步基线、表单字段缓存、内容快照、冲突和恢复副本保存在工作区 `.ecode-local/storage/`；旧版本的 VS Code 扩展存储会在首次使用时复制迁移并保留作为兜底。
+- `.ecode-local/storage/` 可能包含源码快照和冲突内容，不应提交到版本库；检测到工作区由 Git 管理时，扩展会保留现有规则并在工作区根目录 `.gitignore` 中补充 `/.ecode-local/`，已有等价规则时不会重复添加。忽略规则写入失败不会阻断同步。
 - Ecode 同步源码固定在当前 VS Code 工作区根目录的 `ecode/`。
-- AI Coding 资料位于工作区根目录的 `.ecode-ai/` 和 `AGENTS.md`，不包含连接凭据。
-- 扩展不会初始化、切换、提交或修改 Git 仓库。
+- AI Coding 资料位于 `.ecode-local/ecode-ai/`；工作区根目录的 `AGENTS.md` 继续作为通用 Agent 的发现入口。两者均不包含连接凭据。
+- 密码和 Cookie 始终保存在 VS Code `SecretStorage`，不会写入 `.ecode-local/`。
+- 除按上述规则补充工作区根目录 `.gitignore` 外，扩展不会初始化 Git 仓库，也不会切换分支、暂存、提交或推送。
 
 ## 升级与卸载
 
 - **升级**：从 [Releases](https://github.com/MrBear-xzx/ecode-local/releases) 下载新版本 VSIX，并按安装步骤再次安装。
 - **卸载**：在 VS Code 扩展视图中找到 **Ecode Local**，点击“卸载”。
 
-升级或卸载扩展不会删除工作区中的源码。连接配置、同步基线和恢复副本属于 VS Code 扩展存储；卸载前如需保留重要内容，请先自行备份。
+升级或卸载扩展不会删除工作区中的源码。连接配置与凭据仍由 VS Code 管理；`.ecode-local/storage/` 中的同步基线和恢复副本也不会随卸载自动删除，卸载前如需保留重要内容请先自行备份。
 
 0.4.0 的目录迁移规则见[从旧版本升级到 0.4.0](#从旧版本升级到-040)。
 
@@ -210,7 +241,7 @@ workspace/
 | `Ecode: 解决冲突` | 接受远端或确认已完成手工合并 |
 | `Ecode: 搜索开发文档` | 按对象名、方法名、组件名或功能描述搜索内置 API 与 PC 组件知识 |
 | `Ecode: 打开官方文档` | 打开 ecodeSDK、ModeForm/ModeList、WfForm 或 PC 组件库官方文档 |
-| `Ecode: 刷新 AI Coding 支持` | 重新生成 `.ecode-ai/` 和 AGENTS 管理区块 |
+| `Ecode: 刷新 AI Coding 支持` | 重新生成 `.ecode-local/ecode-ai/` 和 AGENTS 管理区块 |
 | `Ecode: 打开 AI Coding 指南` | 打开生成的平台约束和编码指南 |
 | `Ecode: 移除 AI Coding 支持` | 删除受管理的 AI 文件和 AGENTS 区块并关闭自动生成 |
 | `Ecode: 确认迁移到固定源码目录` | 将旧连接改为固定的 `ecode/`，不移动或删除旧目录 |
@@ -227,6 +258,8 @@ AI Coding 支持也默认启用，可通过 `ecode.aiSupport.enabled` 单独关�
 - 服务端没有事务、版本号或 ETag 时，推送保护无法完全消除检查与上传之间的竞争窗口。
 - 内置 API 与组件说明来自当前已整理的官方文档；Ecology 9、KB 或组件库升级后可能存在新增、删除或行为差异，实际兼容范围以目标环境和官方文档为准。
 - `setCom/getCom` 跨文件导航仅索引静态字符串形式的 `appId` 和组件名；动态变量或运行时拼接无法可靠关联。
+- 工作流字段绑定目前只识别可静态求值的 `formid` 守卫及数值配置，例如 `formid !== config.WfFormId`；动态计算、接口异步取得或同名配置存在多个值时不会猜测。建模 `modeId` 守卫可以被识别，但目标服务器未确认可在不读取业务表单数据的前提下仅按 `modeId` 获取完整字段结构，因此这类文件只有在文件详情附带兼容的 `tableInfo/fieldinfomap` 时才有 `ModeForm` 字段建议。
+- 表单字段联想只在 `WfForm`、`ModeForm` 的静态 API 语义位置生效，JavaScript 标识符和数据库字段名按大小写精确匹配；源码中的非标准别名（例如元数据为 `kssj`、代码写成 `mxkssj`）不会自动猜测映射。本地新增且尚未通过全量拉取建立表单绑定的文件不会获得字段建议。
 - 大型工作区首次激活时需要后台预热组件注册索引；预热后文件变化采用单文件增量更新。
 
 ## 开发与验证

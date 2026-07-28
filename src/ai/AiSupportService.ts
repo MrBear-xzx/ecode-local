@@ -1,16 +1,24 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ECODE_AI_DIRECTORY } from '../domain/constants';
+import {
+  ECODE_AI_DIRECTORY,
+  ECODE_LOCAL_DIRECTORY,
+  LEGACY_ECODE_AI_DIRECTORY,
+} from '../domain/constants';
 import { resolveEcodeSourceRoot } from '../domain/paths';
 import { hashText } from '../domain/text';
 import type { ConnectionProfile } from '../domain/types';
 import type { WorkspaceComponentRegistry } from '../language/WorkspaceComponentRegistry';
+import type {
+  WorkspaceFormMetadataRegistry,
+} from '../language/WorkspaceFormMetadataRegistry';
 import {
   generateAiGuide,
   generateComponentDeclarations,
   generateGlobalDeclarations,
   generateWorkspaceComponents,
+  generateWorkspaceFormMetadata,
 } from './AiSupportGenerator';
 
 const AGENTS_START = '<!-- ecode-local:ai-start -->';
@@ -20,6 +28,7 @@ const MANAGED_FILES = [
   'ecode-components.d.ts',
   'ecode-ai-guide.md',
   'workspace-components.md',
+  'workspace-form-metadata.md',
   'manifest.json',
 ] as const;
 
@@ -33,6 +42,7 @@ export class AiSupportService {
 
   constructor(
     private readonly registry: WorkspaceComponentRegistry,
+    private readonly formRegistry: WorkspaceFormMetadataRegistry,
     private readonly extensionVersion: string,
     private readonly output: vscode.LogOutputChannel,
   ) {}
@@ -52,7 +62,7 @@ export class AiSupportService {
   ): Promise<AiSupportRefreshResult> {
     if (!this.isEnabled(profile.workspaceFolder)) {
       return {
-        directory: path.join(profile.workspaceFolder, ECODE_AI_DIRECTORY),
+        directory: aiDirectory(profile.workspaceFolder),
         changedFiles: [],
       };
     }
@@ -67,6 +77,9 @@ export class AiSupportService {
         profile.workspaceFolder,
         calls,
       ),
+      'workspace-form-metadata.md': generateWorkspaceFormMetadata(
+        this.formRegistry.getSnapshot(),
+      ),
     };
     generated['manifest.json'] = `${JSON.stringify({
       schemaVersion: 1,
@@ -77,7 +90,7 @@ export class AiSupportService {
         .join('\0')),
     }, null, 2)}\n`;
 
-    const directory = path.join(profile.workspaceFolder, ECODE_AI_DIRECTORY);
+    const directory = aiDirectory(profile.workspaceFolder);
     await fs.mkdir(directory, { recursive: true });
     const changedFiles: string[] = [];
     for (const [name, content] of Object.entries(generated)) {
@@ -100,6 +113,9 @@ export class AiSupportService {
           .join(', ')}`,
       );
     }
+    await this.removeManagedDirectory(
+      path.join(profile.workspaceFolder, LEGACY_ECODE_AI_DIRECTORY),
+    );
     return { directory, changedFiles };
   }
 
@@ -108,17 +124,10 @@ export class AiSupportService {
   }
 
   private async removeNow(workspaceFolder: string): Promise<void> {
-    const directory = path.join(workspaceFolder, ECODE_AI_DIRECTORY);
-    for (const name of MANAGED_FILES) {
-      await removeOptionalFile(path.join(directory, name));
-    }
-    try {
-      await fs.rmdir(directory);
-    } catch (error: unknown) {
-      if (!isFileSystemError(error, 'ENOENT') && !isFileSystemError(error, 'ENOTEMPTY')) {
-        throw error;
-      }
-    }
+    await this.removeManagedDirectory(aiDirectory(workspaceFolder));
+    await this.removeManagedDirectory(
+      path.join(workspaceFolder, LEGACY_ECODE_AI_DIRECTORY),
+    );
 
     const agentsFile = path.join(workspaceFolder, 'AGENTS.md');
     const currentAgents = await readOptionalFile(agentsFile);
@@ -130,10 +139,22 @@ export class AiSupportService {
     }
   }
 
+  private async removeManagedDirectory(directory: string): Promise<void> {
+    for (const name of MANAGED_FILES) {
+      await removeOptionalFile(path.join(directory, name));
+    }
+    try {
+      await fs.rmdir(directory);
+    } catch (error: unknown) {
+      if (!isFileSystemError(error, 'ENOENT') && !isFileSystemError(error, 'ENOTEMPTY')) {
+        throw error;
+      }
+    }
+  }
+
   guideUri(workspaceFolder: string): vscode.Uri {
     return vscode.Uri.file(path.join(
-      workspaceFolder,
-      ECODE_AI_DIRECTORY,
+      aiDirectory(workspaceFolder),
       'ecode-ai-guide.md',
     ));
   }
@@ -158,9 +179,10 @@ export function updateManagedAgentsContent(current: string | undefined): string 
     '### 目录约定',
     '',
     '- `ecode/`：唯一的 Ecode 业务源码目录。',
-    '- `.ecode-ai/`：由 Ecode Local 自动生成的 AI 知识资料，不属于业务源码。',
-    '- 不要直接修改 `.ecode-ai/` 中的文件。',
-    '- 不要把 `.ecode-ai/`、`AGENTS.md` 或工作区其他文件当作 Ecode 远端源码。',
+    '- `.ecode-local/ecode-ai/`：由 Ecode Local 自动生成的 AI 知识资料，不属于业务源码。',
+    '- `.ecode-local/storage/`：同步清单、字段缓存、快照、冲突和恢复副本，不属于业务源码。',
+    '- 不要直接修改 `.ecode-local/` 中的文件。',
+    '- 不要把 `.ecode-local/`、`AGENTS.md` 或工作区其他文件当作 Ecode 远端源码。',
     '',
     '### 运行时约定',
     '',
@@ -181,13 +203,14 @@ export function updateManagedAgentsContent(current: string | undefined): string 
     '',
     '### 修改代码前',
     '',
-    '1. 阅读 `.ecode-ai/ecode-ai-guide.md`。',
-    '2. API、参数和返回值以 `.ecode-ai/ecode-globals.d.ts` 为准。',
-    '3. PC 组件和 props 以 `.ecode-ai/ecode-components.d.ts` 为准。',
-    '4. 使用 `ecodeSDK.getCom` 前，检查 `.ecode-ai/workspace-components.md` '
+    '1. 阅读 `.ecode-local/ecode-ai/ecode-ai-guide.md`。',
+    '2. API、参数和返回值以 `.ecode-local/ecode-ai/ecode-globals.d.ts` 为准。',
+    '3. PC 组件和 props 以 `.ecode-local/ecode-ai/ecode-components.d.ts` 为准。',
+    '4. 表单字段以 `.ecode-local/ecode-ai/workspace-form-metadata.md` 为准。',
+    '5. 使用 `ecodeSDK.getCom` 前，检查 `.ecode-local/ecode-ai/workspace-components.md` '
       + '中是否存在对应的 `setCom` 注册。',
-    '5. 优先搜索 `ecode/` 中已有的同类调用和项目编码模式。',
-    '6. 类型为 `unknown` 表示资料不足，需要从现有源码或用户信息继续确认，不得自行编造参数。',
+    '6. 优先搜索 `ecode/` 中已有的同类调用和项目编码模式。',
+    '7. 类型为 `unknown` 表示资料不足，需要从现有源码或用户信息继续确认，不得自行编造参数。',
     '',
     '### 修改边界',
     '',
@@ -298,4 +321,12 @@ async function removeOptionalFile(file: string): Promise<void> {
 
 function isFileSystemError(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException).code === code;
+}
+
+function aiDirectory(workspaceFolder: string): string {
+  return path.join(
+    workspaceFolder,
+    ECODE_LOCAL_DIRECTORY,
+    ECODE_AI_DIRECTORY,
+  );
 }

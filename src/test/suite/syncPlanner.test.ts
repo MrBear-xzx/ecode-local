@@ -158,5 +158,8 @@ function remoteFile(path: string, id: string, content: string): RemoteFileConten
     entry: { id, path, name: path.split('/').at(-1) ?? path, kind: 'text' },
     content,
     hash: hashText(content),
+    formMetadataState: 'absent',
+    formContexts: [],
+    formMetadataWarnings: [],
   };
 }

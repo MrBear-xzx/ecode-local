@@ -1,5 +1,36 @@
 # 更新日志
 
+## 0.5.0 - 2026-07-28
+
+### 新增
+
+- 全量拉取时建立源码文件与流程表单的静态关联，缓存主表、`detail_N`、字段 ID、中文名、数据库字段名、类型及查看/编辑/必填属性；编辑、补全、悬停和跳转阶段完全离线。
+- 为 `WfForm`、`ModeForm` 的已知字段参数、明细参数及字段映射对象键提供表单字段联想；支持 `field110`、纯数字字段 ID、数据库字段名、`detail_1` 和逗号分隔字段列表。
+- 支持在字段语义位置按 F12 或 Ctrl+单击打开 `ecode-form:` 只读元数据文档，并在鼠标悬停时展示字段中文名、所属主表/明细表、类型和表单上下文。
+- 支持追踪 `const fieldId = WfForm.convertFieldNameToId(...)` 形式的静态变量，在声明和后续引用处追加字段中文说明；省略第二个参数时限定主表，传入静态 `detail_N` 时限定对应明细表。
+- AI Coding 支持新增 `workspace-form-metadata.md`，使通用 Agent 可以离线读取当前源码关联的表单字段信息。
+
+### 调整
+
+- AI Coding 资料迁移到 `.ecode-local/ecode-ai/`，同步清单、表单缓存、快照、冲突和恢复副本迁移到 `.ecode-local/storage/`；根目录 `AGENTS.md` 继续作为通用 Agent 的发现入口。
+- 检测到工作区由 Git 管理时，在保留现有规则的前提下向根目录 `.gitignore` 补充 `/.ecode-local/`，已有等价规则时不重复写入。
+- 表单上下文分析按 JavaScript 标识符大小写精确追踪 `formid`、`formId` 等变量，并可解析 `pageInfo` 等公共配置中被业务文件实际引用的数值 `WfFormId`。
+- `/api/cloudstore/ecode/one?id=...` 的文件详情读取同时兼容提取响应中附带的 `tableInfo/fieldinfomap`；工作流上下文可通过字段列表与表数据接口补充完整字段结构。
+- 表单元数据按服务器指纹和远端文件路径隔离；全量拉取取消、请求失败或格式异常时保留旧缓存，成功拉取后原子更新并清理已删除或明确无元数据的条目。
+
+### 兼容性与限制
+
+- 表单字段智能继续受 `ecode.intelligence.enabled` 控制，不新增刷新命令；元数据只随未取消的全量拉取刷新。
+- 仅识别可静态求值的 API 语义位置和表单守卫，不在任意字符串中猜测字段，也不会把源码中的非标准字段别名自动映射为元数据字段名。
+- 建模表单只有在文件详情响应附带兼容的 `tableInfo/fieldinfomap` 时才能建立完整字段上下文。
+
+### 验证
+
+- `node_modules/.bin/tsc --noEmit`
+- `npm run build`
+- `npm test`：119 项通过
+- `git diff --check`
+
 ## 0.4.0 - 2026-07-27
 
 ### 新增

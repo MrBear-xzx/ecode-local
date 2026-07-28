@@ -1,3 +1,8 @@
+import type {
+  FormContext,
+  FormMetadataState,
+} from './formMetadata';
+
 export interface ConnectionProfile {
   version: 3;
   workspaceFolder: string;
@@ -25,6 +30,9 @@ export interface RemoteFileContent {
   entry: RemoteFileEntry;
   content: string;
   hash: string;
+  formMetadataState: FormMetadataState;
+  formContexts: FormContext[];
+  formMetadataWarnings: string[];
 }
 
 export interface ManifestEntry {

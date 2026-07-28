@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -204,13 +204,13 @@
         "ecode.intelligence.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "为 ecodeSDK、ModeForm、ModeList、WfForm、ecCom 和内置 antd 启用成员与二级对象参数联想、setCom/getCom 工作区导航、参数/props 提示、悬停说明及文档跳转。"
+          "description": "为 ecodeSDK、ModeForm、ModeList、WfForm、ecCom 和内置 antd 启用成员与二级对象参数联想、表单字段元数据联想与跳转、setCom/getCom 工作区导航、参数/props 提示、悬停说明及文档跳转。"
         },
         "ecode.aiSupport.enabled": {
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "在工作区根目录生成并自动刷新 .ecode-ai 和 AGENTS.md 的 Ecode AI Coding 支持资料。"
+          "description": "在 .ecode-local/ecode-ai 中生成并自动刷新 Ecode AI Coding 支持资料，同时维护工作区根目录 AGENTS.md 的 Ecode 管理区块。"
         }
       }
     }

@@ -1,4 +1,10 @@
 import * as path from 'path';
+import type {
+  CachedFileFormMetadata,
+  FormContext,
+  FormField,
+  FormTable,
+} from '../domain/formMetadata';
 import {
   ECODE_COMPONENT_ENTRIES,
   type EcodeComponentEntry,
@@ -105,7 +111,8 @@ export function generateAiGuide(): string {
     '## 工作区约定',
     '',
     '- `ecode/` 是唯一的 Ecode 源码目录，远端拉取和推送只作用于该目录。',
-    '- `.ecode-ai/` 是 AI 支持资料目录，不属于 Ecode 源码，禁止同步到远端。',
+    '- `.ecode-local/ecode-ai/` 是 AI 支持资料目录，不属于 Ecode 源码，禁止同步到远端。',
+    '- `.ecode-local/storage/` 是扩展的同步状态与恢复资料目录，不属于 Ecode 源码。',
     '- 不要假设 Ecode 全局对象来自 npm 包；`WfForm`、`ModeForm`、`ModeList`、`ecodeSDK`、`ecCom` 和 `antd` 由平台运行时提供。',
     '- 平台 JavaScript 编译环境以 Babel 7.5.5 兼容能力为准，生成代码时避免依赖过新的语法和运行时 API。',
     '',
@@ -114,6 +121,7 @@ export function generateAiGuide(): string {
     '- `ecode-globals.d.ts`：全局 API、签名、参数及嵌套参数。',
     '- `ecode-components.d.ts`：PC 组件、props 及嵌套 props。',
     '- `workspace-components.md`：当前项目的 `ecodeSDK.setCom/getCom` 组件关系。',
+    '- `workspace-form-metadata.md`：当前源码文件关联的流程/建模表单、主表、明细表和字段中文名。',
     '',
     '## 生成代码规则',
     '',
@@ -121,7 +129,8 @@ export function generateAiGuide(): string {
     '2. 对 `WeaBrowser.tabs`、`WeaTable.columns` 等对象或数组参数，使用声明中的二级结构。',
     '3. 使用 `ecodeSDK.getCom(appId, name)` 前，优先在工作区组件表中确认对应 `setCom` 定义。',
     '4. 类型为 `unknown` 表示官方资料不足，必须从现有调用或运行时行为继续确认，不应擅自猜测。',
-    '5. 不修改 `.ecode-ai/` 中的生成文件；知识变化后使用扩展命令重新生成。',
+    '5. `convertFieldNameToId` 未提供表参数时按主表理解，提供 `detail_N` 时只使用对应明细表。',
+    '6. 不修改 `.ecode-local/` 中的生成文件；知识变化后使用扩展命令重新生成。',
     '',
     '## 常见示例',
     '',
@@ -170,6 +179,109 @@ export function generateWorkspaceComponents(
       ? sections
       : ['当前 `ecode/` 源码中尚未发现静态组件注册或引用。', '']),
   ].join('\n'));
+}
+
+export function generateWorkspaceFormMetadata(
+  files: readonly CachedFileFormMetadata[],
+): string {
+  const groups = new Map<string, {
+    context: FormContext;
+    paths: string[];
+  }>();
+  for (const file of files) {
+    for (const context of file.contexts) {
+      const key = JSON.stringify(context);
+      const group = groups.get(key) ?? { context, paths: [] };
+      group.paths.push(`ecode/${file.path.replace(/\\/g, '/')}`);
+      groups.set(key, group);
+    }
+  }
+  const sections = [...groups.values()]
+    .sort((left, right) =>
+      formContextTitle(left.context).localeCompare(formContextTitle(right.context)))
+    .flatMap(group => [
+      `## ${formContextTitle(group.context)}`,
+      '',
+      `关联源码：${group.paths
+        .sort((left, right) => left.localeCompare(right))
+        .map(value => `\`${escapeCode(value)}\``)
+        .join('、')}`,
+      '',
+      ...group.context.tables.flatMap(table =>
+        formTableSection(table)),
+    ]);
+  return ensureTrailingNewline([
+    '# Ecode 工作区表单字段',
+    '',
+    '由 Ecode Local 根据全量拉取获得的表单上下文与字段缓存生成，供 AI 在离线编辑时理解字段含义。',
+    '',
+    '## 字段定位规则',
+    '',
+    '- `WfForm.convertFieldNameToId("field_name")` 和 `ModeForm.convertFieldNameToId("field_name")` 默认定位主表 `main`。',
+    '- 显式传入 `"detail_N"` 时，只定位对应明细表；无法静态确定表标识时不要猜测。',
+    '- `field110_3` 表示字段 `field110` 的明细行实例，字段定义仍以 `field110` 查询。',
+    '',
+    ...(sections.length > 0
+      ? sections
+      : ['当前缓存中尚无可关联到源码文件的表单字段元数据。', '']),
+  ].join('\n'));
+}
+
+function formContextTitle(context: FormContext): string {
+  const kind = context.kind === 'workflow'
+    ? '流程表单'
+    : context.kind === 'mode' ? '建模表单' : '共享表单';
+  const ids = [
+    context.workflowId ? `workflowId ${context.workflowId}` : undefined,
+    context.requestId ? `requestId ${context.requestId}` : undefined,
+    context.modeId ? `modeId ${context.modeId}` : undefined,
+    context.formId ? `formId ${context.formId}` : undefined,
+  ].filter(Boolean);
+  return ids.length > 0 ? `${kind}（${ids.join('，')}）` : kind;
+}
+
+function formTableSection(table: FormTable): string[] {
+  const title = table.title
+    || table.tableName
+    || (table.mark === 'main' ? '主表' : table.mark);
+  return [
+    `### ${escapeMarkdown(table.mark)} — ${escapeMarkdown(title)}`,
+    '',
+    ...(table.tableName
+      ? [`数据库表：\`${escapeCode(table.tableName)}\``, '']
+      : []),
+    '| 标识 | 中文名 | 数据库字段 | 类型 | 查看 | 编辑 | 必填 |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+    ...table.fields.map(field => formFieldRow(field)),
+    '',
+  ];
+}
+
+function formFieldRow(field: FormField): string {
+  const type = [
+    field.htmlType ? `htmlType ${field.htmlType}` : undefined,
+    field.detailType ? `detailType ${field.detailType}` : undefined,
+    field.dbType,
+  ].filter(Boolean).join(' / ');
+  return [
+    `\`field${escapeCode(field.id)}\``,
+    escapeTableCell(field.label),
+    field.name ? `\`${escapeCode(field.name)}\`` : '',
+    escapeTableCell(type),
+    booleanMetadata(field.isView),
+    booleanMetadata(field.isEdit),
+    booleanMetadata(field.isMandatory),
+  ].join(' | ').replace(/^/, '| ').replace(/$/, ' |');
+}
+
+function booleanMetadata(value: boolean | undefined): string {
+  return value === undefined ? '' : value ? '是' : '否';
+}
+
+function escapeTableCell(value: string): string {
+  return escapeMarkdown(value)
+    .replace(/\|/g, '\\|')
+    .replace(/\r?\n/g, '<br>');
 }
 
 export function normalizeType(rawType: string): string {

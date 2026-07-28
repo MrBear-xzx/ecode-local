@@ -13,6 +13,7 @@ import type {
 } from './domain/types';
 import { registerEcodeLanguageFeatures } from './language/EcodeLanguageProvider';
 import { WorkspaceComponentRegistry } from './language/WorkspaceComponentRegistry';
+import { WorkspaceFormMetadataRegistry } from './language/WorkspaceFormMetadataRegistry';
 import { WorkspaceStore } from './storage/WorkspaceStore';
 import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
 import { AuthManager } from './sync/auth/AuthManager';
@@ -35,8 +36,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const tree = new EcodeTreeProvider();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const componentRegistry = new WorkspaceComponentRegistry();
+  const formMetadataRegistry = new WorkspaceFormMetadataRegistry();
   const extensionVersion = String(context.extension.packageJSON.version ?? 'unknown');
-  const aiSupport = new AiSupportService(componentRegistry, extensionVersion, output);
+  const aiSupport = new AiSupportService(
+    componentRegistry,
+    formMetadataRegistry,
+    extensionVersion,
+    output,
+  );
   const controller = new ExtensionController(
     context,
     store,
@@ -45,6 +52,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     tree,
     status,
     componentRegistry,
+    formMetadataRegistry,
     aiSupport,
   );
 
@@ -52,6 +60,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     output,
     status,
     componentRegistry,
+    formMetadataRegistry,
     controller,
     vscode.window.registerTreeDataProvider('ecode.workspace', tree),
     vscode.workspace.registerTextDocumentContentProvider(
@@ -66,7 +75,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       EMPTY_SCHEME,
       new VirtualDocumentProvider(EMPTY_SCHEME, service),
     ),
-    ...registerEcodeLanguageFeatures(componentRegistry),
+    ...registerEcodeLanguageFeatures(componentRegistry, formMetadataRegistry),
     ...controller.registerCommands(),
   );
 
@@ -95,6 +104,7 @@ class ExtensionController {
     private readonly tree: EcodeTreeProvider,
     private readonly status: vscode.StatusBarItem,
     private readonly componentRegistry: WorkspaceComponentRegistry,
+    private readonly formMetadataRegistry: WorkspaceFormMetadataRegistry,
     private readonly aiSupport: AiSupportService,
   ) {}
 
@@ -129,6 +139,7 @@ class ExtensionController {
 
   async initialize(): Promise<void> {
     const profile = await this.loadActiveProfile();
+    await this.formMetadataRegistry.reload(profile, this.store);
     if (profile) {
       try {
         this.changes = await this.service.refreshLocalChanges();
@@ -222,6 +233,7 @@ class ExtensionController {
       await this.store.saveProfile(profile);
       await this.store.clearLegacyProfile();
       this.legacyProfile = undefined;
+      await this.formMetadataRegistry.reload(profile, this.store);
       this.changes = await this.service.refreshLocalChanges();
       this.configureLocalWatcher(profile);
       await this.refreshAiSupport(false);
@@ -254,6 +266,8 @@ class ExtensionController {
         message => progress.report({ message }),
         token,
       ));
+      await this.formMetadataRegistry.reload(profile, this.store);
+      await this.refreshAiSupport(false);
       this.changes = this.service.getLastPlan()?.changes ?? [];
       showResult('拉取', result);
     });
@@ -578,6 +592,7 @@ class ExtensionController {
     await this.store.saveProfile(profile);
     await this.store.clearLegacyProfile();
     this.legacyProfile = undefined;
+    await this.formMetadataRegistry.reload(profile, this.store);
     try {
       this.changes = await this.service.refreshLocalChanges();
     } catch (error: unknown) {
@@ -666,7 +681,7 @@ class ExtensionController {
       return;
     }
     const confirmation = await vscode.window.showWarningMessage(
-      '将删除 .ecode-ai 中由扩展管理的文件及 AGENTS.md 的 Ecode 管理区块。'
+      '将删除 .ecode-local/ecode-ai 中由扩展管理的文件及 AGENTS.md 的 Ecode 管理区块。'
         + '其他文件不会被删除。',
       { modal: true },
       '移除 AI 支持',

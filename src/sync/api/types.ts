@@ -1,3 +1,8 @@
+import type {
+  FormContext,
+  FormMetadataState,
+} from '../../domain/formMetadata';
+
 export interface ApiResponse<T = unknown> {
   status: boolean;
   msg?: string;
@@ -20,6 +25,13 @@ export interface TreePayload {
   typeList: TreeNode[];
   childFolder: TreeNode[];
   childFile: TreeNode[];
+}
+
+export interface FileDetail {
+  content: string;
+  formMetadataState: FormMetadataState;
+  formContexts: FormContext[];
+  formMetadataWarnings: string[];
 }
 
 export class EcodeApiError extends Error {
