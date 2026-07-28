@@ -46,6 +46,21 @@ import {
   WorkspaceComponentRegistry,
   type RegisteredEcodeComponent,
 } from './WorkspaceComponentRegistry';
+import {
+  EcodeFormDocumentationProvider,
+  formCompletionItems,
+  formDefinitions,
+  formHover,
+} from './FormMetadataLanguage';
+import {
+  findFormReferenceAt,
+  findFormVariableReferenceAt,
+  parseFormReferenceContext,
+} from './formKnowledge';
+import {
+  ECODE_FORM_SCHEME,
+  WorkspaceFormMetadataRegistry,
+} from './WorkspaceFormMetadataRegistry';
 
 export const ECODE_DOC_SCHEME = 'ecode-doc';
 
@@ -58,11 +73,17 @@ const LANGUAGE_SELECTOR: vscode.DocumentSelector = [
 
 export function registerEcodeLanguageFeatures(
   registry: WorkspaceComponentRegistry,
+  formRegistry: WorkspaceFormMetadataRegistry,
 ): vscode.Disposable[] {
-  const provider = new EcodeLanguageProvider(registry);
+  const provider = new EcodeLanguageProvider(registry, formRegistry);
   const documentation = new EcodeDocumentationProvider();
+  const formDocumentation = new EcodeFormDocumentationProvider(formRegistry);
   return [
     vscode.workspace.registerTextDocumentContentProvider(ECODE_DOC_SCHEME, documentation),
+    vscode.workspace.registerTextDocumentContentProvider(
+      ECODE_FORM_SCHEME,
+      formDocumentation,
+    ),
     vscode.languages.registerCompletionItemProvider(
       LANGUAGE_SELECTOR,
       provider,
@@ -94,6 +115,7 @@ export class EcodeLanguageProvider implements
   vscode.SignatureHelpProvider {
   constructor(
     private readonly componentRegistry: WorkspaceComponentRegistry,
+    private readonly formRegistry: WorkspaceFormMetadataRegistry,
   ) {}
 
   async provideCompletionItems(
@@ -103,10 +125,23 @@ export class EcodeLanguageProvider implements
     if (!isEnabled()) {
       return undefined;
     }
+    const documentText = document.getText();
+    const formContext = parseFormReferenceContext(
+      documentText,
+      document.offsetAt(position),
+    );
+    if (formContext) {
+      return formCompletionItems(
+        document,
+        formContext,
+        this.formRegistry,
+      );
+    }
     const lineBeforeCursor = document.lineAt(position.line).text
       .slice(0, position.character);
-    const textBeforeCursor = document.getText(
-      new vscode.Range(new vscode.Position(0, 0), position),
+    const textBeforeCursor = documentText.slice(
+      0,
+      document.offsetAt(position),
     ).slice(-4000);
     const componentNameContext =
       parseEcodeComponentNameCompletionContext(textBeforeCursor);
@@ -148,7 +183,7 @@ export class EcodeLanguageProvider implements
         .map(nestedPropertyCompletionItem);
     }
 
-    const bindings = getComponentBindings(document.getText());
+    const bindings = getComponentBindings(documentText);
     const componentNestedContext = parseComponentNestedPropertyContext(
       textBeforeCursor,
       bindings,
@@ -185,6 +220,16 @@ export class EcodeLanguageProvider implements
     if (!isEnabled()) {
       return undefined;
     }
+    const documentText = document.getText();
+    const offset = document.offsetAt(position);
+    const formReference = findFormReferenceAt(documentText, offset)
+      ?? findFormVariableReferenceAt(documentText, offset);
+    if (formReference) {
+      const hover = formHover(document, formReference, this.formRegistry);
+      if (hover) {
+        return hover;
+      }
+    }
     const entry = entryAt(document, position);
     const range = document.getWordRangeAtPosition(position);
     return entry && range
@@ -205,6 +250,17 @@ export class EcodeLanguageProvider implements
   ): Promise<vscode.Definition | undefined> {
     if (!isEnabled()) {
       return undefined;
+    }
+    const formReference = findFormReferenceAt(
+      document.getText(),
+      document.offsetAt(position),
+    );
+    if (formReference) {
+      return formDefinitions(
+        document,
+        formReference,
+        this.formRegistry,
+      );
     }
     const componentCall = findEcodeComponentCallAt(
       document.getText(),

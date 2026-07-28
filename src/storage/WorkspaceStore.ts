@@ -7,14 +7,26 @@ import type {
   StoredConflict,
   SyncManifest,
 } from '../domain/types';
+import type {
+  CachedFileFormMetadata,
+  FormMetadataCache,
+} from '../domain/formMetadata';
+import {
+  ECODE_LOCAL_DIRECTORY,
+  ECODE_STORAGE_DIRECTORY,
+} from '../domain/constants';
 import { hashText } from '../domain/text';
 
 const PROFILE_KEY = 'ecode.v3.profile';
 const LEGACY_PROFILE_KEY = 'ecode.v2.profile';
 const MANIFEST_FILE = 'sync-manifest.json';
+const FORM_METADATA_FILE = 'form-metadata.json';
 
 export class WorkspaceStore {
   private activeFingerprint: string | undefined;
+  private activeStorageRoot: string | undefined;
+  private readonly migratedStorageRoots = new Set<string>();
+  private readonly checkedGitIgnoreRoots = new Set<string>();
 
   constructor(private context: vscode.ExtensionContext) {}
 
@@ -39,6 +51,7 @@ export class WorkspaceStore {
 
   async loadManifest(serverFingerprint: string, syncRoot: string): Promise<SyncManifest> {
     this.activeFingerprint = serverFingerprint;
+    const storageRoot = await this.storageRoot(syncRoot);
     const empty = (): SyncManifest => ({
       schemaVersion: 1,
       serverFingerprint,
@@ -48,7 +61,7 @@ export class WorkspaceStore {
     });
 
     try {
-      const raw = await fs.readFile(path.join(await this.storageRoot(), MANIFEST_FILE), 'utf8');
+      const raw = await fs.readFile(path.join(storageRoot, MANIFEST_FILE), 'utf8');
       const parsed = JSON.parse(raw) as SyncManifest;
       if (
         parsed.schemaVersion !== 1
@@ -64,9 +77,60 @@ export class WorkspaceStore {
   }
 
   async saveManifest(manifest: SyncManifest): Promise<void> {
-    const root = await this.storageRoot();
+    const root = await this.storageRoot(manifest.syncRoot);
     manifest.updatedAt = new Date().toISOString();
     await writeJsonAtomic(path.join(root, MANIFEST_FILE), manifest);
+  }
+
+  async loadFormMetadataCache(
+    serverFingerprint: string,
+    syncRoot: string,
+  ): Promise<FormMetadataCache> {
+    const empty = (): FormMetadataCache => ({
+      schemaVersion: 1,
+      serverFingerprint,
+      syncRoot,
+      updatedAt: new Date(0).toISOString(),
+      files: {},
+    });
+
+    try {
+      const storageRoot = await this.storageRoot(syncRoot);
+      const raw = await fs.readFile(
+        path.join(storageRoot, FORM_METADATA_FILE),
+        'utf8',
+      );
+      const parsed = JSON.parse(raw) as Partial<FormMetadataCache>;
+      if (
+        parsed.schemaVersion !== 1
+        || parsed.serverFingerprint !== serverFingerprint
+        || typeof parsed.syncRoot !== 'string'
+        || path.resolve(parsed.syncRoot) !== path.resolve(syncRoot)
+        || !parsed.files
+        || typeof parsed.files !== 'object'
+        || Array.isArray(parsed.files)
+      ) {
+        return empty();
+      }
+      return {
+        ...(parsed as FormMetadataCache),
+        files: Object.fromEntries(
+          Object.entries(parsed.files)
+            .filter((entry): entry is [string, CachedFileFormMetadata] =>
+              isCachedFileFormMetadata(entry[1])),
+        ),
+      };
+    } catch {
+      return empty();
+    }
+  }
+
+  async saveFormMetadataCache(cache: FormMetadataCache): Promise<void> {
+    cache.updatedAt = new Date().toISOString();
+    await writeJsonAtomic(
+      path.join(await this.storageRoot(cache.syncRoot), FORM_METADATA_FILE),
+      cache,
+    );
   }
 
   async saveSnapshot(content: string): Promise<string> {
@@ -144,13 +208,84 @@ export class WorkspaceStore {
     return file;
   }
 
-  private async storageRoot(): Promise<string> {
-    const uri = this.context.storageUri;
-    if (!uri) {
-      throw new Error('当前窗口没有可用的工作区存储');
+  private async storageRoot(syncRoot?: string): Promise<string> {
+    if (syncRoot) {
+      const workspaceFolder = path.dirname(path.resolve(syncRoot));
+      this.activeStorageRoot = path.join(
+        workspaceFolder,
+        ECODE_LOCAL_DIRECTORY,
+        ECODE_STORAGE_DIRECTORY,
+      );
     }
-    await fs.mkdir(uri.fsPath, { recursive: true });
-    return uri.fsPath;
+    if (!this.activeStorageRoot) {
+      throw new Error('同步清单尚未加载，无法确定工作区存储目录');
+    }
+    const workspaceFolder = path.dirname(path.dirname(this.activeStorageRoot));
+    await this.ensureGitIgnore(workspaceFolder);
+    await fs.mkdir(this.activeStorageRoot, { recursive: true });
+    await this.migrateLegacyStorage(this.activeStorageRoot);
+    return this.activeStorageRoot;
+  }
+
+  private async migrateLegacyStorage(targetRoot: string): Promise<void> {
+    const normalizedTarget = path.resolve(targetRoot);
+    if (this.migratedStorageRoots.has(normalizedTarget)) {
+      return;
+    }
+    this.migratedStorageRoots.add(normalizedTarget);
+    const legacyRoot = this.context.storageUri?.fsPath;
+    if (!legacyRoot || path.resolve(legacyRoot) === normalizedTarget) {
+      return;
+    }
+    for (const name of [
+      MANIFEST_FILE,
+      FORM_METADATA_FILE,
+      'snapshots',
+      'conflicts',
+      'recovery',
+    ]) {
+      const source = path.join(legacyRoot, name);
+      const target = path.join(targetRoot, name);
+      try {
+        await fs.cp(source, target, {
+          recursive: true,
+          force: false,
+          errorOnExist: false,
+        });
+      } catch (error: unknown) {
+        if (!isFileSystemError(error, 'ENOENT')) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  private async ensureGitIgnore(workspaceFolder: string): Promise<void> {
+    const normalizedRoot = path.resolve(workspaceFolder);
+    if (this.checkedGitIgnoreRoots.has(normalizedRoot)) {
+      return;
+    }
+    this.checkedGitIgnoreRoots.add(normalizedRoot);
+    try {
+      if (!await isInsideGitRepository(normalizedRoot)) {
+        return;
+      }
+      const file = path.join(normalizedRoot, '.gitignore');
+      let current = '';
+      try {
+        current = await fs.readFile(file, 'utf8');
+      } catch (error: unknown) {
+        if (!isFileSystemError(error, 'ENOENT')) {
+          throw error;
+        }
+      }
+      const next = updateGitIgnoreForEcodeLocal(current);
+      if (next !== current) {
+        await writeTextAtomic(file, next);
+      }
+    } catch {
+      // Git 忽略规则属于辅助保护，写入失败不能阻断源码同步。
+    }
   }
 
   private async conflictDirectory(): Promise<string> {
@@ -166,8 +301,104 @@ export class WorkspaceStore {
 }
 
 async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+  await writeTextAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function writeTextAtomic(file: string, content: string): Promise<void> {
   const temporary = `${file}.tmp`;
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await fs.writeFile(temporary, content, 'utf8');
   await fs.rename(temporary, file);
+}
+
+export function updateGitIgnoreForEcodeLocal(current: string): string {
+  const alreadyIgnored = current.split(/\r?\n/).some(rawLine => {
+    const line = rawLine.trim();
+    return !line.startsWith('!')
+      && [
+        '.ecode-local',
+        '.ecode-local/',
+        '/.ecode-local',
+        '/.ecode-local/',
+        '.ecode-local/**',
+        '/.ecode-local/**',
+      ].includes(line);
+  });
+  if (alreadyIgnored) {
+    return current;
+  }
+  const eol = current.includes('\r\n') ? '\r\n' : '\n';
+  let prefix = current;
+  if (prefix && !/\r?\n$/.test(prefix)) {
+    prefix += eol;
+  }
+  if (prefix && !prefix.endsWith(`${eol}${eol}`)) {
+    prefix += eol;
+  }
+  return `${prefix}# Ecode Local generated files${eol}/.ecode-local/${eol}`;
+}
+
+async function isInsideGitRepository(directory: string): Promise<boolean> {
+  let current = path.resolve(directory);
+  while (true) {
+    try {
+      await fs.access(path.join(current, '.git'));
+      return true;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return false;
+      }
+      current = parent;
+    }
+  }
+}
+
+function isCachedFileFormMetadata(value: unknown): value is CachedFileFormMetadata {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const file = value as Record<string, unknown>;
+  if (
+    typeof file.remoteId !== 'string'
+    || typeof file.path !== 'string'
+    || typeof file.updatedAt !== 'string'
+    || !Array.isArray(file.contexts)
+  ) {
+    return false;
+  }
+  return file.contexts.every(contextValue => {
+    if (!contextValue || typeof contextValue !== 'object' || Array.isArray(contextValue)) {
+      return false;
+    }
+    const context = contextValue as Record<string, unknown>;
+    if (
+      !['workflow', 'mode', 'shared'].includes(String(context.kind))
+      || !Array.isArray(context.tables)
+    ) {
+      return false;
+    }
+    return context.tables.every(tableValue => {
+      if (!tableValue || typeof tableValue !== 'object' || Array.isArray(tableValue)) {
+        return false;
+      }
+      const table = tableValue as Record<string, unknown>;
+      return (
+        typeof table.mark === 'string'
+        && (table.mark === 'main' || /^detail_\d+$/.test(table.mark))
+        && Array.isArray(table.fields)
+        && table.fields.every(fieldValue => {
+          if (!fieldValue || typeof fieldValue !== 'object' || Array.isArray(fieldValue)) {
+            return false;
+          }
+          const field = fieldValue as Record<string, unknown>;
+          return typeof field.id === 'string' && typeof field.label === 'string';
+        })
+      );
+    });
+  });
+}
+
+function isFileSystemError(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException).code === code;
 }

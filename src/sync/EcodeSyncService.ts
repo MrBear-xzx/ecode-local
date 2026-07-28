@@ -8,6 +8,8 @@ import {
   resolveSafeLocalPath,
   resolveEcodeSourceRoot,
 } from '../domain/paths';
+import { analyzeFormContexts } from '../domain/formContextAnalyzer';
+import type { FormContext, FormMetadataCache } from '../domain/formMetadata';
 import { buildLocalChanges, buildSyncPlan } from '../domain/syncPlanner';
 import { hashText, isSupportedText, serverFingerprint } from '../domain/text';
 import type {
@@ -223,6 +225,18 @@ export class EcodeSyncService {
     }
 
     await this.store.saveManifest(context.manifest);
+    this.throwIfCancelled(cancellation);
+    try {
+      await this.withAuthentication(context.profile, api =>
+        this.refreshFormMetadataCache(
+          context.formMetadataCache,
+          remote,
+          api,
+        ),
+      );
+    } catch (error: unknown) {
+      this.output.warn(`表单元数据缓存更新失败，不影响源码拉取: ${errorMessage(error)}`);
+    }
     this.lastRemoteFiles = remote.files;
 
     const refreshedLocal = await this.scanLocalFiles(context.syncRoot);
@@ -603,6 +617,9 @@ export class EcodeSyncService {
       },
       content: conflict.remoteContent,
       hash: conflict.remoteHash,
+      formMetadataState: 'absent',
+      formContexts: [],
+      formMetadataWarnings: [],
     });
     await this.store.deleteConflict(remotePath);
     await this.store.saveManifest(context.manifest);
@@ -624,6 +641,9 @@ export class EcodeSyncService {
       },
       content: conflict.remoteContent,
       hash: conflict.remoteHash,
+      formMetadataState: 'absent',
+      formContexts: [],
+      formMetadataWarnings: [],
     });
     await this.store.deleteConflict(remotePath);
     await this.store.saveManifest(context.manifest);
@@ -711,6 +731,7 @@ export class EcodeSyncService {
     profile: ConnectionProfile;
     syncRoot: string;
     manifest: SyncManifest;
+    formMetadataCache: FormMetadataCache;
   }> {
     const profile = await this.store.getProfile();
     if (!profile) {
@@ -719,7 +740,11 @@ export class EcodeSyncService {
     const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
     const fingerprint = serverFingerprint(profile.serverUrl, profile.username);
     const manifest = await this.store.loadManifest(fingerprint, syncRoot);
-    return { profile, syncRoot, manifest };
+    const formMetadataCache = await this.store.loadFormMetadataCache(
+      fingerprint,
+      syncRoot,
+    );
+    return { profile, syncRoot, manifest, formMetadataCache };
   }
 
   private async scanRemote(
@@ -1125,12 +1150,123 @@ export class EcodeSyncService {
   }
 
   private async readRemote(api: FileApi, entry: RemoteFileEntry): Promise<RemoteFileContent> {
-    const response = await api.viewFile(entry.id);
-    const content = requireSuccess(response, `读取远端文件失败: ${entry.path}`);
-    if (!isSupportedText(content)) {
+    const response = await api.viewFileDetail(entry.id);
+    const detail = requireSuccess(response, `读取远端文件失败: ${entry.path}`);
+    if (!isSupportedText(detail.content)) {
       throw new Error('当前版本不支持二进制或非 UTF-8 文件');
     }
-    return { entry, content, hash: hashText(content) };
+    return {
+      entry,
+      content: detail.content,
+      hash: hashText(detail.content),
+      formMetadataState: detail.formMetadataState,
+      formContexts: detail.formContexts,
+      formMetadataWarnings: detail.formMetadataWarnings,
+    };
+  }
+
+  private async refreshFormMetadataCache(
+    cache: FormMetadataCache,
+    remote: RemoteScan,
+    api: FileApi,
+  ): Promise<void> {
+    const nextFiles = { ...cache.files };
+    for (const cachedPath of Object.keys(nextFiles)) {
+      if (!remote.presentPaths.has(cachedPath)) {
+        delete nextFiles[cachedPath];
+      }
+    }
+
+    const analysis = analyzeFormContexts(
+      [...remote.files.values()].map(file => ({
+        path: file.entry.path,
+        content: file.content,
+      })),
+    );
+    for (const warning of analysis.warnings) {
+      this.output.warn(`表单上下文: ${warning}`);
+    }
+
+    const workflowIds = new Set(
+      [...analysis.bindingsByPath.entries()]
+        .filter(([remotePath]) => !analysis.unresolvedPaths.has(remotePath))
+        .flatMap(([, bindings]) => bindings)
+        .filter(binding => binding.kind === 'workflow')
+        .map(binding => binding.id),
+    );
+    const modeIds = new Set(
+      [...analysis.bindingsByPath.entries()]
+        .filter(([remotePath]) => !analysis.unresolvedPaths.has(remotePath))
+        .flatMap(([, bindings]) => bindings)
+        .filter(binding => binding.kind === 'mode')
+        .map(binding => binding.id),
+    );
+    for (const modeId of modeIds) {
+      this.output.warn(
+        `已识别 ModeForm modeId=${modeId}，但未确认仅按 modeId 获取字段结构的服务器接口`,
+      );
+    }
+    const workflowContexts = new Map<string, FormContext>();
+    const failedWorkflowIds = new Set<string>();
+    await mapConcurrent([...workflowIds], 4, async formId => {
+      const response = await api.loadWorkflowFormContext(formId);
+      if (isUnauthorized(response.code)) {
+        throw new SessionExpiredError(response.msg || 'Session expired');
+      }
+      if (!response.status || !response.data) {
+        failedWorkflowIds.add(formId);
+        this.output.warn(
+          `表单 ${formId} 字段元数据读取失败，保留旧缓存: ${response.msg ?? '未知错误'}`,
+        );
+        return;
+      }
+      workflowContexts.set(formId, response.data);
+    });
+
+    const updatedAt = new Date().toISOString();
+    for (const [remotePath, remoteFile] of remote.files) {
+      for (const warning of remoteFile.formMetadataWarnings) {
+        this.output.warn(`表单元数据 ${remotePath}: ${warning}`);
+      }
+      const bindings = analysis.bindingsByPath.get(remotePath) ?? [];
+      const contexts = [...remoteFile.formContexts];
+      if (!analysis.unresolvedPaths.has(remotePath)) {
+        for (const binding of bindings) {
+          if (binding.kind === 'workflow') {
+            const context = workflowContexts.get(binding.id);
+            if (context) {
+              contexts.push(context);
+            }
+          }
+        }
+      }
+      const uniqueContexts = dedupeFormContexts(contexts);
+      if (uniqueContexts.length > 0) {
+        nextFiles[remotePath] = {
+          remoteId: remoteFile.entry.id,
+          path: remotePath,
+          updatedAt,
+          contexts: uniqueContexts,
+        };
+        continue;
+      }
+      const unresolvedBinding = bindings.some(binding =>
+        binding.kind === 'mode'
+        || failedWorkflowIds.has(binding.id));
+      if (
+        remoteFile.formMetadataState === 'invalid'
+        || unresolvedBinding
+        || analysis.unresolvedPaths.has(remotePath)
+      ) {
+        continue;
+      }
+      if (remoteFile.formMetadataState === 'absent') {
+        delete nextFiles[remotePath];
+      }
+    }
+
+    cache.files = nextFiles;
+    await this.store.saveFormMetadataCache(cache);
   }
 
   private async pruneRemoteDeletedLocalDirectories(
@@ -1331,6 +1467,9 @@ export class EcodeSyncService {
           },
           content: conflict.remoteContent,
           hash: conflict.remoteHash,
+          formMetadataState: 'absent',
+          formContexts: [],
+          formMetadataWarnings: [],
         });
       }
     }
@@ -1492,6 +1631,21 @@ function emptyResult(): SyncOperationResult {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function dedupeFormContexts(contexts: FormContext[]): FormContext[] {
+  const unique = new Map<string, FormContext>();
+  for (const context of contexts) {
+    const key = [
+      context.kind,
+      context.formId ?? '',
+      context.modeId ?? '',
+      context.workflowId ?? '',
+      context.requestId ?? '',
+    ].join(':');
+    unique.set(key, context);
+  }
+  return [...unique.values()];
 }
 
 function conflictMessage(reason: StoredConflict['reason']): string {

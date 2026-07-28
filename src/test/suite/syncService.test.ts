@@ -4,6 +4,7 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
+import type { FormMetadataCache } from '../../domain/formMetadata';
 import type { ConnectionProfile, StoredConflict, SyncManifest } from '../../domain/types';
 import type { WorkspaceStore } from '../../storage/WorkspaceStore';
 import { EcodeSyncService, SyncCancelledError } from '../../sync/EcodeSyncService';
@@ -21,6 +22,7 @@ suite('Ecode sync service', () => {
     compiledContent?: string;
     status?: number;
     parentId?: string;
+    metadata?: unknown;
   }>;
   let folders: Array<{ id: string; name: string; parentId: string }>;
   let failedUploads: Set<string>;
@@ -29,6 +31,7 @@ suite('Ecode sync service', () => {
   let expiredTreeResponses: number;
   let rootTreeRequests: number;
   let folderDeleteRequests: number;
+  let requestedFormIds: string[];
 
   setup(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-service-'));
@@ -40,6 +43,7 @@ suite('Ecode sync service', () => {
     expiredTreeResponses = 0;
     rootTreeRequests = 0;
     folderDeleteRequests = 0;
+    requestedFormIds = [];
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
       const url = new URL(request.url ?? '/', 'http://localhost');
@@ -134,9 +138,46 @@ suite('Ecode sync service', () => {
         } else {
           response.end(JSON.stringify({
             status: true,
-            data: { content: file.content },
+            data: {
+              content: file.content,
+              ...(file.metadata === undefined ? {} : { metadata: file.metadata }),
+            },
           }));
         }
+        return;
+      }
+      if (
+        url.pathname === '/api/workflow/formSetting/fieldSet/getFieldList'
+        && request.method === 'POST'
+      ) {
+        const chunks: Buffer[] = [];
+        request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        request.on('end', () => {
+          const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+          requestedFormIds.push(form.get('formId') ?? '');
+          response.end(JSON.stringify({
+            status: true,
+            data: { sessionkey: `fields-${form.get('formId')}` },
+          }));
+        });
+        return;
+      }
+      if (
+        url.pathname === '/api/ec/dev/table/datas'
+        && request.method === 'POST'
+      ) {
+        response.end(JSON.stringify({
+          status: true,
+          data: {
+            datas: [{
+              id: '110',
+              fieldName: 'cfdd',
+              fieldlabel: '出发地点',
+              viewtype: '0',
+              groupname: '主表',
+            }],
+          },
+        }));
         return;
       }
       if (url.pathname === '/api/cloudstore/ecode/addFolder' && request.method === 'POST') {
@@ -346,6 +387,76 @@ suite('Ecode sync service', () => {
       fs.readFileSync(path.join(root, 'ecode', 'Type', 'a.js'), 'utf8'),
       'const remote = true;\n',
     );
+  });
+
+  test('refreshes, preserves, and removes file form metadata with a full pull', async () => {
+    files[0].metadata = {
+      workflowId: 77,
+      tableInfo: {
+        main: {
+          fieldInfoMap: {
+            110: {
+              fieldId: 110,
+              fieldLabel: '申请人',
+              fieldName: 'applicant',
+            },
+          },
+        },
+      },
+    };
+    const harness = createHarness(root, baseUrl);
+
+    await harness.service.pull(() => undefined);
+    assert.strictEqual(
+      harness.store.formMetadata.files['Type/a.js']
+        .contexts[0].tables[0].fields[0].label,
+      '申请人',
+    );
+
+    files[0].status = 500;
+    await harness.service.pull(() => undefined);
+    assert.ok(harness.store.formMetadata.files['Type/a.js']);
+
+    files[0].status = undefined;
+    files[0].metadata = '{"tableInfo":';
+    await harness.service.pull(() => undefined);
+    assert.ok(harness.store.formMetadata.files['Type/a.js']);
+
+    files[0].metadata = undefined;
+    await harness.service.pull(() => undefined);
+    assert.strictEqual(
+      harness.store.formMetadata.files['Type/a.js'],
+      undefined,
+    );
+  });
+
+  test('binds guarded workflow source to fields loaded by formId during full pull', async () => {
+    files[0].content = `
+      const carRequest = { WfFormId: -133 };
+      const runScript = () => WfForm.convertFieldNameToId('cfdd');
+      const { formid } = WfForm.getBaseInfo();
+      if (formid !== carRequest.WfFormId) return;
+      runScript();
+    `;
+    const harness = createHarness(root, baseUrl);
+
+    await harness.service.pull(() => undefined);
+
+    assert.deepStrictEqual(requestedFormIds, ['-133']);
+    const context = harness.store.formMetadata.files['Type/a.js'].contexts[0];
+    assert.strictEqual(context.formId, '-133');
+    assert.strictEqual(context.tables[0].fields[0].name, 'cfdd');
+    assert.strictEqual(context.tables[0].fields[0].label, '出发地点');
+  });
+
+  test('does not fail source pull when form metadata cache cannot be saved', async () => {
+    const harness = createHarness(root, baseUrl);
+    harness.store.failFormMetadataSave = true;
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 1);
   });
 
   test('does not delete a tracked local file when its remote content cannot be read', async () => {
@@ -740,12 +851,21 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
 
 class MemoryStore {
   manifest: SyncManifest;
+  formMetadata: FormMetadataCache;
+  failFormMetadataSave = false;
   conflicts = new Map<string, StoredConflict>();
   recoveries: Array<{ path: string; content: string }> = [];
   private snapshots = new Map<string, string>();
 
   constructor(private profile: ConnectionProfile) {
     this.manifest = {
+      schemaVersion: 1,
+      serverFingerprint: '',
+      syncRoot: '',
+      updatedAt: new Date(0).toISOString(),
+      files: {},
+    };
+    this.formMetadata = {
       schemaVersion: 1,
       serverFingerprint: '',
       syncRoot: '',
@@ -766,6 +886,22 @@ class MemoryStore {
 
   async saveManifest(manifest: SyncManifest): Promise<void> {
     this.manifest = manifest;
+  }
+
+  async loadFormMetadataCache(
+    fingerprint: string,
+    syncRoot: string,
+  ): Promise<FormMetadataCache> {
+    this.formMetadata.serverFingerprint = fingerprint;
+    this.formMetadata.syncRoot = syncRoot;
+    return this.formMetadata;
+  }
+
+  async saveFormMetadataCache(cache: FormMetadataCache): Promise<void> {
+    if (this.failFormMetadataSave) {
+      throw new Error('metadata storage unavailable');
+    }
+    this.formMetadata = cache;
   }
 
   async saveSnapshot(content: string): Promise<string> {

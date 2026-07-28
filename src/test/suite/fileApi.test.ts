@@ -21,10 +21,32 @@ suite('File API', () => {
           childFile: [],
         }));
       } else if (request.url?.startsWith('/api/cloudstore/ecode/one')) {
+        const id = new URL(request.url, 'http://localhost').searchParams.get('id');
         response.end(JSON.stringify({
           api_status: true,
           status: true,
-          data: { content: 'const value = 1;\n' },
+          data: {
+            content: 'const value = 1;\n',
+            ...(id === 'metadata-file'
+              ? {
+                  metadata: {
+                    modeId: 8,
+                    formId: 9,
+                    tableInfo: {
+                      main: {
+                        fieldInfoMap: {
+                          110: {
+                            fieldId: 110,
+                            fieldLabel: '申请人',
+                            fieldName: 'applicant',
+                          },
+                        },
+                      },
+                    },
+                  },
+                }
+              : {}),
+          },
         }));
       } else if (request.url === '/redirect') {
         response.statusCode = 302;
@@ -38,6 +60,52 @@ suite('File API', () => {
           errorCode: '002',
           errorMsg: '登录信息超时',
         }));
+      } else if (
+        request.method === 'POST'
+        && request.url === '/api/workflow/formSetting/fieldSet/getFieldList'
+      ) {
+        collectForm(request).then(form => {
+          posted.set(request.url ?? '', form);
+          response.end(JSON.stringify({
+            status: true,
+            data: { sessionkey: 'field-session' },
+          }));
+        });
+      } else if (
+        request.method === 'POST'
+        && request.url === '/api/ec/dev/table/datas'
+      ) {
+        collectForm(request).then(form => {
+          posted.set(request.url ?? '', form);
+          response.end(JSON.stringify({
+            status: true,
+            data: {
+              datas: [
+                {
+                  id: 110,
+                  fieldName: 'sqr',
+                  fieldlabel: '-86043',
+                  fieldlabelspan: '<a href="javascript:void(0)">申请人</a>',
+                  fieldhtmltype: 3,
+                  viewtype: 0,
+                  viewtypespan: '主表',
+                  groupname: '主表',
+                },
+                {
+                  id: '220',
+                  fieldName: 'mdd',
+                  fieldlabel: '-89192',
+                  fieldlabelspan: '<a href="javascript:void(0)">目的地</a>',
+                  fieldhtmltype: '1',
+                  viewtype: '1',
+                  groupid: '1',
+                  viewtypespan: '明细表1',
+                  groupname: '明细表1',
+                },
+              ],
+            },
+          }));
+        });
       } else if (request.method === 'POST' && request.url?.startsWith('/api/cloudstore/ecode/')) {
         collectForm(request).then(form => {
           posted.set(request.url ?? '', form);
@@ -73,6 +141,41 @@ suite('File API', () => {
     assert.strictEqual(tree.data?.typeList[0].hasChild, true);
     assert.strictEqual(content.status, true);
     assert.strictEqual(content.data, 'const value = 1;\n');
+  });
+
+  test('retains normalized form metadata from a file-detail response', async () => {
+    const detail = await new FileApi(new EcodeApiClient(baseUrl))
+      .viewFileDetail('metadata-file');
+
+    assert.strictEqual(detail.status, true);
+    assert.strictEqual(detail.data?.content, 'const value = 1;\n');
+    assert.strictEqual(detail.data?.formMetadataState, 'present');
+    assert.strictEqual(detail.data?.formContexts[0].kind, 'mode');
+    assert.strictEqual(
+      detail.data?.formContexts[0].tables[0].fields[0].name,
+      'applicant',
+    );
+  });
+
+  test('loads workflow fields through the verified two-stage field-list API', async () => {
+    const context = await new FileApi(new EcodeApiClient(baseUrl))
+      .loadWorkflowFormContext('-133');
+
+    assert.strictEqual(context.status, true);
+    assert.strictEqual(context.data?.kind, 'workflow');
+    assert.strictEqual(context.data?.formId, '-133');
+    assert.strictEqual(context.data?.tables[0].mark, 'main');
+    assert.strictEqual(context.data?.tables[0].fields[0].name, 'sqr');
+    assert.strictEqual(context.data?.tables[1].mark, 'detail_1');
+    assert.strictEqual(context.data?.tables[1].fields[0].label, '目的地');
+    assert.strictEqual(
+      posted.get('/api/workflow/formSetting/fieldSet/getFieldList')?.get('formId'),
+      '-133',
+    );
+    assert.strictEqual(
+      posted.get('/api/ec/dev/table/datas')?.get('dataKey'),
+      'field-session',
+    );
   });
 
   test('preserves an HTTP failure as a failed API response', async () => {

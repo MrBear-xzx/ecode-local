@@ -8,9 +8,11 @@ import {
   generateComponentDeclarations,
   generateGlobalDeclarations,
   generateWorkspaceComponents,
+  generateWorkspaceFormMetadata,
   normalizeType,
 } from '../../ai/AiSupportGenerator';
 import {
+  AiSupportService,
   removeManagedAgentsContent,
   updateManagedAgentsContent,
 } from '../../ai/AiSupportService';
@@ -75,6 +77,7 @@ suite('AI coding support', () => {
     assert.match(generated, /不是独立的 Node\.js、React CLI 或普通 Web 项目/);
     assert.match(generated, /运行时全局提供，无须 npm 安装或 import/);
     assert.match(generated, /Babel 7\.5\.5/);
+    assert.match(generated, /\.ecode-local\/ecode-ai\/workspace-form-metadata\.md/);
     assert.match(generated, /不要假设业务工作区使用 Git/);
     assert.match(generated, /不要自动执行远端推送、删除或发布操作/);
     assert.strictEqual(updated, generated);
@@ -100,6 +103,94 @@ suite('AI coding support', () => {
     assert.match(markdown, /ecode\/components\/widget\.js:4/);
     assert.match(markdown, /ecode\/pages\/home\.js:9/);
     assert.ok(!markdown.includes(`${workspaceRoot}/`));
+  });
+
+  test('generates AI-readable form fields grouped by source context', () => {
+    const markdown = generateWorkspaceFormMetadata([{
+      remoteId: 'file-1',
+      path: '流程/A002/index.js',
+      updatedAt: new Date(0).toISOString(),
+      contexts: [{
+        kind: 'workflow',
+        formId: '-133',
+        tables: [{
+          mark: 'main',
+          tableName: 'formtable_main_133',
+          fields: [{
+            id: '11408',
+            label: '出发地点',
+            name: 'cfdd',
+            dbType: 'varchar(4000)',
+            isView: true,
+          }],
+        }, {
+          mark: 'detail_2',
+          title: '用车明细',
+          fields: [{
+            id: '11420',
+            label: '存货编码',
+            name: 'chbm',
+          }],
+        }],
+      }],
+    }]);
+
+    assert.match(markdown, /ecode\/流程\/A002\/index\.js/);
+    assert.match(markdown, /流程表单（formId -133）/);
+    assert.match(markdown, /field11408/);
+    assert.match(markdown, /出发地点/);
+    assert.match(markdown, /cfdd/);
+    assert.match(markdown, /detail\\_2/);
+    assert.match(markdown, /默认定位主表/);
+  });
+
+  test('writes AI support below .ecode-local and cleans legacy managed files', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-migration-'));
+    const legacy = path.join(root, '.ecode-ai');
+    fs.mkdirSync(legacy);
+    fs.writeFileSync(path.join(legacy, 'ecode-ai-guide.md'), 'legacy', 'utf8');
+    fs.writeFileSync(path.join(legacy, 'custom.md'), 'keep', 'utf8');
+    const service = new AiSupportService(
+      {
+        refreshSourceRoot: async () => undefined,
+        getSnapshot: async () => [],
+      } as unknown as WorkspaceComponentRegistry,
+      {
+        getSnapshot: () => [],
+      } as never,
+      'test',
+      {
+        info: () => undefined,
+      } as never,
+    );
+    try {
+      const result = await service.refresh({
+        version: 3,
+        workspaceFolder: root,
+        serverUrl: 'https://example.test',
+        username: 'tester',
+      });
+
+      assert.strictEqual(
+        result.directory,
+        path.join(root, '.ecode-local', 'ecode-ai'),
+      );
+      assert.strictEqual(
+        fs.existsSync(path.join(result.directory, 'workspace-form-metadata.md')),
+        true,
+      );
+      assert.strictEqual(
+        fs.existsSync(path.join(legacy, 'ecode-ai-guide.md')),
+        false,
+      );
+      assert.strictEqual(fs.readFileSync(path.join(legacy, 'custom.md'), 'utf8'), 'keep');
+      assert.match(
+        fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8'),
+        /\.ecode-local\/ecode-ai/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('filters the workspace component snapshot to the fixed ecode source root', async () => {
