@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as ts from 'typescript';
 import * as vscode from 'vscode';
+import { parseAiPushRequest } from '../../ai/AiPushRequest';
 import {
   generateComponentDeclarations,
   generateGlobalDeclarations,
@@ -68,8 +69,8 @@ suite('AI coding support', () => {
 
   test('updates only the managed AGENTS block and rejects malformed markers', () => {
     const original = '# Existing instructions\n\nKeep this.\n';
-    const generated = updateManagedAgentsContent(original);
-    const updated = updateManagedAgentsContent(generated);
+    const generated = updateManagedAgentsContent(original, 'dev_env');
+    const updated = updateManagedAgentsContent(generated, 'dev_env');
 
     assert.match(generated, /^# Existing instructions/m);
     assert.match(generated, /<!-- ecode-local:ai-start -->/);
@@ -77,16 +78,52 @@ suite('AI coding support', () => {
     assert.match(generated, /不是独立的 Node\.js、React CLI 或普通 Web 项目/);
     assert.match(generated, /运行时全局提供，无须 npm 安装或 import/);
     assert.match(generated, /Babel 7\.5\.5/);
-    assert.match(generated, /\.ecode-local\/ecode-ai\/workspace-form-metadata\.md/);
+    assert.match(generated, /\.ecode-local\/common\/ecode-ai\/ecode-globals\.d\.ts/);
+    assert.match(generated, /\.ecode-local\/dev_env\/ecode-ai\/workspace-form-metadata\.md/);
     assert.match(generated, /不要假设业务工作区使用 Git/);
     assert.match(generated, /不要自动执行远端推送、删除或发布操作/);
+    assert.match(generated, /\.ecode-local\/ai-requests\/<id>\.json/);
+    assert.match(generated, /只有用户在当前任务中明确要求推送时/);
+    assert.match(generated, /"environmentDirectory": "dev_env"/);
     assert.strictEqual(updated, generated);
     assert.strictEqual(removeManagedAgentsContent(generated), original);
     assert.throws(
       () => updateManagedAgentsContent(
         `${original}<!-- ecode-local:ai-start -->\nmissing end\n`,
+        'dev_env',
       ),
       /标记残缺/,
+    );
+  });
+
+  test('validates AI push requests and binds the id to the file name', () => {
+    const request = parseAiPushRequest(JSON.stringify({
+      schemaVersion: 1,
+      id: 'push_001',
+      action: 'push',
+      environmentDirectory: 'dev_01',
+      paths: ['Type/a.js', 'Page/b.jsx'],
+      createdAt: '2026-07-30T12:00:00.000Z',
+    }), 'push_001.json');
+
+    assert.deepStrictEqual(request.paths, ['Type/a.js', 'Page/b.jsx']);
+    assert.throws(
+      () => parseAiPushRequest(JSON.stringify({
+        ...request,
+        paths: ['Type/a.js', 'type/A.js'],
+      }), 'push_001.json'),
+      /重复路径/,
+    );
+    assert.throws(
+      () => parseAiPushRequest(JSON.stringify(request), 'another.json'),
+      /文件名必须/,
+    );
+    assert.throws(
+      () => parseAiPushRequest(JSON.stringify({
+        ...request,
+        environmentDirectory: '开发环境',
+      }), 'push_001.json'),
+      /只能包含英文字母/,
     );
   });
 
@@ -96,7 +133,7 @@ suite('AI coding support', () => {
       call(workspaceRoot, 'definition', 'ecode/components/widget.js', 3),
       call(workspaceRoot, 'reference', 'ecode/pages/home.js', 8),
     ];
-    const markdown = generateWorkspaceComponents(workspaceRoot, calls);
+    const markdown = generateWorkspaceComponents(workspaceRoot, calls, 'ecode');
 
     assert.match(markdown, /app-test/);
     assert.match(markdown, /Widget/);
@@ -133,9 +170,9 @@ suite('AI coding support', () => {
           }],
         }],
       }],
-    }]);
+    }], 'dev_env');
 
-    assert.match(markdown, /ecode\/流程\/A002\/index\.js/);
+    assert.match(markdown, /dev_env\/流程\/A002\/index\.js/);
     assert.match(markdown, /流程表单（formId -133）/);
     assert.match(markdown, /field11408/);
     assert.match(markdown, /出发地点/);
@@ -144,12 +181,8 @@ suite('AI coding support', () => {
     assert.match(markdown, /默认定位主表/);
   });
 
-  test('writes AI support below .ecode-local and cleans legacy managed files', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-migration-'));
-    const legacy = path.join(root, '.ecode-ai');
-    fs.mkdirSync(legacy);
-    fs.writeFileSync(path.join(legacy, 'ecode-ai-guide.md'), 'legacy', 'utf8');
-    fs.writeFileSync(path.join(legacy, 'custom.md'), 'keep', 'utf8');
+  test('separates common knowledge from environment project knowledge', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-layout-'));
     const service = new AiSupportService(
       {
         refreshSourceRoot: async () => undefined,
@@ -165,7 +198,9 @@ suite('AI coding support', () => {
     );
     try {
       const result = await service.refresh({
-        version: 3,
+        version: 4,
+        environmentId: 'dev',
+        environmentDirectory: 'dev_env',
         workspaceFolder: root,
         serverUrl: 'https://example.test',
         username: 'tester',
@@ -173,29 +208,32 @@ suite('AI coding support', () => {
 
       assert.strictEqual(
         result.directory,
-        path.join(root, '.ecode-local', 'ecode-ai'),
+        path.join(root, '.ecode-local', 'dev_env', 'ecode-ai'),
       );
       assert.strictEqual(
         fs.existsSync(path.join(result.directory, 'workspace-form-metadata.md')),
         true,
       );
       assert.strictEqual(
-        fs.existsSync(path.join(legacy, 'ecode-ai-guide.md')),
-        false,
+        result.commonDirectory,
+        path.join(root, '.ecode-local', 'common', 'ecode-ai'),
       );
-      assert.strictEqual(fs.readFileSync(path.join(legacy, 'custom.md'), 'utf8'), 'keep');
+      assert.strictEqual(
+        fs.existsSync(path.join(result.commonDirectory, 'ecode-globals.d.ts')),
+        true,
+      );
       assert.match(
         fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8'),
-        /\.ecode-local\/ecode-ai/,
+        /\.ecode-local\/dev_env\/ecode-ai/,
       );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('filters the workspace component snapshot to the fixed ecode source root', async () => {
+  test('filters the workspace component snapshot to one environment source root', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-registry-'));
-    const sourceRoot = path.join(root, 'ecode');
+    const sourceRoot = path.join(root, 'dev_env');
     fs.mkdirSync(sourceRoot);
     const inside = path.join(sourceRoot, 'inside.js');
     const outside = path.join(root, 'outside.js');
@@ -225,6 +263,67 @@ suite('AI coding support', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test('limits component definitions and references to the source environment', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-navigation-'));
+    const developmentRoot = path.join(root, 'development');
+    const productionRoot = path.join(root, 'production');
+    const files = [
+      path.join(developmentRoot, 'registration.js'),
+      path.join(developmentRoot, 'usage.js'),
+      path.join(productionRoot, 'registration.js'),
+      path.join(productionRoot, 'usage.js'),
+    ];
+    fs.mkdirSync(developmentRoot, { recursive: true });
+    fs.mkdirSync(productionRoot, { recursive: true });
+    for (const file of files) {
+      fs.writeFileSync(
+        file,
+        file.endsWith('registration.js')
+          ? 'ecodeSDK.setCom("app-test", "Widget", Widget);'
+          : 'ecodeSDK.getCom("app-test", "Widget");',
+        'utf8',
+      );
+    }
+    const registry = new WorkspaceComponentRegistry();
+    try {
+      registry.setSourceRoots([developmentRoot, productionRoot]);
+      await registry.refreshSourceRoot(developmentRoot);
+      await registry.refreshSourceRoot(productionRoot);
+      const sourceUri = vscode.Uri.file(path.join(developmentRoot, 'usage.js'));
+      const componentCall = call(
+        developmentRoot,
+        'reference',
+        'usage.js',
+        0,
+      );
+
+      const definitions = await registry.getDefinitions(
+        componentCall,
+        sourceUri,
+      );
+      const references = await registry.getReferences(
+        componentCall,
+        true,
+        sourceUri,
+      );
+
+      assert.deepStrictEqual(
+        definitions.map(location => pathKey(location.uri.fsPath)),
+        [pathKey(path.join(developmentRoot, 'registration.js'))],
+      );
+      assert.deepStrictEqual(
+        references.map(location => pathKey(location.uri.fsPath)).sort(),
+        [
+          pathKey(path.join(developmentRoot, 'registration.js')),
+          pathKey(path.join(developmentRoot, 'usage.js')),
+        ].sort(),
+      );
+    } finally {
+      registry.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function call(
@@ -243,4 +342,10 @@ function call(
     uri: vscode.Uri.file(path.join(workspaceRoot, relativePath)),
     range: new vscode.Range(line, 2, line, 8),
   };
+}
+
+function pathKey(filePath: string): string {
+  return process.platform === 'win32'
+    ? path.resolve(filePath).toLowerCase()
+    : path.resolve(filePath);
 }

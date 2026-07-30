@@ -2,11 +2,11 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  ECODE_COMMON_DIRECTORY,
   ECODE_AI_DIRECTORY,
   ECODE_LOCAL_DIRECTORY,
-  LEGACY_ECODE_AI_DIRECTORY,
 } from '../domain/constants';
-import { resolveEcodeSourceRoot } from '../domain/paths';
+import { resolveEnvironmentSourceRoot } from '../domain/paths';
 import { hashText } from '../domain/text';
 import type { ConnectionProfile } from '../domain/types';
 import type { WorkspaceComponentRegistry } from '../language/WorkspaceComponentRegistry';
@@ -23,10 +23,13 @@ import {
 
 const AGENTS_START = '<!-- ecode-local:ai-start -->';
 const AGENTS_END = '<!-- ecode-local:ai-end -->';
-const MANAGED_FILES = [
+const COMMON_MANAGED_FILES = [
   'ecode-globals.d.ts',
   'ecode-components.d.ts',
   'ecode-ai-guide.md',
+  'manifest.json',
+] as const;
+const ENVIRONMENT_MANAGED_FILES = [
   'workspace-components.md',
   'workspace-form-metadata.md',
   'manifest.json',
@@ -34,6 +37,7 @@ const MANAGED_FILES = [
 
 export interface AiSupportRefreshResult {
   directory: string;
+  commonDirectory: string;
   changedFiles: readonly string[];
 }
 
@@ -62,47 +66,64 @@ export class AiSupportService {
   ): Promise<AiSupportRefreshResult> {
     if (!this.isEnabled(profile.workspaceFolder)) {
       return {
-        directory: aiDirectory(profile.workspaceFolder),
+        directory: environmentAiDirectory(profile),
+        commonDirectory: commonAiDirectory(profile.workspaceFolder),
         changedFiles: [],
       };
     }
-    const sourceRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
+    const sourceRoot = resolveEnvironmentSourceRoot(
+      profile.workspaceFolder,
+      profile.environmentDirectory,
+    );
     await this.registry.refreshSourceRoot(sourceRoot);
     const calls = await this.registry.getSnapshot(sourceRoot);
-    const generated: Record<string, string> = {
+    const commonGenerated: Record<string, string> = {
       'ecode-globals.d.ts': generateGlobalDeclarations(),
       'ecode-components.d.ts': generateComponentDeclarations(),
       'ecode-ai-guide.md': generateAiGuide(),
+    };
+    commonGenerated['manifest.json'] = generatedManifest(
+      this.extensionVersion,
+      commonGenerated,
+    );
+    const environmentGenerated: Record<string, string> = {
       'workspace-components.md': generateWorkspaceComponents(
         profile.workspaceFolder,
         calls,
+        profile.environmentDirectory,
       ),
       'workspace-form-metadata.md': generateWorkspaceFormMetadata(
         this.formRegistry.getSnapshot(),
+        profile.environmentDirectory,
       ),
     };
-    generated['manifest.json'] = `${JSON.stringify({
-      schemaVersion: 1,
-      generatorVersion: this.extensionVersion,
-      knowledgeHash: hashText(Object.entries(generated)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, content]) => `${name}\0${content}`)
-        .join('\0')),
-    }, null, 2)}\n`;
+    environmentGenerated['manifest.json'] = generatedManifest(
+      this.extensionVersion,
+      environmentGenerated,
+    );
 
-    const directory = aiDirectory(profile.workspaceFolder);
-    await fs.mkdir(directory, { recursive: true });
+    const commonDirectory = commonAiDirectory(profile.workspaceFolder);
+    const directory = environmentAiDirectory(profile);
     const changedFiles: string[] = [];
-    for (const [name, content] of Object.entries(generated)) {
-      const file = path.join(directory, name);
-      if (await writeIfChanged(file, content)) {
-        changedFiles.push(file);
+    for (const [targetDirectory, generated] of [
+      [commonDirectory, commonGenerated],
+      [directory, environmentGenerated],
+    ] as const) {
+      await fs.mkdir(targetDirectory, { recursive: true });
+      for (const [name, content] of Object.entries(generated)) {
+        const file = path.join(targetDirectory, name);
+        if (await writeIfChanged(file, content)) {
+          changedFiles.push(file);
+        }
       }
     }
 
     const agentsFile = path.join(profile.workspaceFolder, 'AGENTS.md');
     const currentAgents = await readOptionalFile(agentsFile);
-    const nextAgents = updateManagedAgentsContent(currentAgents);
+    const nextAgents = updateManagedAgentsContent(
+      currentAgents,
+      profile.environmentDirectory,
+    );
     if (nextAgents !== currentAgents && await writeIfChanged(agentsFile, nextAgents)) {
       changedFiles.push(agentsFile);
     }
@@ -113,23 +134,32 @@ export class AiSupportService {
           .join(', ')}`,
       );
     }
-    await this.removeManagedDirectory(
-      path.join(profile.workspaceFolder, LEGACY_ECODE_AI_DIRECTORY),
-    );
-    return { directory, changedFiles };
+    return { directory, commonDirectory, changedFiles };
   }
 
-  remove(workspaceFolder: string): Promise<void> {
-    return this.enqueue(() => this.removeNow(workspaceFolder));
+  remove(
+    profile: ConnectionProfile,
+    environmentDirectories: readonly string[] = [profile.environmentDirectory],
+  ): Promise<void> {
+    return this.enqueue(() => this.removeNow(profile, environmentDirectories));
   }
 
-  private async removeNow(workspaceFolder: string): Promise<void> {
-    await this.removeManagedDirectory(aiDirectory(workspaceFolder));
+  private async removeNow(
+    profile: ConnectionProfile,
+    environmentDirectories: readonly string[],
+  ): Promise<void> {
     await this.removeManagedDirectory(
-      path.join(workspaceFolder, LEGACY_ECODE_AI_DIRECTORY),
+      commonAiDirectory(profile.workspaceFolder),
+      COMMON_MANAGED_FILES,
     );
+    for (const environmentDirectory of new Set(environmentDirectories)) {
+      await this.removeManagedDirectory(
+        environmentAiDirectory({ ...profile, environmentDirectory }),
+        ENVIRONMENT_MANAGED_FILES,
+      );
+    }
 
-    const agentsFile = path.join(workspaceFolder, 'AGENTS.md');
+    const agentsFile = path.join(profile.workspaceFolder, 'AGENTS.md');
     const currentAgents = await readOptionalFile(agentsFile);
     if (currentAgents !== undefined) {
       const nextAgents = removeManagedAgentsContent(currentAgents);
@@ -139,8 +169,11 @@ export class AiSupportService {
     }
   }
 
-  private async removeManagedDirectory(directory: string): Promise<void> {
-    for (const name of MANAGED_FILES) {
+  private async removeManagedDirectory(
+    directory: string,
+    managedFiles: readonly string[],
+  ): Promise<void> {
+    for (const name of managedFiles) {
       await removeOptionalFile(path.join(directory, name));
     }
     try {
@@ -154,7 +187,7 @@ export class AiSupportService {
 
   guideUri(workspaceFolder: string): vscode.Uri {
     return vscode.Uri.file(path.join(
-      aiDirectory(workspaceFolder),
+      commonAiDirectory(workspaceFolder),
       'ecode-ai-guide.md',
     ));
   }
@@ -166,7 +199,11 @@ export class AiSupportService {
   }
 }
 
-export function updateManagedAgentsContent(current: string | undefined): string {
+export function updateManagedAgentsContent(
+  current: string | undefined,
+  environmentDirectory = '环境目录',
+): string {
+  const environmentAiRoot = `.ecode-local/${environmentDirectory}/ecode-ai`;
   const block = [
     AGENTS_START,
     '## Ecode 项目说明',
@@ -178,10 +215,12 @@ export function updateManagedAgentsContent(current: string | undefined): string 
     '',
     '### 目录约定',
     '',
-    '- `ecode/`：唯一的 Ecode 业务源码目录。',
-    '- `.ecode-local/ecode-ai/`：由 Ecode Local 自动生成的 AI 知识资料，不属于业务源码。',
-    '- `.ecode-local/storage/`：同步清单、字段缓存、快照、冲突和恢复副本，不属于业务源码。',
-    '- 不要直接修改 `.ecode-local/` 中的文件。',
+    `- \`${environmentDirectory}/\`：当前活动环境的 Ecode 业务源码目录。`,
+    '- `.ecode-local/common/ecode-ai/`：公共 API 与组件知识，不属于业务源码。',
+    `- \`.ecode-local/${environmentDirectory}/\`：当前环境的同步状态、字段缓存、快照、`
+      + '冲突、恢复副本及项目知识，不属于业务源码。',
+    '- `.ecode-local/promotion/`：推送记录、跨环境变更集、源码快照与应用记录。',
+    '- 不要直接修改 `.ecode-local/` 中的文件；唯一例外是下述 AI 推送请求文件。',
     '- 不要把 `.ecode-local/`、`AGENTS.md` 或工作区其他文件当作 Ecode 远端源码。',
     '',
     '### 运行时约定',
@@ -203,21 +242,42 @@ export function updateManagedAgentsContent(current: string | undefined): string 
     '',
     '### 修改代码前',
     '',
-    '1. 阅读 `.ecode-local/ecode-ai/ecode-ai-guide.md`。',
-    '2. API、参数和返回值以 `.ecode-local/ecode-ai/ecode-globals.d.ts` 为准。',
-    '3. PC 组件和 props 以 `.ecode-local/ecode-ai/ecode-components.d.ts` 为准。',
-    '4. 表单字段以 `.ecode-local/ecode-ai/workspace-form-metadata.md` 为准。',
-    '5. 使用 `ecodeSDK.getCom` 前，检查 `.ecode-local/ecode-ai/workspace-components.md` '
+    '1. 阅读 `.ecode-local/common/ecode-ai/ecode-ai-guide.md`。',
+    '2. API、参数和返回值以 `.ecode-local/common/ecode-ai/ecode-globals.d.ts` 为准。',
+    '3. PC 组件和 props 以 `.ecode-local/common/ecode-ai/ecode-components.d.ts` 为准。',
+    `4. 表单字段以 \`${environmentAiRoot}/workspace-form-metadata.md\` 为准。`,
+    `5. 使用 \`ecodeSDK.getCom\` 前，检查 \`${environmentAiRoot}/workspace-components.md\` `
       + '中是否存在对应的 `setCom` 注册。',
-    '6. 优先搜索 `ecode/` 中已有的同类调用和项目编码模式。',
+    `6. 优先搜索 \`${environmentDirectory}/\` 中已有的同类调用和项目编码模式。`,
     '7. 类型为 `unknown` 表示资料不足，需要从现有源码或用户信息继续确认，不得自行编造参数。',
     '',
     '### 修改边界',
     '',
-    '- 业务代码修改应限制在 `ecode/` 中，除非用户明确要求修改工作区配置或文档。',
+    `- 业务代码修改应限制在 \`${environmentDirectory}/\` 中，`
+      + '除非用户明确要求修改工作区配置或文档。',
     '- 不要直接编辑生成的 AI 文件。',
     '- 不要假设业务工作区使用 Git。',
     '- 不要自动执行远端推送、删除或发布操作。',
+    '',
+    '### AI 推送请求接口',
+    '',
+    '- 只有用户在当前任务中明确要求推送时，AI 才能创建推送请求；代码修改、测试通过或此前授权都不等于推送授权。',
+    `- 请求写入 \`.ecode-local/ai-requests/<id>.json\`，其中环境目录必须是当前活动目录 \`${environmentDirectory}\`。`,
+    '- `<id>` 只能包含英文字母、数字、下划线和横线，最长 64 位；每次请求使用新的 id，禁止覆盖旧请求。',
+    '- `paths` 使用相对于环境源码目录的 `/` 分隔路径，只能包含本次明确要求推送的文件，最多 100 个。',
+    '- 扩展会校验文件状态、弹出人工确认、执行远端冲突检查和回读验证；AI 不得绕过确认或直接调用 E-cology 接口。',
+    '- 处理结果位于 `.ecode-local/ai-results/<id>.json`。读取结果并向用户报告；不要修改请求或结果文件。',
+    '',
+    '```json',
+    '{',
+    '  "schemaVersion": 1,',
+    '  "id": "push_20260730_001",',
+    '  "action": "push",',
+    `  "environmentDirectory": "${environmentDirectory}",`,
+    '  "paths": ["Type/example.js"],',
+    '  "createdAt": "2026-07-30T12:00:00.000Z"',
+    '}',
+    '```',
     AGENTS_END,
   ].join('\n');
   if (current === undefined || current.length === 0) {
@@ -323,10 +383,34 @@ function isFileSystemError(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException).code === code;
 }
 
-function aiDirectory(workspaceFolder: string): string {
+function commonAiDirectory(workspaceFolder: string): string {
   return path.join(
     workspaceFolder,
     ECODE_LOCAL_DIRECTORY,
+    ECODE_COMMON_DIRECTORY,
     ECODE_AI_DIRECTORY,
   );
+}
+
+function environmentAiDirectory(profile: ConnectionProfile): string {
+  return path.join(
+    profile.workspaceFolder,
+    ECODE_LOCAL_DIRECTORY,
+    profile.environmentDirectory,
+    ECODE_AI_DIRECTORY,
+  );
+}
+
+function generatedManifest(
+  extensionVersion: string,
+  generated: Record<string, string>,
+): string {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    generatorVersion: extensionVersion,
+    knowledgeHash: hashText(Object.entries(generated)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, content]) => `${name}\0${content}`)
+      .join('\0')),
+  }, null, 2)}\n`;
 }

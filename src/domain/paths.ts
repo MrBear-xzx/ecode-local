@@ -1,6 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ECODE_SOURCE_DIRECTORY } from './constants';
+import {
+  ECODE_COMMON_DIRECTORY,
+  ECODE_LOCAL_DIRECTORY,
+  ECODE_PROMOTION_DIRECTORY,
+} from './constants';
 
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const WINDOWS_INVALID = /[<>:"|?*\u0000-\u001F]/;
@@ -53,24 +57,60 @@ export function assertNoCaseCollisions(paths: Iterable<string>): void {
   }
 }
 
-export function resolveEcodeSourceRoot(workspaceFolder: string): string {
-  return resolveWorkspaceSubdirectory(workspaceFolder, ECODE_SOURCE_DIRECTORY);
+export function validateEnvironmentDirectory(value: string): string | undefined {
+  const directory = value.trim();
+  if (!directory) {
+    return '环境目录不能为空';
+  }
+  if (!/^[A-Za-z0-9_]+$/.test(directory)) {
+    return '环境目录只能包含英文字母、数字和下划线';
+  }
+  if (!/[A-Za-z0-9]/.test(directory)) {
+    return '环境目录至少包含一个英文字母或数字';
+  }
+  if (/^(con|prn|aux|nul)$/i.test(directory)) {
+    return `环境目录不能使用 Windows 保留名称 ${directory}`;
+  }
+  if ([
+    ECODE_LOCAL_DIRECTORY,
+    ECODE_COMMON_DIRECTORY,
+    ECODE_PROMOTION_DIRECTORY,
+  ].includes(directory.toLocaleLowerCase('en-US'))) {
+    return `环境目录不能使用保留名称 ${directory}`;
+  }
+  return undefined;
 }
 
-export function resolveLegacySyncRoot(
+export function resolveEnvironmentSourceRoot(
   workspaceFolder: string,
-  localDirectory: string,
+  environmentDirectory: string,
 ): string {
-  const segments = localDirectory.split(/[\\/]+/);
-  if (
-    !localDirectory.trim()
-    || path.isAbsolute(localDirectory)
-    || segments.includes('..')
-  ) {
-    throw new Error('本地目录必须是工作区内的相对路径');
+  const validation = validateEnvironmentDirectory(environmentDirectory);
+  if (validation) {
+    throw new Error(validation);
   }
+  return resolveWorkspaceSubdirectory(workspaceFolder, environmentDirectory.trim());
+}
 
-  return resolveWorkspaceSubdirectory(workspaceFolder, localDirectory);
+export function resolveEnvironmentDataRoot(
+  workspaceFolder: string,
+  environmentDirectory: string,
+): string {
+  const validation = validateEnvironmentDirectory(environmentDirectory);
+  if (validation) {
+    throw new Error(validation);
+  }
+  return resolveWorkspaceSubdirectory(
+    workspaceFolder,
+    path.join(ECODE_LOCAL_DIRECTORY, environmentDirectory.trim()),
+  );
+}
+
+export function resolveCommonDataRoot(workspaceFolder: string): string {
+  return resolveWorkspaceSubdirectory(
+    workspaceFolder,
+    path.join(ECODE_LOCAL_DIRECTORY, ECODE_COMMON_DIRECTORY),
+  );
 }
 
 function resolveWorkspaceSubdirectory(

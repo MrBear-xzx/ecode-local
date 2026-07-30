@@ -4,18 +4,37 @@ import type {
 } from './formMetadata';
 
 export interface ConnectionProfile {
-  version: 3;
+  version: 4;
+  environmentId: string;
+  environmentDirectory: string;
   workspaceFolder: string;
   serverUrl: string;
   username: string;
 }
 
-export interface LegacyConnectionProfile {
+export interface EnvironmentProfile {
   version: 2;
+  id: string;
+  name: string;
+  directory: string;
   workspaceFolder: string;
   serverUrl: string;
   username: string;
-  localDirectory: string;
+}
+
+export interface StoredEnvironmentProfile {
+  version: 2;
+  id: string;
+  name: string;
+  directory: string;
+  serverUrl: string;
+  username: string;
+}
+
+export interface EnvironmentConfiguration {
+  schemaVersion: 2;
+  activeEnvironmentId: string;
+  environments: StoredEnvironmentProfile[];
 }
 
 export interface RemoteFileEntry {
@@ -115,4 +134,85 @@ export interface StoredConflict {
   detectedAt: string;
   reason: ConflictReason;
   remoteDeleted?: boolean;
+}
+
+export type PromotionOperation = 'add' | 'modify' | 'delete';
+
+export interface PromotionCandidate {
+  path: string;
+  operation: PromotionOperation;
+  baseHash?: string;
+  baseContent?: string;
+  resultHash?: string;
+  resultContent?: string;
+}
+
+export interface ChangeSetFile {
+  path: string;
+  operation: PromotionOperation;
+  baseHash?: string;
+  baseSnapshotKey?: string;
+  resultHash?: string;
+  resultSnapshotKey?: string;
+  verifiedAt: string;
+}
+
+export interface ChangeSet {
+  schemaVersion: 1;
+  id: string;
+  name: string;
+  sourceEnvironmentId: string;
+  createdAt: string;
+  updatedAt: string;
+  files: Record<string, ChangeSetFile>;
+}
+
+export interface PushRecord {
+  schemaVersion: 1;
+  id: string;
+  environmentId: string;
+  createdAt: string;
+  status: 'succeeded' | 'partial';
+  requestedPaths: string[];
+  files: ChangeSetFile[];
+}
+
+export type DeploymentFileStatus =
+  | 'pending'
+  | 'succeeded'
+  | 'conflict'
+  | 'failed';
+
+export interface DeploymentFileResult {
+  path: string;
+  operation: PromotionOperation;
+  status: DeploymentFileStatus;
+  expectedHash?: string;
+  actualHash?: string;
+  message?: string;
+  recoveryPath?: string;
+}
+
+export interface DeploymentRecord {
+  schemaVersion: 1;
+  id: string;
+  changeSetId: string;
+  targetEnvironmentId: string;
+  startedAt: string;
+  completedAt: string;
+  status: 'succeeded' | 'partial' | 'conflict' | 'failed';
+  files: DeploymentFileResult[];
+}
+
+export interface ReleaseArtifact {
+  path: string;
+  operation: PromotionOperation;
+  baseHash?: string;
+  resultHash?: string;
+  resultContent?: string;
+}
+
+export interface ReleaseVerification {
+  success: boolean;
+  files: DeploymentFileResult[];
 }

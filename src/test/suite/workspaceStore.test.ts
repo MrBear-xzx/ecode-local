@@ -2,13 +2,11 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { FormMetadataCache } from '../../domain/formMetadata';
 import type {
-  ConnectionProfile,
-  LegacyConnectionProfile,
   StoredConflict,
   SyncManifest,
 } from '../../domain/types';
-import type { FormMetadataCache } from '../../domain/formMetadata';
 import {
   updateGitIgnoreForEcodeLocal,
   WorkspaceStore,
@@ -16,21 +14,14 @@ import {
 
 suite('Workspace store', () => {
   let root: string;
-  let state: Map<string, unknown>;
+  let workspaceFolder: string;
   let store: WorkspaceStore;
 
   setup(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-store-'));
-    state = new Map<string, unknown>();
-    store = new WorkspaceStore({
-      storageUri: { fsPath: root },
-      workspaceState: {
-        get: <T>(key: string): T | undefined => state.get(key) as T | undefined,
-        update: async (key: string, value: unknown): Promise<void> => {
-          state.set(key, value);
-        },
-      },
-    } as never);
+    workspaceFolder = path.join(root, 'workspace');
+    fs.mkdirSync(workspaceFolder);
+    store = new WorkspaceStore(workspaceFolder);
   });
 
   teardown(() => {
@@ -38,18 +29,10 @@ suite('Workspace store', () => {
   });
 
   test('persists manifest updates atomically and rejects a different identity', async () => {
-    const syncRoot = path.join(root, 'workspace', 'ecode');
+    const syncRoot = path.join(workspaceFolder, 'dev_01');
     const manifest = emptyManifest('identity-a', syncRoot);
     await store.loadManifest('identity-a', syncRoot);
-    await store.saveManifest(manifest);
-    manifest.files['Type/a.js'] = {
-      remoteId: 'file-1',
-      path: 'Type/a.js',
-      kind: 'text',
-      baselineHash: 'hash',
-      snapshotKey: 'snapshot',
-      lastVerifiedAt: new Date().toISOString(),
-    };
+    manifest.files['Type/a.js'] = manifestEntry('Type/a.js', 'hash');
     await store.saveManifest(manifest);
 
     const restored = await store.loadManifest('identity-a', syncRoot);
@@ -57,35 +40,143 @@ suite('Workspace store', () => {
 
     assert.ok(restored.files['Type/a.js']);
     assert.deepStrictEqual(otherIdentity.files, {});
+    assert.strictEqual(
+      fs.existsSync(path.join(environmentRoot('dev_01'), 'sync-manifest.json.tmp')),
+      false,
+    );
   });
 
-  test('reads and clears a legacy v2 connection profile separately', async () => {
-    const legacy: LegacyConnectionProfile = {
-      version: 2,
-      workspaceFolder: path.join(root, 'workspace'),
-      serverUrl: 'https://example.test',
-      username: 'sysadmin',
-      localDirectory: 'custom-source',
-    };
-    state.set('ecode.v2.profile', legacy);
+  test('persists environment configuration only in .ecode-local', async () => {
+    const saved = await store.saveEnvironment({
+      name: '开发环境',
+      directory: 'dev_env',
+      workspaceFolder,
+      serverUrl: 'https://dev.example',
+      username: 'developer',
+    });
 
-    assert.deepStrictEqual(await store.getLegacyProfile(), legacy);
-    assert.strictEqual(await store.getProfile(), undefined);
-    await store.clearLegacyProfile();
-    assert.strictEqual(await store.getLegacyProfile(), undefined);
-
-    const current: ConnectionProfile = {
-      version: 3,
-      workspaceFolder: legacy.workspaceFolder,
-      serverUrl: legacy.serverUrl,
-      username: legacy.username,
+    const configurationFile = path.join(
+      workspaceFolder,
+      '.ecode-local',
+      'environments.json',
+    );
+    const raw = fs.readFileSync(configurationFile, 'utf8');
+    const configuration = JSON.parse(raw) as {
+      schemaVersion: number;
+      environments: Array<Record<string, unknown>>;
     };
-    await store.saveProfile(current);
-    assert.deepStrictEqual(await store.getProfile(), current);
+
+    assert.strictEqual(configuration.schemaVersion, 2);
+    assert.strictEqual(configuration.environments[0].directory, 'dev_env');
+    assert.strictEqual(configuration.environments[0].workspaceFolder, undefined);
+    assert.strictEqual(configuration.environments[0].password, undefined);
+    assert.strictEqual((await store.getActiveEnvironment())?.id, saved.id);
+    assert.deepStrictEqual(await store.getProfile(), {
+      version: 4,
+      environmentId: saved.id,
+      environmentDirectory: 'dev_env',
+      workspaceFolder,
+      serverUrl: 'https://dev.example',
+      username: 'developer',
+    });
   });
 
-  test('persists form metadata separately for the active server and sync root', async () => {
-    const syncRoot = path.join(root, 'workspace', 'ecode');
+  test('keeps source roots and environment data isolated by directory', async () => {
+    const development = await store.saveEnvironment({
+      name: '开发环境',
+      directory: 'dev',
+      workspaceFolder,
+      serverUrl: 'https://dev.example',
+      username: 'developer',
+    });
+    const devRoot = path.join(workspaceFolder, development.directory);
+    const devManifest = emptyManifest('identity-dev', devRoot);
+    devManifest.files['Type/dev.js'] = manifestEntry('Type/dev.js', 'dev');
+    await store.saveManifest(devManifest);
+
+    const target = await store.saveEnvironment({
+      name: '目标环境',
+      directory: 'target_env',
+      workspaceFolder,
+      serverUrl: 'https://target.example',
+      username: 'publisher',
+    });
+    const targetRoot = path.join(workspaceFolder, target.directory);
+    const targetManifest = emptyManifest('identity-target', targetRoot);
+    targetManifest.files['Type/target.js'] = manifestEntry('Type/target.js', 'target');
+    await store.saveManifest(targetManifest);
+
+    assert.ok((await store.loadManifest('identity-dev', devRoot)).files['Type/dev.js']);
+    assert.strictEqual(
+      (await store.loadManifest('identity-dev', devRoot)).files['Type/target.js'],
+      undefined,
+    );
+    assert.ok(
+      (await store.loadManifest('identity-target', targetRoot)).files['Type/target.js'],
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(environmentRoot('dev'), 'sync-manifest.json')),
+      true,
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(environmentRoot('target_env'), 'sync-manifest.json')),
+      true,
+    );
+    await store.setActiveEnvironment(development.id);
+    assert.strictEqual((await store.getActiveEnvironment())?.directory, 'dev');
+  });
+
+  test('rejects duplicate, invalid, and mutable environment directories', async () => {
+    const saved = await store.saveEnvironment({
+      name: '开发环境',
+      directory: 'dev_env',
+      workspaceFolder,
+      serverUrl: 'https://dev.example',
+      username: 'developer',
+    });
+    await assert.rejects(
+      store.saveEnvironment({
+        name: '另一个环境',
+        directory: 'DEV_ENV',
+        workspaceFolder,
+        serverUrl: 'https://other.example',
+        username: 'other',
+      }),
+      /已由环境/,
+    );
+    const numericDirectory = await store.saveEnvironment({
+      name: '数字目录',
+      directory: 'dev2',
+      workspaceFolder,
+      serverUrl: 'https://numeric.example',
+      username: 'numeric',
+    });
+    assert.strictEqual(numericDirectory.directory, 'dev2');
+    await assert.rejects(
+      store.saveEnvironment({
+        name: '非法目录',
+        directory: 'dev-2',
+        workspaceFolder,
+        serverUrl: 'https://other.example',
+        username: 'other',
+      }),
+      /只能包含/,
+    );
+    await assert.rejects(
+      store.saveEnvironment({
+        id: saved.id,
+        name: saved.name,
+        directory: 'renamed',
+        workspaceFolder,
+        serverUrl: saved.serverUrl,
+        username: saved.username,
+      }),
+      /不可修改/,
+    );
+  });
+
+  test('persists form metadata in the matching environment directory', async () => {
+    const syncRoot = path.join(workspaceFolder, 'dev');
     const cache: FormMetadataCache = {
       schemaVersion: 1,
       serverFingerprint: 'identity-a',
@@ -111,103 +202,36 @@ suite('Workspace store', () => {
     await store.saveFormMetadataCache(cache);
     const restored = await store.loadFormMetadataCache('identity-a', syncRoot);
     const otherServer = await store.loadFormMetadataCache('identity-b', syncRoot);
-    const otherRoot = await store.loadFormMetadataCache(
-      'identity-a',
-      path.join(root, 'other', 'ecode'),
-    );
 
     assert.strictEqual(
       restored.files['Type/form.js'].contexts[0].tables[0].fields[0].label,
       '申请人',
     );
     assert.deepStrictEqual(otherServer.files, {});
-    assert.deepStrictEqual(otherRoot.files, {});
     assert.strictEqual(
-      fs.existsSync(path.join(workspaceStorageRoot(), 'form-metadata.json.tmp')),
-      false,
-    );
-    assert.strictEqual(
-      fs.existsSync(path.join(workspaceStorageRoot(), 'form-metadata.json')),
+      fs.existsSync(path.join(environmentRoot('dev'), 'form-metadata.json')),
       true,
-    );
-  });
-
-  test('copies legacy extension storage into the workspace-local directory', async () => {
-    const syncRoot = path.join(root, 'workspace', 'ecode');
-    const legacyManifest = emptyManifest('identity-a', syncRoot);
-    legacyManifest.files['Type/a.js'] = {
-      remoteId: 'file-1',
-      path: 'Type/a.js',
-      kind: 'text',
-      baselineHash: 'hash',
-      snapshotKey: 'snapshot',
-      lastVerifiedAt: new Date(0).toISOString(),
-    };
-    fs.writeFileSync(
-      path.join(root, 'sync-manifest.json'),
-      `${JSON.stringify(legacyManifest)}\n`,
-      'utf8',
-    );
-    fs.mkdirSync(path.join(root, 'snapshots'));
-    fs.writeFileSync(path.join(root, 'snapshots', 'snapshot.txt'), 'source', 'utf8');
-
-    const restored = await store.loadManifest('identity-a', syncRoot);
-
-    assert.ok(restored.files['Type/a.js']);
-    assert.strictEqual(await store.readSnapshot('snapshot'), 'source');
-    assert.strictEqual(
-      fs.existsSync(path.join(workspaceStorageRoot(), 'sync-manifest.json')),
-      true,
-    );
-    assert.strictEqual(
-      fs.existsSync(path.join(root, 'sync-manifest.json')),
-      true,
-      '旧扩展存储应保留作为迁移兜底',
     );
   });
 
   test('adds .ecode-local to git ignore without replacing existing rules', async () => {
-    const workspaceRoot = path.join(root, 'workspace');
-    const syncRoot = path.join(workspaceRoot, 'ecode');
-    fs.mkdirSync(path.join(workspaceRoot, '.git'), { recursive: true });
-    fs.writeFileSync(
-      path.join(workspaceRoot, '.gitignore'),
-      'node_modules/\n',
-      'utf8',
-    );
+    fs.mkdirSync(path.join(workspaceFolder, '.git'));
+    fs.writeFileSync(path.join(workspaceFolder, '.gitignore'), 'node_modules/\n', 'utf8');
 
-    await store.loadManifest('identity-a', syncRoot);
-    await store.loadFormMetadataCache('identity-a', syncRoot);
+    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
 
-    const gitIgnore = fs.readFileSync(
-      path.join(workspaceRoot, '.gitignore'),
-      'utf8',
-    );
+    const gitIgnore = fs.readFileSync(path.join(workspaceFolder, '.gitignore'), 'utf8');
     assert.match(gitIgnore, /^node_modules\/$/m);
-    assert.strictEqual(
-      gitIgnore.match(/^\/\.ecode-local\/$/gm)?.length,
-      1,
-    );
-    assert.strictEqual(
-      updateGitIgnoreForEcodeLocal(gitIgnore),
-      gitIgnore,
-    );
+    assert.strictEqual(gitIgnore.match(/^\/\.ecode-local\/$/gm)?.length, 1);
+    assert.strictEqual(updateGitIgnoreForEcodeLocal(gitIgnore), gitIgnore);
   });
 
   test('does not create .gitignore outside a git repository', async () => {
-    const workspaceRoot = path.join(root, 'workspace');
-    await store.loadManifest(
-      'identity-a',
-      path.join(workspaceRoot, 'ecode'),
-    );
-    assert.strictEqual(
-      fs.existsSync(path.join(workspaceRoot, '.gitignore')),
-      false,
-    );
+    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
+    assert.strictEqual(fs.existsSync(path.join(workspaceFolder, '.gitignore')), false);
   });
 
-  test('scopes stored conflicts to the active connection identity', async () => {
-    const syncRoot = path.join(root, 'workspace', 'ecode');
+  test('scopes stored conflicts to each environment directory', async () => {
     const conflict: StoredConflict = {
       path: 'Type/a.js',
       remoteId: 'file-1',
@@ -217,19 +241,30 @@ suite('Workspace store', () => {
       reason: 'bothModified',
     };
 
-    await store.loadManifest('identity-a', syncRoot);
+    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
     await store.saveConflict(conflict);
     assert.strictEqual((await store.listConflicts()).length, 1);
 
-    await store.loadManifest('identity-b', syncRoot);
+    await store.loadManifest('identity-b', path.join(workspaceFolder, 'target'));
     assert.strictEqual((await store.listConflicts()).length, 0);
 
-    await store.loadManifest('identity-a', syncRoot);
+    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
     assert.strictEqual((await store.loadConflict('Type/a.js'))?.remoteId, 'file-1');
   });
 
-  function workspaceStorageRoot(): string {
-    return path.join(root, 'workspace', '.ecode-local', 'storage');
+  test('keeps distinct recovery copies created for the same file', async () => {
+    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
+
+    const first = await store.saveRecovery('Type/a.js', 'remote version');
+    const second = await store.saveRecovery('Type/a.js', 'local version');
+
+    assert.notStrictEqual(first, second);
+    assert.strictEqual(fs.readFileSync(first, 'utf8'), 'remote version');
+    assert.strictEqual(fs.readFileSync(second, 'utf8'), 'local version');
+  });
+
+  function environmentRoot(directory: string): string {
+    return path.join(workspaceFolder, '.ecode-local', directory);
   }
 });
 
@@ -240,5 +275,16 @@ function emptyManifest(serverFingerprint: string, syncRoot: string): SyncManifes
     syncRoot,
     updatedAt: new Date(0).toISOString(),
     files: {},
+  };
+}
+
+function manifestEntry(remotePath: string, hash: string): SyncManifest['files'][string] {
+  return {
+    remoteId: `file-${hash}`,
+    path: remotePath,
+    kind: 'text',
+    baselineHash: hash,
+    snapshotKey: hash,
+    lastVerifiedAt: new Date(0).toISOString(),
   };
 }

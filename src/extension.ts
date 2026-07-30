@@ -1,13 +1,30 @@
 import * as fs from 'fs';
+import { randomUUID } from 'crypto';
+import * as path from 'path';
 import * as vscode from 'vscode';
+import {
+  AI_PUSH_REQUEST_DIRECTORY,
+  AI_PUSH_RESULT_DIRECTORY,
+  type AiPushRequest,
+  type AiPushResult,
+  parseAiPushRequest,
+} from './ai/AiPushRequest';
 import { AiSupportService } from './ai/AiSupportService';
-import { ECODE_SOURCE_DIRECTORY } from './domain/constants';
-import { resolveEcodeSourceRoot, resolveSafeLocalPath } from './domain/paths';
-import { classifyLegacyProfile } from './domain/profileMigration';
+import { ECODE_LOCAL_DIRECTORY } from './domain/constants';
+import {
+  resolveEnvironmentSourceRoot,
+  resolveSafeLocalPath,
+  validateEnvironmentDirectory,
+} from './domain/paths';
 import { serverFingerprint } from './domain/text';
 import type {
+  ChangeSet,
+  DeploymentFileResult,
+  DeploymentRecord,
   ConnectionProfile,
-  LegacyConnectionProfile,
+  EnvironmentProfile,
+  PromotionCandidate,
+  PushRecord,
   SyncChange,
   SyncOperationResult,
 } from './domain/types';
@@ -15,9 +32,18 @@ import { registerEcodeLanguageFeatures } from './language/EcodeLanguageProvider'
 import { WorkspaceComponentRegistry } from './language/WorkspaceComponentRegistry';
 import { WorkspaceFormMetadataRegistry } from './language/WorkspaceFormMetadataRegistry';
 import { WorkspaceStore } from './storage/WorkspaceStore';
+import { PromotionStore } from './storage/PromotionStore';
+import { detectLegacyProjects } from './storage/LegacyProjectGuard';
 import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
 import { AuthManager } from './sync/auth/AuthManager';
-import { EcodeTreeProvider } from './ui/EcodeTreeProvider';
+import {
+  EcodeTreeProvider,
+  type EnvironmentTreeState,
+} from './ui/EcodeTreeProvider';
+import {
+  PROMOTION_DIFF_SCHEME,
+  PromotionDiffProvider,
+} from './ui/PromotionDiffProvider';
 import {
   BASELINE_SCHEME,
   EMPTY_SCHEME,
@@ -28,12 +54,31 @@ import {
 
 let output: vscode.LogOutputChannel;
 
+interface PushExecution {
+  result: SyncOperationResult;
+  record?: PushRecord;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel('Ecode', { log: true });
-  const store = new WorkspaceStore(context);
+  const workspaceFolders = vscode.workspace.workspaceFolders
+    ?.map(folder => folder.uri.fsPath) ?? [];
+  const legacyProjects = await detectLegacyProjects(context, workspaceFolders);
+  if (legacyProjects.length > 0) {
+    await activateLegacyProjectBlock(context, legacyProjects);
+    return;
+  }
+  const initialWorkspace = workspaceFolders.find(workspaceFolder =>
+    fs.existsSync(path.join(
+      workspaceFolder,
+      '.ecode-local',
+      'environments.json',
+    ))) ?? workspaceFolders[0];
+  const store = new WorkspaceStore(initialWorkspace);
   const auth = new AuthManager(context);
   const service = new EcodeSyncService(store, auth, output);
   const tree = new EcodeTreeProvider();
+  const promotionDiff = new PromotionDiffProvider();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const componentRegistry = new WorkspaceComponentRegistry();
   const formMetadataRegistry = new WorkspaceFormMetadataRegistry();
@@ -45,7 +90,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     output,
   );
   const controller = new ExtensionController(
-    context,
     store,
     auth,
     service,
@@ -54,6 +98,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     componentRegistry,
     formMetadataRegistry,
     aiSupport,
+    promotionDiff,
   );
 
   context.subscriptions.push(
@@ -75,6 +120,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       EMPTY_SCHEME,
       new VirtualDocumentProvider(EMPTY_SCHEME, service),
     ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      PROMOTION_DIFF_SCHEME,
+      promotionDiff,
+    ),
     ...registerEcodeLanguageFeatures(componentRegistry, formMetadataRegistry),
     ...controller.registerCommands(),
   );
@@ -87,17 +136,53 @@ export function deactivate(): void {
   // 没有后台任务或自动同步需要清理。
 }
 
+async function activateLegacyProjectBlock(
+  context: vscode.ExtensionContext,
+  projects: Awaited<ReturnType<typeof detectLegacyProjects>>,
+): Promise<void> {
+  const details = projects.map(project =>
+    `${project.workspaceFolder}: ${project.reasons.join('、')}`).join('\n');
+  const message = 'Ecode Local 0.6 不允许直接用于 0.5 及以下版本项目。'
+    + '请先使用旧版扩展处理并备份项目，再清理旧版项目痕迹，重新打开目录后配置环境并全量拉取。';
+  output.error(`${message}\n${details}`);
+  const commands = (
+    context.extension.packageJSON.contributes?.commands as
+      | Array<{ command?: unknown }>
+      | undefined
+  ) ?? [];
+  context.subscriptions.push(
+    output,
+    ...commands
+      .map(item => typeof item.command === 'string' ? item.command : undefined)
+      .filter((command): command is string => Boolean(command))
+      .map(command => vscode.commands.registerCommand(command, async () => {
+        await vscode.window.showErrorMessage(message, { modal: true });
+      })),
+  );
+  const action = await vscode.window.showErrorMessage(
+    message,
+    { modal: true, detail: details },
+    '打开升级说明',
+  );
+  if (action === '打开升级说明') {
+    await vscode.commands.executeCommand(
+      'markdown.showPreview',
+      vscode.Uri.joinPath(context.extensionUri, 'README.md'),
+    );
+  }
+}
+
 class ExtensionController {
   private busy = false;
   private changes: SyncChange[] = [];
   private localWatcher: vscode.Disposable | undefined;
+  private aiPushWatcher: vscode.Disposable | undefined;
+  private readonly processingAiPushRequests = new Set<string>();
   private localRefreshTimer: NodeJS.Timeout | undefined;
   private aiRefreshTimer: NodeJS.Timeout | undefined;
-  private legacyProfile: LegacyConnectionProfile | undefined;
   private lastAiSupportError: string | undefined;
 
   constructor(
-    private readonly context: vscode.ExtensionContext,
     private readonly store: WorkspaceStore,
     private readonly auth: AuthManager,
     private readonly service: EcodeSyncService,
@@ -106,28 +191,49 @@ class ExtensionController {
     private readonly componentRegistry: WorkspaceComponentRegistry,
     private readonly formMetadataRegistry: WorkspaceFormMetadataRegistry,
     private readonly aiSupport: AiSupportService,
+    private readonly promotionDiff: PromotionDiffProvider,
   ) {}
 
   registerCommands(): vscode.Disposable[] {
     return [
       vscode.commands.registerCommand('ecode.configure', () => this.configure()),
       vscode.commands.registerCommand('ecode.setup', () => this.configure()),
+      vscode.commands.registerCommand('ecode.addEnvironment', () => this.configure(true)),
+      vscode.commands.registerCommand('ecode.switchEnvironment', () =>
+        this.runCommandSafely(() => this.switchEnvironment())),
       vscode.commands.registerCommand('ecode.pull', () => this.pull()),
       vscode.commands.registerCommand('ecode.refreshChanges', () => this.refreshChanges()),
-      vscode.commands.registerCommand('ecode.pushSelected', () => this.pushSelected()),
+      vscode.commands.registerCommand('ecode.pushSelected', () =>
+        this.runCommandSafely(() => this.pushSelected())),
+      vscode.commands.registerCommand(
+        'ecode.rollbackPushFile',
+        (argument: unknown, remotePath?: string) =>
+          this.runCommandSafely(() =>
+            this.rollbackPushFile(argument, remotePath)),
+      ),
+      vscode.commands.registerCommand(
+        'ecode.openPromotionDiff',
+        (candidate: PushRecord | ChangeSet, remotePath: string) =>
+          this.runCommandSafely(() =>
+            this.openPromotionDiff(candidate, remotePath)),
+      ),
       vscode.commands.registerCommand('ecode.openDiff', (change: SyncChange) => this.openDiff(change)),
       vscode.commands.registerCommand('ecode.revertChange', (change?: SyncChange) =>
         this.revertChange(change)),
       vscode.commands.registerCommand('ecode.resolveConflict', (change: SyncChange) =>
         this.resolveConflict(change)),
+      vscode.commands.registerCommand('ecode.createChangeSet', () =>
+        this.runCommandSafely(() => this.createChangeSet())),
+      vscode.commands.registerCommand('ecode.applyChangeSet', (argument?: unknown) =>
+        this.runCommandSafely(() => this.applyChangeSet(argument))),
+      vscode.commands.registerCommand('ecode.cancelChangeSet', (argument?: unknown) =>
+        this.runCommandSafely(() => this.cancelChangeSet(argument))),
       vscode.commands.registerCommand('ecode.refreshAiSupport', () =>
         this.refreshAiSupport(true)),
       vscode.commands.registerCommand('ecode.openAiGuide', () =>
         this.runCommandSafely(() => this.openAiGuide())),
       vscode.commands.registerCommand('ecode.removeAiSupport', () =>
         this.runCommandSafely(() => this.removeAiSupport())),
-      vscode.commands.registerCommand('ecode.confirmSourceDirectoryMigration', () =>
-        this.runCommandSafely(() => this.confirmSourceDirectoryMigration())),
       this.componentRegistry.onDidChange(() => this.scheduleAiRefresh()),
       vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration('ecode.aiSupport.enabled')) {
@@ -138,7 +244,7 @@ class ExtensionController {
   }
 
   async initialize(): Promise<void> {
-    const profile = await this.loadActiveProfile();
+    const profile = await this.store.getProfile();
     await this.formMetadataRegistry.reload(profile, this.store);
     if (profile) {
       try {
@@ -147,15 +253,8 @@ class ExtensionController {
         output.warn(`Initial local scan failed: ${errorMessage(error)}`);
       }
       this.configureLocalWatcher(profile);
+      this.configureAiPushWatcher(profile.workspaceFolder);
       await this.refreshAiSupport(false);
-    } else if (this.legacyProfile) {
-      const action = await vscode.window.showWarningMessage(
-        `Ecode: 旧连接使用自定义源码目录“${this.legacyProfile.localDirectory}”，同步已暂停。`,
-        '确认改用 ecode',
-      );
-      if (action === '确认改用 ecode') {
-        await this.runCommandSafely(() => this.confirmSourceDirectoryMigration());
-      }
     }
     await this.updateViews();
   }
@@ -163,6 +262,8 @@ class ExtensionController {
   dispose(): void {
     this.localWatcher?.dispose();
     this.localWatcher = undefined;
+    this.aiPushWatcher?.dispose();
+    this.aiPushWatcher = undefined;
     if (this.localRefreshTimer) {
       clearTimeout(this.localRefreshTimer);
       this.localRefreshTimer = undefined;
@@ -173,7 +274,7 @@ class ExtensionController {
     }
   }
 
-  private async configure(): Promise<void> {
+  private async configure(createNew = false): Promise<void> {
     if (this.busy) {
       return;
     }
@@ -181,12 +282,48 @@ class ExtensionController {
     if (!workspaceFolder) {
       return;
     }
+    this.store.setWorkspaceFolder(workspaceFolder.uri.fsPath);
 
-    const previous = await this.store.getProfile()
-      ?? this.legacyProfile
-      ?? await this.store.getLegacyProfile();
+    const currentEnvironment = await this.store.getActiveEnvironment();
+    const activeEnvironment = createNew
+      ? undefined
+      : currentEnvironment;
+    const previous = activeEnvironment
+      ?? currentEnvironment;
+    const configuredEnvironments = await this.store.getEnvironments();
+    const environmentName = await vscode.window.showInputBox({
+      title: '配置 Ecode 环境 (1/5)',
+      prompt: '环境名称',
+      value: activeEnvironment?.name ?? '',
+      placeHolder: '例如：开发环境、预发布环境',
+      ignoreFocusOut: true,
+      validateInput: value => validateEnvironmentName(
+        value,
+        configuredEnvironments,
+        workspaceFolder.uri.fsPath,
+        activeEnvironment?.id,
+      ),
+    });
+    if (!environmentName) {
+      return;
+    }
+    const environmentDirectory = await vscode.window.showInputBox({
+      title: '配置 Ecode 环境 (2/5)',
+      prompt: '环境目录',
+      value: activeEnvironment?.directory ?? '',
+      placeHolder: '例如：dev、test_env、prod_01',
+      ignoreFocusOut: true,
+      validateInput: value => validateEnvironmentDirectoryInput(
+        value,
+        configuredEnvironments,
+        activeEnvironment,
+      ),
+    });
+    if (!environmentDirectory) {
+      return;
+    }
     const serverUrl = await vscode.window.showInputBox({
-      title: '配置 Ecode 连接 (1/3)',
+      title: '配置 Ecode 环境 (3/5)',
       prompt: 'E-cology 服务器地址',
       value: previous?.serverUrl ?? 'http://localhost:8099',
       ignoreFocusOut: true,
@@ -197,7 +334,7 @@ class ExtensionController {
     }
 
     const username = await vscode.window.showInputBox({
-      title: '配置 Ecode 连接 (2/3)',
+      title: '配置 Ecode 环境 (4/5)',
       prompt: '登录用户名',
       value: previous?.username ?? 'sysadmin',
       ignoreFocusOut: true,
@@ -208,7 +345,7 @@ class ExtensionController {
     }
 
     const password = await vscode.window.showInputBox({
-      title: '配置 Ecode 连接 (3/3)',
+      title: '配置 Ecode 环境 (5/5)',
       prompt: '密码将保存到 VS Code SecretStorage',
       password: true,
       ignoreFocusOut: true,
@@ -218,8 +355,11 @@ class ExtensionController {
       return;
     }
 
+    const environmentId = activeEnvironment?.id ?? randomUUID();
     const profile: ConnectionProfile = {
-      version: 3,
+      version: 4,
+      environmentId,
+      environmentDirectory: environmentDirectory.trim(),
       workspaceFolder: workspaceFolder.uri.fsPath,
       serverUrl: serverUrl.trim().replace(/\/+$/, ''),
       username: username.trim(),
@@ -230,15 +370,82 @@ class ExtensionController {
       if (!result.success) {
         throw new Error(result.message);
       }
-      await this.store.saveProfile(profile);
-      await this.store.clearLegacyProfile();
-      this.legacyProfile = undefined;
-      await this.formMetadataRegistry.reload(profile, this.store);
-      this.changes = await this.service.refreshLocalChanges();
-      this.configureLocalWatcher(profile);
-      await this.refreshAiSupport(false);
-      vscode.window.showInformationMessage('Ecode: 连接配置已保存，请手动执行拉取');
+      const savedEnvironment = await this.store.saveEnvironment({
+        id: environmentId,
+        name: environmentName.trim(),
+        directory: profile.environmentDirectory,
+        workspaceFolder: profile.workspaceFolder,
+        serverUrl: profile.serverUrl,
+        username: profile.username,
+      }, !createNew || !currentEnvironment);
+      if (!createNew || !currentEnvironment) {
+        await this.formMetadataRegistry.reload(profile, this.store);
+        this.changes = await this.service.refreshLocalChanges();
+        this.configureLocalWatcher(profile);
+        this.configureAiPushWatcher(profile.workspaceFolder);
+        await this.refreshAiSupport(false);
+      }
+      vscode.window.showInformationMessage(
+        createNew && currentEnvironment
+          ? `Ecode: ${savedEnvironment.name}已保存，可通过“切换环境”激活`
+          : `Ecode: ${savedEnvironment.name}已保存并激活，请手动执行拉取`,
+      );
     });
+  }
+
+  private async switchEnvironment(): Promise<void> {
+    if (this.busy) {
+      vscode.window.showWarningMessage('Ecode: 已有同步操作正在执行');
+      return;
+    }
+    const current = await this.store.getActiveEnvironment();
+    const environments = await this.store.getEnvironments();
+    const candidates = environments.filter(environment => environment.id !== current?.id);
+    if (candidates.length === 0) {
+      const action = await vscode.window.showInformationMessage(
+        'Ecode: 尚未配置其他环境',
+        '新增环境',
+      );
+      if (action === '新增环境') {
+        await this.configure(true);
+      }
+      return;
+    }
+    const selected = await vscode.window.showQuickPick(
+      candidates.map(environment => ({
+        label: environment.name,
+        description: `${environment.directory}/`,
+        detail: `${environment.serverUrl} · ${environment.username}`,
+        environment,
+      })),
+      {
+        title: '切换 Ecode 环境',
+        placeHolder: '每个环境使用独立源码目录，切换不会改动其他环境源码',
+        ignoreFocusOut: true,
+      },
+    );
+    if (!selected) {
+      return;
+    }
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认切换到“${selected.environment.name}”（${selected.environment.serverUrl}）？`
+        + `扩展将改用独立源码目录 ${selected.environment.directory}/，`
+        + '其他环境的源码和同步状态保持不变。',
+      { modal: true },
+      '确认切换',
+    );
+    if (confirmation !== '确认切换') {
+      return;
+    }
+    const environment = await this.store.setActiveEnvironment(selected.environment.id);
+    const profile = toConnectionProfile(environment);
+    await this.formMetadataRegistry.reload(profile, this.store);
+    this.changes = await this.service.refreshLocalChanges();
+    this.configureLocalWatcher(profile);
+    this.configureAiPushWatcher(profile.workspaceFolder);
+    await this.refreshAiSupport(false);
+    await this.updateViews();
+    vscode.window.showInformationMessage(`Ecode: 已切换到 ${environment.name}`);
   }
 
   private async pull(): Promise<void> {
@@ -246,7 +453,10 @@ class ExtensionController {
     if (!profile) {
       return;
     }
-    const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
+    const syncRoot = resolveEnvironmentSourceRoot(
+      profile.workspaceFolder,
+      profile.environmentDirectory,
+    );
     const choice = await vscode.window.showWarningMessage(
       `将全量检查远端源码并安全拉取到 ${syncRoot}。`
         + '远端删除会同步到未修改的本地文件，删除前保存恢复副本；本地修改不会被覆盖。',
@@ -284,10 +494,18 @@ class ExtensionController {
     if (!profile) {
       return;
     }
+    if (!await this.service.hasSyncBaseline()) {
+      const action = await vscode.window.showWarningMessage(
+        'Ecode: 当前环境尚未建立同步基线，请先执行全量拉取',
+        '全量拉取',
+      );
+      if (action === '全量拉取') {
+        await this.pull();
+      }
+      return;
+    }
     this.changes = await this.service.refreshLocalChanges();
-    const pushable = this.changes.filter(change =>
-      ['localAdded', 'localModified', 'localDeleted'].includes(change.status),
-    );
+    const pushable = this.changes.filter(isPushableChange);
     if (pushable.length === 0) {
       vscode.window.showInformationMessage('Ecode: 没有可推送的新增、修改或删除文件');
       await this.updateViews();
@@ -299,7 +517,9 @@ class ExtensionController {
         label: change.path,
         description: change.status === 'localAdded'
           ? '新增'
-          : change.status === 'localDeleted' ? '删除' : '修改',
+          : change.status === 'localDeleted'
+            ? '删除'
+            : change.status === 'conflict' ? '远端已一致，确认推送结果' : '修改',
         change,
         picked: true,
       })),
@@ -313,6 +533,14 @@ class ExtensionController {
     if (!selected?.length) {
       return;
     }
+    const activeEnvironment = await this.store.getActiveEnvironment();
+    if (!activeEnvironment) {
+      throw new Error('当前没有活动环境');
+    }
+    const selectedPaths = selected.map(item => item.change.path);
+    const promotionCandidates = await this.service.preparePromotionCandidates(
+      selectedPaths,
+    );
 
     const deletionCount = selected.filter(item => item.change.status === 'localDeleted').length;
     const confirmation = await vscode.window.showWarningMessage(
@@ -326,19 +554,340 @@ class ExtensionController {
       return;
     }
 
-    await this.runExclusive('正在推送...', async () => {
+    const execution = await this.executePush(
+      profile,
+      activeEnvironment,
+      selectedPaths,
+      promotionCandidates,
+    );
+    if (execution) {
+      showResult('推送', execution.result);
+      if (execution.record) {
+        vscode.window.showInformationMessage(
+          `Ecode: 已保存推送记录 ${execution.record.id}`,
+        );
+      }
+    }
+  }
+
+  private async executePush(
+    profile: ConnectionProfile,
+    environment: EnvironmentProfile,
+    selectedPaths: string[],
+    promotionCandidates: PromotionCandidate[],
+  ): Promise<PushExecution | undefined> {
+    return this.runExclusive('正在推送...', async () => {
       const result = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
         title: 'Ecode: 安全推送',
         cancellable: true,
       }, (progress, token) => this.service.pushSelected(
-        selected.map(item => item.change.path),
+        selectedPaths,
         message => progress.report({ message }),
         token,
       ));
+      const verified = await this.service.filterVerifiedPromotionCandidates(
+        promotionCandidates,
+      );
+      const promotionStore = this.promotionStore(profile.workspaceFolder);
+      const record = verified.length > 0
+        ? await promotionStore.recordPush(
+            environment.id,
+            verified,
+            selectedPaths,
+          )
+        : undefined;
       this.changes = this.service.getLastPlan()?.changes ?? [];
-      showResult('推送', result);
+      return { result, record };
     });
+  }
+
+  private async createChangeSet(): Promise<void> {
+    const source = await this.store.getActiveEnvironment();
+    if (!source) {
+      throw new Error('请先配置并激活源环境');
+    }
+    if (!await this.service.hasSyncBaseline()) {
+      throw new Error('当前源环境尚未建立同步基线，请先执行全量拉取');
+    }
+    const promotionStore = this.promotionStore(source.workspaceFolder);
+    const pushRecords = await promotionStore.listPushRecords(source.id);
+    if (pushRecords.length === 0) {
+      throw new Error('当前环境还没有成功推送记录，请先完成一次推送');
+    }
+    const selectedRecords = await vscode.window.showQuickPick(
+      pushRecords.map(record => ({
+        label: new Date(record.createdAt).toLocaleString(),
+        description: `${record.files.length} 个文件`,
+        detail: `${record.id}${record.status === 'partial' ? ' · 部分成功' : ''}`,
+        record,
+        picked: false,
+      })),
+      {
+        title: '选择组成跨环境变更集的历史推送',
+        placeHolder: '可选择一次或多次推送；同一文件按时间折叠为最终净变化',
+        canPickMany: true,
+        ignoreFocusOut: true,
+      },
+    );
+    if (!selectedRecords?.length) {
+      return;
+    }
+    const name = await vscode.window.showInputBox({
+      title: '从历史推送创建变更集',
+      prompt: '变更集名称',
+      placeHolder: '例如：采购申请校验',
+      ignoreFocusOut: true,
+      validateInput: value => value.trim() ? undefined : '名称不能为空',
+    });
+    if (!name) {
+      return;
+    }
+    const changeSet = await promotionStore.createChangeSet(
+      name,
+      source.id,
+    );
+    const chronologicalRecords = selectedRecords
+      .map(item => item.record)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    let updatedChangeSet = changeSet;
+    for (const record of chronologicalRecords) {
+      updatedChangeSet = await promotionStore.recordVerifiedCandidates(
+        changeSet.id,
+        await promotionStore.materializePushRecord(record),
+      );
+    }
+    await this.updateViews();
+    vscode.window.showInformationMessage(
+      `Ecode: 已从 ${selectedRecords.length} 次历史推送创建 `
+        + `变更集“${changeSet.name}”，包含 `
+        + `${Object.keys(updatedChangeSet.files).length} 个文件；`
+        + '切换到任意已建立基线的环境即可直接应用',
+    );
+  }
+
+  private async rollbackPushFile(
+    argument: unknown,
+    explicitRemotePath?: string,
+  ): Promise<void> {
+    const selection = pushRecordFileSelection(argument, explicitRemotePath);
+    if (!selection) {
+      throw new Error('未找到要回退的推送文件');
+    }
+    const { record, remotePath } = selection;
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const promotionStore = this.promotionStore(environment.workspaceFolder);
+    if (record.environmentId !== environment.id) {
+      throw new Error('请先切换到该推送记录所属环境再执行本地回退');
+    }
+    const candidate = (await promotionStore.materializePushRecord(record))
+      .find(item => item.path === remotePath);
+    if (!candidate) {
+      throw new Error('推送记录中不存在该文件');
+    }
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认把本地文件 ${remotePath} 恢复到 ${record.id} 推送前？`
+        + '此操作不会修改远端和同步基线；恢复后会显示为待推送的本地变更。',
+      { modal: true },
+      '确认本地回退',
+    );
+    if (confirmation !== '确认本地回退') {
+      return;
+    }
+
+    await this.runExclusive('正在回退本地源码...', async () => {
+      const recoveries = await this.service.rollbackPushLocally([candidate]);
+      this.changes = this.service.getLastPlan()?.changes ?? [];
+      vscode.window.showInformationMessage(
+        `Ecode: 已将 ${remotePath} 恢复到推送前，`
+          + `远端未修改${recoveries.length > 0
+            ? `；已保存 ${recoveries.length} 份恢复副本`
+            : ''}`,
+      );
+    });
+  }
+
+  private async openPromotionDiff(
+    candidate: PushRecord | ChangeSet,
+    remotePath: string,
+  ): Promise<void> {
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const promotionStore = this.promotionStore(environment.workspaceFolder);
+    const files = isPushRecord(candidate)
+      ? await promotionStore.materializePushRecord(candidate)
+      : await promotionStore.materializeChangeSetCandidates(candidate);
+    const file = files.find(item => item.path === remotePath);
+    if (!file) {
+      throw new Error('记录中不存在该文件');
+    }
+    const uris = this.promotionDiff.createDiff(
+      remotePath,
+      file.baseContent,
+      file.resultContent,
+    );
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      uris.before,
+      uris.after,
+      `${remotePath} — 推送前 ↔ 推送后`,
+    );
+  }
+
+  private async applyChangeSet(argument?: unknown): Promise<void> {
+    const target = await this.store.getActiveEnvironment();
+    if (!target) {
+      throw new Error('请先配置并激活当前环境');
+    }
+    const promotionStore = this.promotionStore(target.workspaceFolder);
+    const changeSet = await this.selectChangeSet(
+      promotionStore,
+      argument,
+      `选择要应用到当前环境“${target.name}”的变更集`,
+    );
+    if (!changeSet) {
+      return;
+    }
+    const artifacts = await promotionStore.materializeChangeSet(changeSet);
+    if (artifacts.length === 0) {
+      throw new Error('变更集中没有可应用的文件');
+    }
+    const profile = toConnectionProfile(target);
+    if (!await this.service.hasSyncBaseline(profile)) {
+      throw new Error(
+        `当前环境“${target.name}”尚未建立同步基线，请先执行全量拉取`,
+      );
+    }
+    const preflight = await this.service.verifyRelease(profile, artifacts);
+    if (!preflight.success) {
+      const now = new Date().toISOString();
+      await promotionStore.saveDeployment({
+        schemaVersion: 1,
+        id: `DEP-${randomUUID()}`,
+        changeSetId: changeSet.id,
+        targetEnvironmentId: target.id,
+        startedAt: now,
+        completedAt: now,
+        status: 'conflict',
+        files: preflight.files,
+      });
+      throw new Error(formatPromotionFailures(
+        '当前环境预检未通过，未写入任何文件',
+        preflight.files,
+      ));
+    }
+    const typedName = await vscode.window.showInputBox({
+      title: `应用变更集 ${changeSet.name}`,
+      prompt: `请输入当前环境名称“${target.name}”确认应用 ${artifacts.length} 个文件`,
+      ignoreFocusOut: true,
+      validateInput: value => value === target.name
+        ? undefined
+        : `请输入完整环境名称：${target.name}`,
+    });
+    if (typedName !== target.name) {
+      return;
+    }
+
+    await this.runExclusive(`正在向 ${target.name} 应用变更...`, async () => {
+      const startedAt = new Date().toISOString();
+      const files = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `Ecode: 应用变更集 ${changeSet.name}`,
+        cancellable: true,
+      }, (progress, token) => this.service.deployRelease(
+        profile,
+        artifacts,
+        message => progress.report({ message }),
+        token,
+      ));
+      const record: DeploymentRecord = {
+        schemaVersion: 1,
+        id: `DEP-${randomUUID()}`,
+        changeSetId: changeSet.id,
+        targetEnvironmentId: target.id,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        status: deploymentStatus(files),
+        files,
+      };
+      await promotionStore.saveDeployment(record);
+      this.changes = await this.service.refreshLocalChanges();
+      if (record.status === 'succeeded') {
+        vscode.window.showInformationMessage(
+          `Ecode: 变更集“${changeSet.name}”已成功应用到当前环境 ${target.name}`,
+        );
+      } else {
+        vscode.window.showErrorMessage(formatPromotionFailures(
+          `应用结果：${record.status}`,
+          files,
+        ));
+      }
+    });
+  }
+
+  private async cancelChangeSet(argument?: unknown): Promise<void> {
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('请先配置并激活当前环境');
+    }
+    const promotionStore = this.promotionStore(environment.workspaceFolder);
+    const changeSet = await this.selectChangeSet(
+      promotionStore,
+      argument,
+      '选择要取消的跨环境变更集',
+    );
+    if (!changeSet) {
+      return;
+    }
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认取消变更集“${changeSet.name}”？`
+        + '这只会删除变更集记录，不会删除推送记录、应用记录，'
+        + '也不会回退任何本地或远端代码。',
+      { modal: true },
+      '确认取消',
+    );
+    if (confirmation !== '确认取消') {
+      return;
+    }
+    await promotionStore.deleteChangeSet(changeSet.id);
+    await this.updateViews();
+    vscode.window.showInformationMessage(
+      `Ecode: 已取消变更集“${changeSet.name}”；已有代码和历史记录未修改`,
+    );
+  }
+
+  private async selectChangeSet(
+    promotionStore: PromotionStore,
+    argument: unknown,
+    title: string,
+  ): Promise<ChangeSet | undefined> {
+    const available = (await promotionStore.listChangeSets())
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    if (available.length === 0) {
+      throw new Error('当前工作区还没有变更集');
+    }
+    const candidate = changeSetFromCommandArgument(argument);
+    if (candidate) {
+      const current = available.find(item => item.id === candidate.id);
+      if (!current) {
+        throw new Error('变更集不存在或已取消');
+      }
+      return current;
+    }
+    return (await vscode.window.showQuickPick(
+      available.map(changeSet => ({
+        label: changeSet.name,
+        description: changeSet.id,
+        detail: `${Object.keys(changeSet.files).length} 个文件`,
+        changeSet,
+      })),
+      { title, ignoreFocusOut: true },
+    ))?.changeSet;
   }
 
   private async openDiff(change: SyncChange): Promise<void> {
@@ -351,7 +900,10 @@ class ExtensionController {
     }
     const local = vscode.Uri.file(
       resolveSafeLocalPath(
-        resolveEcodeSourceRoot(profile.workspaceFolder),
+        resolveEnvironmentSourceRoot(
+          profile.workspaceFolder,
+          profile.environmentDirectory,
+        ),
         change.path,
       ),
     );
@@ -530,83 +1082,6 @@ class ExtensionController {
     });
   }
 
-  private async loadActiveProfile(): Promise<ConnectionProfile | undefined> {
-    const current = await this.store.getProfile();
-    if (current) {
-      this.legacyProfile = undefined;
-      return current;
-    }
-    const legacy = await this.store.getLegacyProfile();
-    if (!legacy) {
-      this.legacyProfile = undefined;
-      return undefined;
-    }
-    try {
-      const migration = classifyLegacyProfile(legacy);
-      if (migration.kind === 'migrated') {
-        await this.store.saveProfile(migration.profile);
-        await this.store.clearLegacyProfile();
-        this.legacyProfile = undefined;
-        output.info('Migrated v2 connection profile with fixed ecode source directory');
-        return migration.profile;
-      }
-    } catch (error: unknown) {
-      output.warn(`Unable to validate legacy source directory: ${errorMessage(error)}`);
-    }
-    this.legacyProfile = legacy;
-    return undefined;
-  }
-
-  private async confirmSourceDirectoryMigration(): Promise<void> {
-    const legacy = this.legacyProfile ?? await this.store.getLegacyProfile();
-    if (!legacy) {
-      vscode.window.showInformationMessage('Ecode: 没有需要迁移的旧连接配置');
-      return;
-    }
-    const sourceRoot = resolveEcodeSourceRoot(legacy.workspaceFolder);
-    let entries: string[] = [];
-    try {
-      entries = await fs.promises.readdir(sourceRoot);
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw error;
-      }
-    }
-    if (entries.length > 0) {
-      const confirmation = await vscode.window.showWarningMessage(
-        `固定源码目录 ${sourceRoot} 已包含 ${entries.length} 个项目。`
-          + '扩展不会覆盖或移动这些内容，确认将其作为新的同步源码目录吗？',
-        { modal: true },
-        '确认使用 ecode',
-      );
-      if (confirmation !== '确认使用 ecode') {
-        return;
-      }
-    }
-    const profile: ConnectionProfile = {
-      version: 3,
-      workspaceFolder: legacy.workspaceFolder,
-      serverUrl: legacy.serverUrl,
-      username: legacy.username,
-    };
-    await this.store.saveProfile(profile);
-    await this.store.clearLegacyProfile();
-    this.legacyProfile = undefined;
-    await this.formMetadataRegistry.reload(profile, this.store);
-    try {
-      this.changes = await this.service.refreshLocalChanges();
-    } catch (error: unknown) {
-      output.warn(`Initial scan after source directory migration failed: ${errorMessage(error)}`);
-      this.changes = [];
-    }
-    this.configureLocalWatcher(profile);
-    await this.refreshAiSupport(false);
-    await this.updateViews();
-    vscode.window.showInformationMessage(
-      `Ecode: 已改用固定源码目录 ${ECODE_SOURCE_DIRECTORY}/，旧目录未做任何修改`,
-    );
-  }
-
   private scheduleAiRefresh(): void {
     if (this.aiRefreshTimer) {
       clearTimeout(this.aiRefreshTimer);
@@ -621,7 +1096,7 @@ class ExtensionController {
     const profile = await this.store.getProfile();
     if (!profile) {
       if (showMessage) {
-        vscode.window.showErrorMessage('Ecode: 请先配置连接或完成源码目录迁移');
+        vscode.window.showErrorMessage('Ecode: 请先配置环境');
       }
       return;
     }
@@ -660,7 +1135,7 @@ class ExtensionController {
   private async openAiGuide(): Promise<void> {
     const profile = await this.store.getProfile();
     if (!profile) {
-      vscode.window.showErrorMessage('Ecode: 请先配置连接或完成源码目录迁移');
+      vscode.window.showErrorMessage('Ecode: 请先配置环境');
       return;
     }
     await this.refreshAiSupport(false);
@@ -681,8 +1156,8 @@ class ExtensionController {
       return;
     }
     const confirmation = await vscode.window.showWarningMessage(
-      '将删除 .ecode-local/ecode-ai 中由扩展管理的文件及 AGENTS.md 的 Ecode 管理区块。'
-        + '其他文件不会被删除。',
+      '将删除公共知识目录、当前环境的 AI 项目知识及 AGENTS.md 的 Ecode 管理区块。'
+        + '同步状态、变更集和其他环境数据不会被删除。',
       { modal: true },
       '移除 AI 支持',
     );
@@ -696,7 +1171,10 @@ class ExtensionController {
         false,
         vscode.ConfigurationTarget.WorkspaceFolder,
       );
-    await this.aiSupport.remove(profile.workspaceFolder);
+    await this.aiSupport.remove(
+      profile,
+      (await this.store.getEnvironments()).map(environment => environment.directory),
+    );
     vscode.window.showInformationMessage('Ecode: 已移除当前工作区的 AI Coding 支持');
   }
 
@@ -713,20 +1191,21 @@ class ExtensionController {
   private async requireProfile(): Promise<ConnectionProfile | undefined> {
     const profile = await this.store.getProfile();
     if (!profile) {
-      if (this.legacyProfile ?? await this.store.getLegacyProfile()) {
-        vscode.window.showErrorMessage(
-          'Ecode: 旧连接使用自定义源码目录，请先确认迁移到固定的 ecode/ 目录',
-        );
-        return undefined;
-      }
-      vscode.window.showErrorMessage('Ecode: 请先配置连接');
+      vscode.window.showErrorMessage('Ecode: 请先配置环境');
       await this.configure();
       return this.store.getProfile();
     }
     return profile;
   }
 
-  private async runExclusive(label: string, operation: () => Promise<void>): Promise<void> {
+  private promotionStore(workspaceFolder: string): PromotionStore {
+    return new PromotionStore(workspaceFolder);
+  }
+
+  private async runExclusive<T>(
+    label: string,
+    operation: () => Promise<T>,
+  ): Promise<T | undefined> {
     if (this.busy) {
       vscode.window.showWarningMessage('Ecode: 已有同步操作正在执行');
       return;
@@ -734,7 +1213,7 @@ class ExtensionController {
     this.busy = true;
     await this.updateViews(label);
     try {
-      await operation();
+      return await operation();
     } catch (error: unknown) {
       if (error instanceof SyncCancelledError) {
         vscode.window.showInformationMessage('Ecode: 操作已取消');
@@ -749,6 +1228,206 @@ class ExtensionController {
     }
   }
 
+  private configureAiPushWatcher(workspaceFolder: string): void {
+    this.aiPushWatcher?.dispose();
+    this.aiPushWatcher = undefined;
+    const requestsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      AI_PUSH_REQUEST_DIRECTORY,
+    );
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(requestsRoot, '*.json'),
+    );
+    const process = (uri: vscode.Uri): void => {
+      void this.processAiPushRequestFile(workspaceFolder, uri.fsPath);
+    };
+    this.aiPushWatcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidCreate(process),
+      watcher.onDidChange(process),
+    );
+    void this.processPendingAiPushRequests(workspaceFolder);
+  }
+
+  private async processPendingAiPushRequests(
+    workspaceFolder: string,
+  ): Promise<void> {
+    const requestsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      AI_PUSH_REQUEST_DIRECTORY,
+    );
+    try {
+      const names = await fs.promises.readdir(requestsRoot);
+      for (const name of names.filter(item => item.endsWith('.json'))) {
+        await this.processAiPushRequestFile(
+          workspaceFolder,
+          path.join(requestsRoot, name),
+        );
+      }
+    } catch (error: unknown) {
+      if (!isFileSystemError(error, 'ENOENT')) {
+        output.warn(`Unable to scan AI push requests: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  private async processAiPushRequestFile(
+    workspaceFolder: string,
+    requestFile: string,
+  ): Promise<void> {
+    const fileName = path.basename(requestFile);
+    const fallbackId = path.basename(fileName, '.json');
+    if (
+      !/^[A-Za-z0-9_-]{1,64}$/.test(fallbackId)
+      || this.processingAiPushRequests.has(requestFile)
+    ) {
+      return;
+    }
+    const resultFile = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      AI_PUSH_RESULT_DIRECTORY,
+      `${fallbackId}.json`,
+    );
+    if (fs.existsSync(resultFile)) {
+      return;
+    }
+    this.processingAiPushRequests.add(requestFile);
+    let request: AiPushRequest | undefined;
+    try {
+      request = parseAiPushRequest(
+        await fs.promises.readFile(requestFile, 'utf8'),
+        fileName,
+      );
+      const environment = await this.store.getActiveEnvironment();
+      const profile = await this.store.getProfile();
+      if (!environment || !profile) {
+        throw new Error('当前没有活动环境');
+      }
+      if (request.environmentDirectory !== environment.directory) {
+        await this.writeAiPushResult(resultFile, {
+          schemaVersion: 1,
+          id: request.id,
+          action: 'push',
+          environmentDirectory: request.environmentDirectory,
+          processedAt: new Date().toISOString(),
+          status: 'rejected',
+          message: `当前活动环境目录为 ${environment.directory}，请先人工切换环境`,
+        });
+        return;
+      }
+      if (this.busy) {
+        await this.writeAiPushResult(resultFile, {
+          schemaVersion: 1,
+          id: request.id,
+          action: 'push',
+          environmentDirectory: request.environmentDirectory,
+          processedAt: new Date().toISOString(),
+          status: 'failed',
+          message: '已有同步操作正在执行，请使用新的请求 id 重试',
+        });
+        return;
+      }
+      if (!await this.service.hasSyncBaseline()) {
+        throw new Error('当前环境尚未建立同步基线，请先人工执行全量拉取');
+      }
+      this.changes = await this.service.refreshLocalChanges();
+      const pushable = new Set(this.changes
+        .filter(isPushableChange)
+        .map(change => change.path));
+      const unavailable = request.paths.filter(item => !pushable.has(item));
+      if (unavailable.length > 0) {
+        throw new Error(
+          `以下路径不是当前可推送的本地变更：${unavailable.join('、')}`,
+        );
+      }
+      const candidates = await this.service.preparePromotionCandidates(request.paths);
+      const confirmation = await vscode.window.showWarningMessage(
+        `AI 请求向“${environment.name}”（${profile.serverUrl}）推送 `
+          + `${request.paths.length} 个文件。请求 ${request.id}。`
+          + '扩展仍会执行远端冲突检查和推送后回读校验。',
+        { modal: true },
+        '确认 AI 推送',
+      );
+      if (confirmation !== '确认 AI 推送') {
+        await this.writeAiPushResult(resultFile, {
+          schemaVersion: 1,
+          id: request.id,
+          action: 'push',
+          environmentDirectory: request.environmentDirectory,
+          processedAt: new Date().toISOString(),
+          status: 'cancelled',
+          message: '用户未确认推送',
+        });
+        return;
+      }
+      const execution = await this.executePush(
+        profile,
+        environment,
+        request.paths,
+        candidates,
+      );
+      if (!execution) {
+        await this.writeAiPushResult(resultFile, {
+          schemaVersion: 1,
+          id: request.id,
+          action: 'push',
+          environmentDirectory: request.environmentDirectory,
+          processedAt: new Date().toISOString(),
+          status: 'failed',
+          message: '推送未完成，详情见 Ecode Output',
+        });
+        return;
+      }
+      showResult('AI 推送', execution.result);
+      await this.writeAiPushResult(resultFile, {
+        schemaVersion: 1,
+        id: request.id,
+        action: 'push',
+        environmentDirectory: request.environmentDirectory,
+        processedAt: new Date().toISOString(),
+        status: execution.result.success && execution.record?.status === 'succeeded'
+          ? 'succeeded'
+          : execution.record ? 'partial' : 'failed',
+        pushRecordId: execution.record?.id,
+        result: execution.result,
+        message: execution.record
+          ? `已保存推送记录 ${execution.record.id}`
+          : '没有文件通过推送后回读验证',
+      });
+    } catch (error: unknown) {
+      const message = errorMessage(error);
+      output.warn(`AI push request ${fallbackId} rejected: ${message}`);
+      await this.writeAiPushResult(resultFile, {
+        schemaVersion: 1,
+        id: request?.id ?? fallbackId,
+        action: 'push',
+        environmentDirectory: request?.environmentDirectory,
+        processedAt: new Date().toISOString(),
+        status: 'rejected',
+        message,
+      });
+    } finally {
+      this.processingAiPushRequests.delete(requestFile);
+    }
+  }
+
+  private async writeAiPushResult(
+    file: string,
+    result: AiPushResult,
+  ): Promise<void> {
+    const temporary = `${file}.tmp`;
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(
+      temporary,
+      `${JSON.stringify(result, null, 2)}\n`,
+      'utf8',
+    );
+    await fs.promises.rename(temporary, file);
+  }
+
   private configureLocalWatcher(profile: ConnectionProfile): void {
     this.localWatcher?.dispose();
     this.localWatcher = undefined;
@@ -757,7 +1436,10 @@ class ExtensionController {
       this.localRefreshTimer = undefined;
     }
 
-    const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
+    const syncRoot = resolveEnvironmentSourceRoot(
+      profile.workspaceFolder,
+      profile.environmentDirectory,
+    );
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(syncRoot, '**/*'),
     );
@@ -801,42 +1483,84 @@ class ExtensionController {
 
   private async updateViews(busyMessage?: string): Promise<void> {
     const profile = await this.store.getProfile();
-    let lastSync: string | undefined;
-    if (profile) {
+    const activeEnvironment = await this.store.getActiveEnvironment();
+    const environments = await this.store.getEnvironments();
+    this.componentRegistry.setSourceRoots(environments.map(environment =>
+      resolveEnvironmentSourceRoot(
+        environment.workspaceFolder,
+        environment.directory,
+      )));
+    const lastSyncByEnvironment = new Map<string, string>();
+    let changeSets: ChangeSet[] = [];
+    let deployments: DeploymentRecord[] = [];
+    let pushRecords: PushRecord[] = [];
+    const manifestLoadOrder = [...environments].sort((left, right) =>
+      Number(left.id === activeEnvironment?.id)
+      - Number(right.id === activeEnvironment?.id));
+    for (const environment of manifestLoadOrder) {
       try {
-        const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
+        const syncRoot = resolveEnvironmentSourceRoot(
+          environment.workspaceFolder,
+          environment.directory,
+        );
         const manifest = await this.store.loadManifest(
-          serverFingerprint(profile.serverUrl, profile.username),
+          serverFingerprint(environment.serverUrl, environment.username),
           syncRoot,
         );
         if (Date.parse(manifest.updatedAt) > 0) {
-          lastSync = new Date(manifest.updatedAt).toLocaleString();
+          lastSyncByEnvironment.set(
+            environment.id,
+            new Date(manifest.updatedAt).toLocaleString(),
+          );
         }
       } catch (error: unknown) {
-        output.warn(`Unable to read last sync state: ${errorMessage(error)}`);
+        output.warn(
+          `Unable to read last sync state for ${environment.name}: ${errorMessage(error)}`,
+        );
       }
     }
+    if (profile) {
+      try {
+        const promotionStore = this.promotionStore(profile.workspaceFolder);
+        [changeSets, deployments, pushRecords] = await Promise.all([
+          promotionStore.listChangeSets(),
+          promotionStore.listDeployments(),
+          promotionStore.listPushRecords(),
+        ]);
+        changeSets.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+        deployments.sort((left, right) =>
+          right.completedAt.localeCompare(left.completedAt));
+      } catch (error: unknown) {
+        output.warn(`Unable to read promotion state: ${errorMessage(error)}`);
+      }
+    }
+    const environmentStates: EnvironmentTreeState[] = environments.map(environment => {
+      const active = environment.id === activeEnvironment?.id;
+      return {
+        environment,
+        active,
+        lastSync: lastSyncByEnvironment.get(environment.id),
+        changes: active ? this.changes : undefined,
+        pushRecords: pushRecords.filter(record =>
+          record.environmentId === environment.id),
+        busyMessage: active ? busyMessage : undefined,
+      };
+    });
     this.tree.update(
-      profile,
-      this.changes,
-      busyMessage,
-      lastSync,
-      this.legacyProfile,
+      environmentStates,
+      changeSets,
+      deployments,
     );
     const count = this.changes.filter(change => change.status !== 'clean').length;
     this.status.text = busyMessage
       ? '$(sync~spin) Ecode'
       : count > 0 ? `$(cloud) Ecode ${count}` : '$(cloud) Ecode';
     this.status.tooltip = profile
-      ? `${profile.serverUrl}\n${count} 项变更或警告`
-      : this.legacyProfile
-        ? `旧源码目录 ${this.legacyProfile.localDirectory} 需要迁移`
-        : '尚未配置 Ecode 连接';
+      ? `${profile.serverUrl}\n源码目录: ${profile.environmentDirectory}/\n${count} 项变更或警告`
+      : '尚未配置 Ecode 环境';
     this.status.command = profile
       ? 'ecode.refreshChanges'
-      : this.legacyProfile
-        ? 'ecode.confirmSourceDirectoryMigration'
-        : 'ecode.configure';
+      : 'ecode.configure';
     this.status.show();
   }
 }
@@ -868,6 +1592,61 @@ function validateServerUrl(value: string): string | undefined {
   }
 }
 
+export function isPushableChange(change: SyncChange): boolean {
+  return ['localAdded', 'localModified', 'localDeleted'].includes(change.status)
+    || (
+      change.status === 'conflict'
+      && change.localHash !== undefined
+      && change.localHash === change.remoteHash
+    );
+}
+
+export function validateEnvironmentName(
+  value: string,
+  environments: EnvironmentProfile[],
+  workspaceFolder: string,
+  editingEnvironmentId?: string,
+): string | undefined {
+  const name = value.trim();
+  if (!name) {
+    return '环境名称不能为空';
+  }
+  const workspaceKey = path.resolve(workspaceFolder).toLocaleLowerCase('en-US');
+  const nameKey = name.toLocaleLowerCase('en-US');
+  const duplicate = environments.find(environment =>
+    environment.id !== editingEnvironmentId
+    && path.resolve(environment.workspaceFolder).toLocaleLowerCase('en-US') === workspaceKey
+    && environment.name.trim().toLocaleLowerCase('en-US') === nameKey);
+  return duplicate
+    ? `环境名称“${duplicate.name}”已存在`
+    : undefined;
+}
+
+export function validateEnvironmentDirectoryInput(
+  value: string,
+  environments: EnvironmentProfile[],
+  editingEnvironment?: EnvironmentProfile,
+): string | undefined {
+  const validation = validateEnvironmentDirectory(value);
+  if (validation) {
+    return validation;
+  }
+  const directory = value.trim();
+  const directoryKey = directory.toLocaleLowerCase('en-US');
+  if (
+    editingEnvironment
+    && editingEnvironment.directory.toLocaleLowerCase('en-US') !== directoryKey
+  ) {
+    return '环境目录创建后不可修改；如需更换目录，请新增环境';
+  }
+  const duplicate = environments.find(environment =>
+    environment.id !== editingEnvironment?.id
+    && environment.directory.toLocaleLowerCase('en-US') === directoryKey);
+  return duplicate
+    ? `环境目录“${duplicate.directory}”已由环境“${duplicate.name}”使用`
+    : undefined;
+}
+
 function showResult(operation: string, result: SyncOperationResult): void {
   const summary = `${operation}完成：${result.pulled} 拉取，${result.pushed} 推送，`
     + `${result.deletedLocal} 个本地删除，${result.deletedRemote} 个远端删除，`
@@ -882,6 +1661,106 @@ function showResult(operation: string, result: SyncOperationResult): void {
   }
 }
 
+function toConnectionProfile(environment: EnvironmentProfile): ConnectionProfile {
+  return {
+    version: 4,
+    environmentId: environment.id,
+    environmentDirectory: environment.directory,
+    workspaceFolder: environment.workspaceFolder,
+    serverUrl: environment.serverUrl,
+    username: environment.username,
+  };
+}
+
+function deploymentStatus(
+  files: DeploymentFileResult[],
+): DeploymentRecord['status'] {
+  if (files.length > 0 && files.every(file => file.status === 'succeeded')) {
+    return 'succeeded';
+  }
+  if (files.some(file => file.status === 'succeeded')) {
+    return 'partial';
+  }
+  if (files.some(file => file.status === 'conflict')) {
+    return 'conflict';
+  }
+  return 'failed';
+}
+
+function formatPromotionFailures(
+  prefix: string,
+  files: DeploymentFileResult[],
+): string {
+  const failures = files.filter(file =>
+    file.status === 'conflict' || file.status === 'failed');
+  const detail = failures.slice(0, 3)
+    .map(file => `${file.path}: ${file.message ?? file.status}`)
+    .join('；');
+  const remaining = failures.length > 3 ? `；另有 ${failures.length - 3} 项` : '';
+  return detail ? `${prefix}：${detail}${remaining}` : prefix;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isPushRecord(candidate: unknown): candidate is PushRecord {
+  return typeof candidate === 'object'
+    && candidate !== null
+    && 'environmentId' in candidate
+    && 'files' in candidate;
+}
+
+function isChangeSet(candidate: unknown): candidate is ChangeSet {
+  return typeof candidate === 'object'
+    && candidate !== null
+    && 'sourceEnvironmentId' in candidate
+    && 'files' in candidate;
+}
+
+function pushRecordFileSelection(
+  argument: unknown,
+  explicitRemotePath?: string,
+): { record: PushRecord; remotePath: string } | undefined {
+  if (isPushRecord(argument) && explicitRemotePath) {
+    return { record: argument, remotePath: explicitRemotePath };
+  }
+  if (
+    typeof argument === 'object'
+    && argument !== null
+    && 'record' in argument
+    && isPushRecord(argument.record)
+    && 'file' in argument
+    && typeof argument.file === 'object'
+    && argument.file !== null
+    && 'path' in argument.file
+    && typeof argument.file.path === 'string'
+  ) {
+    return { record: argument.record, remotePath: argument.file.path };
+  }
+  return undefined;
+}
+
+function changeSetFromCommandArgument(argument: unknown): ChangeSet | undefined {
+  if (isChangeSet(argument)) {
+    return argument;
+  }
+  if (
+    typeof argument === 'object'
+    && argument !== null
+    && 'changeSet' in argument
+    && isChangeSet(argument.changeSet)
+  ) {
+    return argument.changeSet;
+  }
+  return undefined;
+}
+
+function isFileSystemError(
+  error: unknown,
+  code: string,
+): error is NodeJS.ErrnoException {
+  return error instanceof Error
+    && 'code' in error
+    && (error as NodeJS.ErrnoException).code === code;
 }

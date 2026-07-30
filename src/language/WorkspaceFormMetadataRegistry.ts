@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { resolveEcodeSourceRoot } from '../domain/paths';
+import { resolveEnvironmentSourceRoot } from '../domain/paths';
 import { serverFingerprint, hashText } from '../domain/text';
 import type {
   CachedFileFormMetadata,
@@ -27,7 +27,12 @@ export class WorkspaceFormMetadataRegistry implements vscode.Disposable {
     const previousDocumentIds = new Set(this.documents.keys());
     this.files.clear();
     this.documents.clear();
-    this.syncRoot = profile ? resolveEcodeSourceRoot(profile.workspaceFolder) : undefined;
+    this.syncRoot = profile
+      ? resolveEnvironmentSourceRoot(
+          profile.workspaceFolder,
+          profile.environmentDirectory,
+        )
+      : undefined;
     if (profile && this.syncRoot) {
       const cache = await store.loadFormMetadataCache(
         serverFingerprint(profile.serverUrl, profile.username),

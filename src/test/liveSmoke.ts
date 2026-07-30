@@ -22,7 +22,9 @@ async function main(): Promise<void> {
 
   try {
     const profile: ConnectionProfile = {
-      version: 3,
+      version: 4,
+      environmentId: 'live-smoke',
+      environmentDirectory: 'live_smoke',
       workspaceFolder: temporaryRoot,
       serverUrl,
       username,
@@ -65,6 +67,7 @@ async function main(): Promise<void> {
     const candidate = await smallestManifestFile(
       store.manifest,
       temporaryRoot,
+      profile.environmentDirectory,
       verifyUpload ? '.css' : undefined,
     );
     const original = await fs.readFile(candidate.localPath, 'utf8');
@@ -189,13 +192,18 @@ class MemoryWorkspaceStore {
 async function smallestManifestFile(
   manifest: SyncManifest,
   workspaceRoot: string,
+  environmentDirectory: string,
   requiredExtension?: string,
 ): Promise<{ remoteId: string; remotePath: string; localPath: string }> {
   const entries = Object.values(manifest.files).filter(entry =>
     !requiredExtension || entry.path.toLowerCase().endsWith(requiredExtension),
   );
   const candidates = await Promise.all(entries.map(async entry => {
-    const localPath = path.join(workspaceRoot, 'ecode', ...entry.path.split('/'));
+    const localPath = path.join(
+      workspaceRoot,
+      environmentDirectory,
+      ...entry.path.split('/'),
+    );
     const stat = await fs.stat(localPath);
     return { entry, localPath, size: stat.size };
   }));

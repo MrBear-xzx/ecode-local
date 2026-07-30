@@ -34,6 +34,7 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
     readonly IndexedEcodeComponentCall[]
   >();
   private readonly uriRevisions = new Map<string, number>();
+  private sourceRoots: string[] = [];
   private readonly ready: Promise<void>;
 
   constructor() {
@@ -117,6 +118,7 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
   async refreshSourceRoot(sourceRoot: string): Promise<void> {
     await this.ready;
     const root = path.resolve(sourceRoot);
+    this.sourceRoots = uniqueSourceRoots([...this.sourceRoots, root]);
     const fileUris = await vscode.workspace.findFiles(
       new vscode.RelativePattern(sourceRoot, SOURCE_GLOB),
       EXCLUDE_GLOB,
@@ -140,31 +142,40 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
     }
   }
 
+  setSourceRoots(sourceRoots: readonly string[]): void {
+    this.sourceRoots = uniqueSourceRoots(sourceRoots);
+  }
+
   async getDefinitions(
     call: EcodeComponentCall,
+    sourceUri?: vscode.Uri,
   ): Promise<vscode.Location[]> {
-    const available = this.findDefinitions(call);
+    const available = this.findDefinitions(call, sourceUri);
     if (available.length > 0) {
       return available;
     }
     await this.ready;
-    return this.findDefinitions(call);
+    return this.findDefinitions(call, sourceUri);
   }
 
   async getReferences(
     call: EcodeComponentCall,
     includeDeclaration: boolean,
+    sourceUri?: vscode.Uri,
   ): Promise<vscode.Location[]> {
     await this.ready;
-    return this.currentCalls()
+    return this.callsForSource(sourceUri)
       .filter(candidate =>
         sameComponent(candidate, call)
         && (includeDeclaration || candidate.kind === 'reference'))
       .map(candidate => new vscode.Location(candidate.uri, candidate.range));
   }
 
-  private findDefinitions(call: EcodeComponentCall): vscode.Location[] {
-    return this.currentCalls()
+  private findDefinitions(
+    call: EcodeComponentCall,
+    sourceUri?: vscode.Uri,
+  ): vscode.Location[] {
+    return this.callsForSource(sourceUri)
       .filter(candidate =>
         candidate.kind === 'definition'
         && sameComponent(candidate, call))
@@ -252,6 +263,27 @@ export class WorkspaceComponentRegistry implements vscode.Disposable {
   private currentCalls(): readonly IndexedEcodeComponentCall[] {
     return [...this.callsByUri.values()].flat();
   }
+
+  private callsForSource(
+    sourceUri?: vscode.Uri,
+  ): readonly IndexedEcodeComponentCall[] {
+    if (sourceUri?.scheme !== 'file') {
+      return this.currentCalls();
+    }
+    const sourcePath = path.resolve(sourceUri.fsPath);
+    const sourceRoot = this.sourceRoots.find(root =>
+      isInside(root, sourcePath));
+    return sourceRoot
+      ? this.currentCalls().filter(call =>
+        call.uri.scheme === 'file'
+        && isInside(sourceRoot, path.resolve(call.uri.fsPath)))
+      : this.currentCalls();
+  }
+}
+
+function uniqueSourceRoots(sourceRoots: readonly string[]): string[] {
+  return [...new Set(sourceRoots.map(sourceRoot => path.resolve(sourceRoot)))]
+    .sort((left, right) => right.length - left.length);
 }
 
 function sameCalls(

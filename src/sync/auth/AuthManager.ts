@@ -1,6 +1,5 @@
 import type * as vscode from 'vscode';
 import type { ConnectionProfile } from '../../domain/types';
-import { serverFingerprint } from '../../domain/text';
 import { EcodeApiClient } from '../api/EcodeApiClient';
 import type { ApiResponse } from '../api/types';
 import { TokenStore } from './TokenStore';
@@ -51,7 +50,7 @@ export class AuthManager {
 
   async getAuthenticatedClient(profile: ConnectionProfile): Promise<EcodeApiClient | undefined> {
     const client = this.clientFor(profile.serverUrl);
-    const identity = serverFingerprint(profile.serverUrl, profile.username);
+    const identity = profile.environmentId;
     const tokens = new TokenStore(this.secrets, identity);
     if (this.sessionVerified && this.sessionIdentity === identity) {
       return client;
@@ -92,14 +91,6 @@ export class AuthManager {
     }
     const result = await this.login(profile.serverUrl, profile.username, password, tokens);
     return result.success ? this.client : undefined;
-  }
-
-  async clearV2Credentials(): Promise<void> {
-    await new TokenStore(this.secrets, 'all').clearAllV2();
-    this.client = undefined;
-    this.clientUrl = '';
-    this.sessionVerified = false;
-    this.sessionIdentity = '';
   }
 
   private async login(
@@ -163,7 +154,7 @@ export class AuthManager {
       client.setCookie(sessionCookie);
       await tokens.storeCookie(sessionCookie);
       this.sessionVerified = true;
-      this.sessionIdentity = serverFingerprint(normalizedUrl, username);
+      this.sessionIdentity = tokens.identity;
       return { success: true, message: '连接测试成功' };
     } catch (error: unknown) {
       return {
@@ -187,7 +178,7 @@ export class AuthManager {
   private tokens(profile: ConnectionProfile): TokenStore {
     return new TokenStore(
       this.secrets,
-      serverFingerprint(profile.serverUrl, profile.username),
+      profile.environmentId,
     );
   }
 }

@@ -5,9 +5,10 @@ import * as path from 'path';
 import {
   assertNoCaseCollisions,
   normalizeRemotePath,
-  resolveEcodeSourceRoot,
-  resolveLegacySyncRoot,
+  resolveEnvironmentDataRoot,
+  resolveEnvironmentSourceRoot,
   resolveSafeLocalPath,
+  validateEnvironmentDirectory,
 } from '../../domain/paths';
 
 suite('Path safety', () => {
@@ -22,37 +23,30 @@ suite('Path safety', () => {
   });
 
   test('keeps configured and remote paths inside the workspace', () => {
-    const syncRoot = resolveEcodeSourceRoot(root);
-    assert.strictEqual(syncRoot, path.join(root, 'ecode'));
+    const syncRoot = resolveEnvironmentSourceRoot(root, 'dev_01');
+    assert.strictEqual(syncRoot, path.join(root, 'dev_01'));
+    assert.strictEqual(
+      resolveEnvironmentDataRoot(root, 'dev_01'),
+      path.join(root, '.ecode-local', 'dev_01'),
+    );
     assert.strictEqual(
       resolveSafeLocalPath(syncRoot, 'type/folder/a.js'),
-      path.join(root, 'ecode', 'type', 'folder', 'a.js'),
+      path.join(root, 'dev_01', 'type', 'folder', 'a.js'),
     );
   });
 
-  test('rejects absolute and traversing local directories', () => {
-    assert.throws(() => resolveLegacySyncRoot(root, path.resolve(root, 'ecode')));
-    assert.throws(() => resolveLegacySyncRoot(root, '../outside'));
-    assert.throws(() => resolveLegacySyncRoot(root, 'ecode/../outside'));
-  });
-
-  test('rejects a configured directory that escapes through a symbolic link', function () {
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-outside-'));
-    const link = path.join(root, 'linked');
-    try {
-      try {
-        fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code === 'EPERM') {
-          this.skip();
-          return;
-        }
-        throw error;
-      }
-      assert.throws(() => resolveLegacySyncRoot(root, 'linked/ecode'), /工作区范围/);
-    } finally {
-      fs.rmSync(outside, { recursive: true, force: true });
-    }
+  test('accepts only English letters, digits, and underscores for environment directories', () => {
+    assert.strictEqual(validateEnvironmentDirectory('dev_env'), undefined);
+    assert.strictEqual(validateEnvironmentDirectory('dev2'), undefined);
+    assert.strictEqual(validateEnvironmentDirectory('2026'), undefined);
+    assert.match(validateEnvironmentDirectory('生产_环境') ?? '', /只能包含/);
+    assert.match(validateEnvironmentDirectory('dev-2') ?? '', /只能包含/);
+    assert.match(validateEnvironmentDirectory('../outside') ?? '', /只能包含/);
+    assert.match(validateEnvironmentDirectory('___') ?? '', /至少包含/);
+    assert.match(validateEnvironmentDirectory('.ecode-local') ?? '', /只能包含/);
+    assert.match(validateEnvironmentDirectory('common') ?? '', /保留名称/);
+    assert.match(validateEnvironmentDirectory('promotion') ?? '', /保留名称/);
+    assert.match(validateEnvironmentDirectory('CON') ?? '', /Windows 保留名称/);
   });
 
   test('rejects unsafe remote paths and Windows reserved names', () => {
