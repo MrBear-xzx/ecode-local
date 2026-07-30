@@ -1,5 +1,11 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
+import {
+  isPushableChange,
+  validateEnvironmentDirectoryInput,
+  validateEnvironmentName,
+} from '../../extension';
+import type { EnvironmentProfile, SyncChange } from '../../domain/types';
 
 suite('Ecode Extension Test Suite', () => {
   vscode.window.showInformationMessage('Starting Ecode tests.');
@@ -21,19 +27,105 @@ suite('Ecode Extension Test Suite', () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(commands.includes('ecode.setup'));
     assert.ok(commands.includes('ecode.configure'));
+    assert.ok(commands.includes('ecode.addEnvironment'));
+    assert.ok(commands.includes('ecode.switchEnvironment'));
     assert.ok(commands.includes('ecode.pull'));
     assert.ok(commands.includes('ecode.refreshChanges'));
     assert.ok(commands.includes('ecode.pushSelected'));
+    assert.ok(commands.includes('ecode.rollbackPushFile'));
+    assert.ok(commands.includes('ecode.openPromotionDiff'));
     assert.ok(commands.includes('ecode.openDiff'));
     assert.ok(commands.includes('ecode.revertChange'));
     assert.ok(commands.includes('ecode.resolveConflict'));
+    assert.ok(commands.includes('ecode.createChangeSet'));
+    assert.ok(commands.includes('ecode.applyChangeSet'));
+    assert.ok(commands.includes('ecode.cancelChangeSet'));
+    assert.ok(!commands.includes('ecode.freezeRelease'));
+    assert.ok(!commands.includes('ecode.abandonChangeSet'));
+    assert.ok(!commands.includes('ecode.deployRelease'));
     assert.ok(commands.includes('ecode.searchApiDocumentation'));
     assert.ok(commands.includes('ecode.openOnlineDocumentation'));
     assert.ok(commands.includes('ecode.refreshAiSupport'));
     assert.ok(commands.includes('ecode.openAiGuide'));
     assert.ok(commands.includes('ecode.removeAiSupport'));
-    assert.ok(commands.includes('ecode.confirmSourceDirectoryMigration'));
+    assert.ok(!commands.includes('ecode.confirmSourceDirectoryMigration'));
     assert.ok(!commands.includes('ecode.branchNew'));
+  });
+
+  test('allows an already applied conflict to be confirmed as a push', () => {
+    const converged: SyncChange = {
+      path: 'Type/applied.js',
+      status: 'conflict',
+      localHash: 'same',
+      remoteHash: 'same',
+      conflictReason: 'bothModified',
+    };
+    const divergent: SyncChange = {
+      ...converged,
+      remoteHash: 'different',
+    };
+
+    assert.strictEqual(isPushableChange(converged), true);
+    assert.strictEqual(isPushableChange(divergent), false);
+  });
+
+  test('environment name validation rejects duplicates while typing', () => {
+    const environments: EnvironmentProfile[] = [{
+      version: 2,
+      id: 'test',
+      name: '测试环境',
+      directory: 'test_env',
+      workspaceFolder: 'D:\\workspace\\project',
+      serverUrl: 'https://test.example.com',
+      username: 'tester',
+    }];
+
+    assert.match(
+      validateEnvironmentName(
+        ' 测试环境 ',
+        environments,
+        'd:\\workspace\\project',
+      ) ?? '',
+      /已存在/,
+    );
+    assert.strictEqual(
+      validateEnvironmentName(
+        '测试环境',
+        environments,
+        'D:\\workspace\\project',
+        'test',
+      ),
+      undefined,
+    );
+  });
+
+  test('environment directory validation rejects invalid and duplicate values while typing', () => {
+    const environments: EnvironmentProfile[] = [{
+      version: 2,
+      id: 'dev',
+      name: '开发环境',
+      directory: 'dev_env',
+      workspaceFolder: 'D:\\workspace\\project',
+      serverUrl: 'https://dev.example.com',
+      username: 'developer',
+    }];
+
+    assert.strictEqual(
+      validateEnvironmentDirectoryInput('dev2', environments),
+      undefined,
+    );
+    assert.match(
+      validateEnvironmentDirectoryInput('开发环境', environments) ?? '',
+      /只能包含/,
+    );
+    assert.match(
+      validateEnvironmentDirectoryInput('DEV_ENV', environments) ?? '',
+      /已由环境/,
+    );
+    assert.strictEqual(
+      validateEnvironmentDirectoryInput('dev_env', environments, environments[0]),
+      undefined,
+    );
   });
 
   test('Ecode view title keeps only primary sync actions visible', () => {
@@ -55,6 +147,10 @@ suite('Ecode Extension Test Suite', () => {
       'ecode.pushSelected',
     ]);
     assert.ok(overflow.includes('ecode.configure'));
+    assert.ok(overflow.includes('ecode.addEnvironment'));
+    assert.ok(overflow.includes('ecode.switchEnvironment'));
+    assert.ok(overflow.includes('ecode.createChangeSet'));
+    assert.ok(overflow.includes('ecode.applyChangeSet'));
     assert.ok(overflow.includes('ecode.searchApiDocumentation'));
     assert.ok(overflow.includes('ecode.openOnlineDocumentation'));
     assert.ok(overflow.includes('ecode.openAiGuide'));

@@ -268,7 +268,7 @@ export class EcodeLanguageProvider implements
     );
     if (componentCall) {
       const definitions = await this.componentRegistry
-        .getDefinitions(componentCall);
+        .getDefinitions(componentCall, document.uri);
       return definitions.length > 0 ? definitions : undefined;
     }
     const entry = entryAt(document, position);
@@ -300,6 +300,7 @@ export class EcodeLanguageProvider implements
       ? this.componentRegistry.getReferences(
         componentCall,
         context.includeDeclaration,
+        document.uri,
       )
       : undefined;
   }

@@ -6,16 +6,24 @@ import {
   assertNoCaseCollisions,
   normalizeRemotePath,
   resolveSafeLocalPath,
-  resolveEcodeSourceRoot,
+  resolveEnvironmentSourceRoot,
 } from '../domain/paths';
 import { analyzeFormContexts } from '../domain/formContextAnalyzer';
 import type { FormContext, FormMetadataCache } from '../domain/formMetadata';
+import {
+  findGbkIncompatibleCharacters,
+  formatUnicodeCodePoint,
+} from '../domain/gbk';
 import { buildLocalChanges, buildSyncPlan } from '../domain/syncPlanner';
 import { hashText, isSupportedText, serverFingerprint } from '../domain/text';
 import type {
   ConnectionProfile,
+  DeploymentFileResult,
   LocalFileState,
   ManifestEntry,
+  PromotionCandidate,
+  ReleaseArtifact,
+  ReleaseVerification,
   RemoteFileContent,
   RemoteFileEntry,
   StoredConflict,
@@ -52,6 +60,7 @@ interface RemoteIndex {
   files: Map<string, RemoteFileEntry>;
   directories: Map<string, RemoteDirectoryEntry>;
   ambiguousDirectories: Set<string>;
+  pathCollisions: SyncChange[];
 }
 
 interface RemoteTreeTask extends RemoteDirectoryEntry {}
@@ -60,6 +69,8 @@ interface RemoteFolderDeletion {
   directory: RemoteDirectoryEntry;
   filePaths: string[];
 }
+
+const REMOTE_VERIFICATION_RETRY_DELAYS_MS = [250, 750, 1500];
 
 export class EcodeSyncService {
   private lastPlan: SyncPlan | undefined;
@@ -76,8 +87,405 @@ export class EcodeSyncService {
     return this.lastPlan;
   }
 
+  getCompilerVersion(): string {
+    return this.compiler.getVersion();
+  }
+
+  async hasSyncBaseline(profile?: ConnectionProfile): Promise<boolean> {
+    return isManifestInitialized((await this.loadContext(profile)).manifest);
+  }
+
+  async preparePromotionCandidates(
+    selectedPaths: string[],
+  ): Promise<PromotionCandidate[]> {
+    const context = await this.loadContext();
+    if (!isManifestInitialized(context.manifest)) {
+      throw new Error('当前环境尚未建立同步基线，请先执行全量拉取');
+    }
+    const local = await this.scanLocalFiles(context.syncRoot);
+    const changes = new Map(
+      buildLocalChanges(context.manifest, local.files).map(change => [change.path, change]),
+    );
+    const candidates: PromotionCandidate[] = [];
+    for (const remotePath of selectedPaths) {
+      const change = changes.get(remotePath);
+      if (!change || !['localAdded', 'localModified', 'localDeleted'].includes(change.status)) {
+        throw new Error(`${remotePath}: 文件不再是可记录的本地变更`);
+      }
+      const baseline = context.manifest.files[remotePath];
+      const localFile = local.files.get(remotePath);
+      candidates.push({
+        path: remotePath,
+        operation: change.status === 'localAdded'
+          ? 'add'
+          : change.status === 'localDeleted' ? 'delete' : 'modify',
+        baseHash: baseline?.baselineHash,
+        baseContent: baseline
+          ? await this.store.readSnapshot(baseline.snapshotKey)
+          : undefined,
+        resultHash: localFile?.hash,
+        resultContent: localFile?.content,
+      });
+    }
+    this.assertGbkCompatibleSources(candidates.flatMap(candidate =>
+      candidate.resultContent === undefined
+        ? []
+        : [{ path: candidate.path, content: candidate.resultContent }]));
+    return candidates;
+  }
+
+  async filterVerifiedPromotionCandidates(
+    candidates: PromotionCandidate[],
+  ): Promise<PromotionCandidate[]> {
+    const context = await this.loadContext();
+    return candidates.filter(candidate => {
+      const baseline = context.manifest.files[candidate.path];
+      return candidate.operation === 'delete'
+        ? baseline === undefined
+        : baseline?.baselineHash === candidate.resultHash;
+    });
+  }
+
+  async rollbackPushLocally(
+    candidates: PromotionCandidate[],
+  ): Promise<string[]> {
+    const context = await this.loadContext();
+    if (!isManifestInitialized(context.manifest)) {
+      throw new Error('当前环境尚未建立同步基线');
+    }
+    const local = await this.scanLocalFiles(context.syncRoot);
+    const conflicts: string[] = [];
+    for (const candidate of candidates) {
+      const current = local.files.get(candidate.path);
+      const localPath = resolveSafeLocalPath(context.syncRoot, candidate.path);
+      assertNoSymlinkSegments(context.syncRoot, localPath);
+      if (candidate.operation === 'delete') {
+        if (current) {
+          conflicts.push(`${candidate.path}: 推送后本地文件应不存在，但当前已存在`);
+        } else {
+          try {
+            await fs.lstat(localPath);
+            conflicts.push(`${candidate.path}: 推送后路径应不存在，但当前已被占用`);
+          } catch (error: unknown) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'ENOENT') {
+              conflicts.push(`${candidate.path}: 无法确认当前本地路径状态`);
+            }
+          }
+        }
+      } else if (!current || current.hash !== candidate.resultHash) {
+        conflicts.push(`${candidate.path}: 本地内容已不是该次推送后的版本`);
+      }
+      if (
+        candidate.operation !== 'add'
+        && (!candidate.baseHash || candidate.baseContent === undefined)
+      ) {
+        conflicts.push(`${candidate.path}: 推送记录缺少修改前源码快照`);
+      }
+      if (
+        candidate.baseContent !== undefined
+        && candidate.baseHash !== hashText(candidate.baseContent)
+      ) {
+        conflicts.push(`${candidate.path}: 推送前源码快照 Hash 不一致`);
+      }
+    }
+    if (conflicts.length > 0) {
+      throw new Error(
+        `本地回退预检未通过，未修改任何文件：\n${conflicts.join('\n')}`,
+      );
+    }
+
+    const recoveryPaths: string[] = [];
+    for (const candidate of candidates) {
+      const current = local.files.get(candidate.path);
+      if (current) {
+        recoveryPaths.push(
+          await this.store.saveRecovery(candidate.path, current.content),
+        );
+      }
+    }
+    for (const candidate of candidates) {
+      const localPath = resolveSafeLocalPath(context.syncRoot, candidate.path);
+      if (candidate.operation === 'add') {
+        await fs.unlink(localPath);
+        await removeEmptyParents(path.dirname(localPath), context.syncRoot);
+      } else {
+        await fs.mkdir(path.dirname(localPath), { recursive: true });
+        await fs.writeFile(localPath, candidate.baseContent!, 'utf8');
+      }
+    }
+
+    await this.refreshLocalChanges();
+    return recoveryPaths;
+  }
+
+  async verifyRelease(
+    profile: ConnectionProfile,
+    artifacts: ReleaseArtifact[],
+  ): Promise<ReleaseVerification> {
+    this.validateReleaseArtifacts(artifacts);
+    const remoteIndex = await this.withAuthentication(profile, api =>
+      this.listRemoteIndex(api));
+    let files = await this.withAuthentication(profile, async api =>
+      mapConcurrent(artifacts, 4, async artifact =>
+        this.verifyReleaseArtifact(api, remoteIndex, artifact)));
+    const context = await this.loadContext(profile);
+    if (!isManifestInitialized(context.manifest)) {
+      files = artifacts.map(artifact => promotionConflict(
+        artifact,
+        undefined,
+        '目标环境尚未建立同步基线，请先切换到该环境并执行全量拉取',
+      ));
+    } else {
+      const local = await this.scanLocalFiles(context.syncRoot);
+      files = artifacts.map((artifact, index) =>
+        this.verifyTargetLocalArtifact(
+          local,
+          artifact,
+          files[index],
+        ));
+    }
+    return {
+      success: files.every(file =>
+        file.status === 'pending' || file.status === 'succeeded'),
+      files,
+    };
+  }
+
+  async deployRelease(
+    profile: ConnectionProfile,
+    artifacts: ReleaseArtifact[],
+    onProgress: (message: string) => void,
+    cancellation?: CancellationLike,
+  ): Promise<DeploymentFileResult[]> {
+    const preflight = await this.verifyRelease(profile, artifacts);
+    if (!preflight.success) {
+      return preflight.files;
+    }
+    const context = await this.loadContext(profile);
+    let remoteIndex = await this.withAuthentication(profile, api =>
+      this.listRemoteIndex(api));
+    const preflightByPath = new Map(preflight.files.map(file => [file.path, file]));
+    const results: DeploymentFileResult[] = [];
+
+    for (let index = 0; index < artifacts.length; index++) {
+      const artifact = artifacts[index];
+      const preflightResult = preflightByPath.get(artifact.path);
+      if (
+        preflightResult?.status !== 'succeeded'
+        && cancellation?.isCancellationRequested
+      ) {
+        results.push(promotionFailed(artifact, '操作已取消'));
+        continue;
+      }
+      onProgress(`正在应用 ${index + 1}/${artifacts.length}: ${artifact.path}`);
+      try {
+        const result = await this.withAuthentication(profile, async api => {
+          const check = await this.verifyReleaseArtifact(
+            api,
+            remoteIndex,
+            artifact,
+          );
+          if (check.status !== 'pending' && check.status !== 'succeeded') {
+            return check;
+          }
+          const existing = remoteIndex.files.get(artifact.path);
+          const latestLocal = await this.scanLocalFiles(context.syncRoot);
+          const localCheck = this.verifyTargetLocalArtifact(
+            latestLocal,
+            artifact,
+            check,
+          );
+          if (
+            localCheck.status !== 'pending'
+            && localCheck.status !== 'succeeded'
+          ) {
+            return localCheck;
+          }
+          const localFile = [...latestLocal.files.values()].find(file =>
+            remotePathKey(file.path) === remotePathKey(artifact.path));
+          let recoveryPath: string | undefined;
+          let remoteRecoveryHash: string | undefined;
+          if (check.status === 'pending' && existing) {
+            const current = await this.readRemote(api, existing);
+            remoteRecoveryHash = current.hash;
+            recoveryPath = await this.store.saveRecovery(
+              artifact.path,
+              current.content,
+            );
+          }
+          await this.preserveReleaseArtifactLocal(
+            context.syncRoot,
+            artifact,
+            localFile,
+            remoteRecoveryHash,
+          );
+          if (check.status === 'succeeded') {
+            if (artifact.operation === 'delete') {
+              await this.reconcileReleaseArtifactLocal(
+                context.syncRoot,
+                artifact,
+                localFile?.hash,
+              );
+              delete context.manifest.files[artifact.path];
+            } else {
+              if (!existing) {
+                return promotionConflict(
+                  artifact,
+                  undefined,
+                  '目标环境远端文件在应用期间消失',
+                );
+              }
+              const verified = await this.readRemote(api, existing);
+              if (verified.hash !== artifact.resultHash) {
+                return promotionConflict(
+                  artifact,
+                  verified.hash,
+                  '目标环境远端文件在应用期间发生变化',
+                );
+              }
+              await this.reconcileReleaseArtifactLocal(
+                context.syncRoot,
+                artifact,
+                localFile?.hash,
+              );
+              await this.setBaseline(context.manifest, verified);
+            }
+            await this.store.deleteConflict(artifact.path);
+            await this.store.saveManifest(context.manifest);
+            return promotionSucceeded(artifact);
+          }
+
+          if (artifact.operation === 'delete') {
+            if (!existing) {
+              return promotionConflict(
+                artifact,
+                undefined,
+                '目标环境文件已经不存在',
+              );
+            }
+            const deletion = await api.deleteFile(existing.id);
+            this.requireMutationSuccess(deletion, `删除远端文件失败: ${artifact.path}`);
+            const parent = remoteIndex.directories.get(path.posix.dirname(artifact.path));
+            if (!parent) {
+              throw new Error(`删除后无法验证远端父目录: ${artifact.path}`);
+            }
+            const remaining = await this.findRemoteFileInDirectory(
+              api,
+              parent,
+              path.posix.basename(artifact.path),
+              artifact.path,
+            );
+            if (remaining) {
+              throw new Error('删除后远端文件仍然存在');
+            }
+            remoteIndex.files.delete(artifact.path);
+            await this.reconcileReleaseArtifactLocal(
+              context.syncRoot,
+              artifact,
+              localFile?.hash,
+            );
+            delete context.manifest.files[artifact.path];
+            await this.store.deleteConflict(artifact.path);
+            await this.store.saveManifest(context.manifest);
+            return promotionSucceeded(artifact, recoveryPath);
+          }
+
+          if (
+            artifact.resultContent === undefined
+            || artifact.resultHash === undefined
+          ) {
+            throw new Error('冻结快照缺少目标源码');
+          }
+          let uploadedEntry = existing;
+          if (!uploadedEntry) {
+            const parentPath = path.posix.dirname(artifact.path);
+            remoteIndex = await this.ensureRemoteDirectory(
+              api,
+              parentPath,
+              remoteIndex,
+              cancellation,
+            );
+            const parent = remoteIndex.directories.get(parentPath);
+            if (!parent) {
+              throw new Error(`远端父目录不存在: ${parentPath}`);
+            }
+            const extension = path.posix.extname(artifact.path).slice(1);
+            if (!extension) {
+              throw new Error('Ecode 新增文件必须包含扩展名');
+            }
+            const created = await api.addFile(
+              parent.id,
+              path.posix.basename(artifact.path, `.${extension}`),
+              extension,
+            );
+            this.requireMutationSuccess(created, `创建远端文件失败: ${artifact.path}`);
+            uploadedEntry = await this.findRemoteFileInDirectory(
+              api,
+              parent,
+              path.posix.basename(artifact.path),
+              artifact.path,
+            );
+            if (!uploadedEntry) {
+              throw new Error('创建后无法在远端父目录中找到该文件');
+            }
+            remoteIndex.files.set(artifact.path, uploadedEntry);
+          }
+          if (!uploadedEntry) {
+            return promotionConflict(
+              artifact,
+              undefined,
+              '目标环境文件已经不存在',
+            );
+          }
+          const compiledContent = this.compiler.compile(
+            artifact.path,
+            artifact.resultContent,
+          );
+          const upload = await api.updateFile(
+            uploadedEntry.id,
+            artifact.resultContent,
+            compiledContent,
+          );
+          const verified = await this.verifyUploadResult(
+            api,
+            uploadedEntry,
+            artifact.resultHash,
+            upload,
+            artifact.path,
+            cancellation,
+          );
+          await this.reconcileReleaseArtifactLocal(
+            context.syncRoot,
+            artifact,
+            localFile?.hash,
+          );
+          await this.setBaseline(context.manifest, verified);
+          await this.store.deleteConflict(artifact.path);
+          await this.store.saveManifest(context.manifest);
+          remoteIndex.files.set(artifact.path, uploadedEntry);
+          return promotionSucceeded(artifact, recoveryPath);
+        });
+        results.push(result);
+      } catch (error: unknown) {
+        results.push(promotionFailed(artifact, errorMessage(error)));
+      }
+    }
+    return results;
+  }
+
   async refreshLocalChanges(): Promise<SyncChange[]> {
     const context = await this.loadContext();
+    if (!isManifestInitialized(context.manifest)) {
+      this.lastPlan = {
+        generatedAt: new Date().toISOString(),
+        changes: [],
+        executable: [],
+        blocked: [],
+        warnings: ['当前环境尚未建立同步基线，请先执行全量拉取'],
+      };
+      return [];
+    }
     const local = await this.scanLocalFiles(context.syncRoot);
     const changes = await this.mergeStoredConflicts(
       context.manifest,
@@ -127,8 +535,21 @@ export class EcodeSyncService {
 
     for (const item of plan.changes) {
       if (item.status === 'conflict') {
-        result.conflicts++;
         const content = remote.files.get(item.path);
+        const scannedLocal = local.files.get(item.path);
+        if (content && scannedLocal?.hash === content.hash) {
+          const localPath = resolveSafeLocalPath(context.syncRoot, item.path);
+          assertNoSymlinkSegments(context.syncRoot, localPath);
+          const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
+          if (currentLocal?.hash === content.hash) {
+            await this.setBaseline(context.manifest, content);
+            await this.store.deleteConflict(item.path);
+            await this.store.saveManifest(context.manifest);
+            result.pulled++;
+            continue;
+          }
+        }
+        result.conflicts++;
         if (content && item.conflictReason) {
           await this.store.saveConflict({
             path: item.path,
@@ -257,11 +678,20 @@ export class EcodeSyncService {
     cancellation?: CancellationLike,
   ): Promise<SyncOperationResult> {
     const context = await this.loadContext();
+    if (!isManifestInitialized(context.manifest)) {
+      throw new Error('当前环境尚未建立同步基线，请先执行全量拉取');
+    }
     onProgress('正在扫描本地文件...');
     const local = await this.scanLocalFiles(context.syncRoot);
     const localChanges = new Map(
       buildLocalChanges(context.manifest, local.files).map(item => [item.path, item]),
     );
+    this.assertGbkCompatibleSources(selectedPaths.flatMap(remotePath => {
+      const localFile = local.files.get(remotePath);
+      return localFile
+        ? [{ path: remotePath, content: localFile.content }]
+        : [];
+    }));
     const pushConflicts = new Map<string, SyncChange>();
     const result = emptyResult();
     let remoteIndex = await this.withAuthentication(context.profile, api =>
@@ -303,6 +733,11 @@ export class EcodeSyncService {
       }
 
       try {
+        const pathCollision = remoteIndex.pathCollisions.find(item =>
+          remotePathKey(item.path) === remotePathKey(remotePath));
+        if (pathCollision) {
+          throw new Error(pathCollision.message ?? '远端文件与目录路径冲突');
+        }
         if (change.status === 'localDeleted') {
           if (handledDeletedFiles.has(remotePath)) {
             continue;
@@ -414,7 +849,17 @@ export class EcodeSyncService {
         await this.withAuthentication(context.profile, async api => {
           let existing = remoteIndex.files.get(remotePath);
           if (change.status === 'localAdded' && existing) {
-            await this.recordPushConflict(api, remotePath, existing, 'initialCollision');
+            const latest = await this.readRemote(api, existing);
+            if (latest.hash === localFile.hash) {
+              await this.setBaseline(context.manifest, latest);
+              await this.store.deleteConflict(remotePath);
+              await this.store.saveManifest(context.manifest);
+              this.lastRemoteFiles.set(remotePath, latest);
+              result.pushed++;
+              return;
+            }
+            await this.store.saveConflict(toStoredConflict(latest, 'initialCollision'));
+            this.lastRemoteFiles.set(remotePath, latest);
             result.conflicts++;
             pushConflicts.set(remotePath, {
               path: remotePath,
@@ -460,6 +905,14 @@ export class EcodeSyncService {
             }
             const latest = await this.readRemote(api, existing);
             if (latest.hash !== baseline.baselineHash) {
+              if (latest.hash === localFile.hash) {
+                await this.setBaseline(context.manifest, latest);
+                await this.store.deleteConflict(remotePath);
+                await this.store.saveManifest(context.manifest);
+                this.lastRemoteFiles.set(remotePath, latest);
+                result.pushed++;
+                return;
+              }
               await this.store.saveConflict(toStoredConflict(latest, 'bothModified'));
               this.lastRemoteFiles.set(remotePath, latest);
               result.conflicts++;
@@ -537,17 +990,14 @@ export class EcodeSyncService {
             localFile.content,
             compiledContent,
           );
-          if (!upload.status) {
-            if (isUnauthorized(upload.code)) {
-              throw new SessionExpiredError(upload.msg || 'Session expired');
-            }
-            throw new Error(`上传失败: ${remotePath}${upload.msg ? `: ${upload.msg}` : ''}`);
-          }
-
-          const verified = await this.readRemote(api, uploadedEntry);
-          if (verified.hash !== localFile.hash) {
-            throw new Error('上传后远端内容校验不一致');
-          }
+          const verified = await this.verifyUploadResult(
+            api,
+            uploadedEntry,
+            localFile.hash,
+            upload,
+            remotePath,
+            cancellation,
+          );
 
           await this.setBaseline(context.manifest, verified);
           await this.store.saveManifest(context.manifest);
@@ -727,17 +1177,20 @@ export class EcodeSyncService {
     await this.refreshLocalChanges();
   }
 
-  private async loadContext(): Promise<{
+  private async loadContext(profileOverride?: ConnectionProfile): Promise<{
     profile: ConnectionProfile;
     syncRoot: string;
     manifest: SyncManifest;
     formMetadataCache: FormMetadataCache;
   }> {
-    const profile = await this.store.getProfile();
+    const profile = profileOverride ?? await this.store.getProfile();
     if (!profile) {
       throw new Error('请先配置 Ecode 连接');
     }
-    const syncRoot = resolveEcodeSourceRoot(profile.workspaceFolder);
+    const syncRoot = resolveEnvironmentSourceRoot(
+      profile.workspaceFolder,
+      profile.environmentDirectory,
+    );
     const fingerprint = serverFingerprint(profile.serverUrl, profile.username);
     const manifest = await this.store.loadManifest(fingerprint, syncRoot);
     const formMetadataCache = await this.store.loadFormMetadataCache(
@@ -747,6 +1200,200 @@ export class EcodeSyncService {
     return { profile, syncRoot, manifest, formMetadataCache };
   }
 
+  private async verifyReleaseArtifact(
+    api: FileApi,
+    remoteIndex: RemoteIndex,
+    artifact: ReleaseArtifact,
+  ): Promise<DeploymentFileResult> {
+    const pathCollision = remoteIndex.pathCollisions.find(change =>
+      remotePathKey(change.path) === remotePathKey(artifact.path));
+    if (pathCollision) {
+      return promotionConflict(
+        artifact,
+        undefined,
+        pathCollision.message ?? '远端文件与目录路径冲突',
+      );
+    }
+    const existing = remoteIndex.files.get(artifact.path);
+    const remote = existing ? await this.readRemote(api, existing) : undefined;
+    if (
+      artifact.operation !== 'delete'
+      && remote?.hash === artifact.resultHash
+    ) {
+      return promotionSucceeded(artifact);
+    }
+    return artifact.operation === 'delete' && !remote
+      ? promotionSucceeded(artifact)
+      : promotionPending(artifact);
+  }
+
+  private verifyTargetLocalArtifact(
+    local: {
+      files: Map<string, LocalFileState>;
+      directories: Set<string>;
+      unsupported: SyncChange[];
+    },
+    artifact: ReleaseArtifact,
+    remoteResult: DeploymentFileResult,
+  ): DeploymentFileResult {
+    if (
+      remoteResult.status !== 'pending'
+      && remoteResult.status !== 'succeeded'
+    ) {
+      return remoteResult;
+    }
+    const artifactKey = remotePathKey(artifact.path);
+    const unsupported = local.unsupported.find(change => {
+      const unsupportedKey = remotePathKey(change.path);
+      return artifactKey === unsupportedKey
+        || artifactKey.startsWith(`${unsupportedKey}/`);
+    });
+    if (unsupported) {
+      return promotionConflict(
+        artifact,
+        undefined,
+        `目标环境本地路径不可安全写入: ${unsupported.message ?? unsupported.path}`,
+      );
+    }
+    const localDirectory = [...local.directories].find(directory =>
+      remotePathKey(directory) === artifactKey);
+    if (localDirectory) {
+      return promotionConflict(
+        artifact,
+        undefined,
+        '目标环境本地存在同名目录，无法应用文件变更',
+      );
+    }
+    const parentFile = [...local.files.keys()].find(localPath =>
+      artifactKey.startsWith(`${remotePathKey(localPath)}/`));
+    if (parentFile) {
+      return promotionConflict(
+        artifact,
+        local.files.get(parentFile)?.hash,
+        `目标环境本地父路径是文件: ${parentFile}`,
+      );
+    }
+    return remoteResult;
+  }
+
+  private async preserveReleaseArtifactLocal(
+    syncRoot: string,
+    artifact: ReleaseArtifact,
+    localFile: LocalFileState | undefined,
+    remoteRecoveryHash: string | undefined,
+  ): Promise<void> {
+    const desiredHash = artifact.operation === 'delete'
+      ? undefined
+      : artifact.resultHash;
+    if (
+      !localFile
+      || localFile.hash === desiredHash
+      || localFile.hash === remoteRecoveryHash
+    ) {
+      return;
+    }
+    const localPath = resolveSafeLocalPath(syncRoot, artifact.path);
+    assertNoSymlinkSegments(syncRoot, localPath);
+    const current = await this.readLocalFileIfExists(localPath, artifact.path);
+    if (current?.hash !== localFile.hash) {
+      throw new Error(`${artifact.path}: 目标环境本地源码在应用准备期间发生变化`);
+    }
+    await this.store.saveRecovery(artifact.path, current.content);
+  }
+
+  private async reconcileReleaseArtifactLocal(
+    syncRoot: string,
+    artifact: ReleaseArtifact,
+    expectedLocalHash: string | undefined,
+  ): Promise<void> {
+    const localPath = resolveSafeLocalPath(syncRoot, artifact.path);
+    assertNoSymlinkSegments(syncRoot, localPath);
+    const current = await this.readLocalFileIfExists(localPath, artifact.path);
+    if (current?.hash !== expectedLocalHash) {
+      throw new Error(`${artifact.path}: 目标环境本地源码在应用期间发生变化，已停止覆盖`);
+    }
+    if (artifact.operation === 'delete') {
+      if (current) {
+        await fs.unlink(localPath);
+      }
+      return;
+    }
+    if (artifact.resultContent === undefined) {
+      throw new Error(`${artifact.path}: 冻结快照缺少目标源码`);
+    }
+    await fs.mkdir(path.dirname(localPath), { recursive: true });
+    await fs.writeFile(localPath, artifact.resultContent, 'utf8');
+  }
+
+  private validateReleaseArtifacts(artifacts: ReleaseArtifact[]): void {
+    if (artifacts.length === 0) {
+      throw new Error('Release 中没有可发布文件');
+    }
+    const paths = new Set<string>();
+    for (const artifact of artifacts) {
+      const normalized = normalizeRemotePath(artifact.path);
+      if (normalized !== artifact.path || paths.has(normalized)) {
+        throw new Error(`${artifact.path}: Release 路径无效或重复`);
+      }
+      paths.add(normalized);
+      if (artifact.operation === 'add') {
+        if (
+          artifact.baseHash !== undefined
+          || artifact.resultContent === undefined
+          || artifact.resultHash !== hashText(artifact.resultContent)
+        ) {
+          throw new Error(`${artifact.path}: Release 新增快照无效`);
+        }
+      } else if (artifact.operation === 'modify') {
+        if (
+          !artifact.baseHash
+          || artifact.resultContent === undefined
+          || artifact.resultHash !== hashText(artifact.resultContent)
+        ) {
+          throw new Error(`${artifact.path}: Release 修改快照无效`);
+        }
+      } else if (
+        artifact.operation !== 'delete'
+        || !artifact.baseHash
+        || artifact.resultHash !== undefined
+        || artifact.resultContent !== undefined
+      ) {
+        throw new Error(`${artifact.path}: Release 删除快照无效`);
+      }
+    }
+    this.assertGbkCompatibleSources(artifacts.flatMap(artifact =>
+      artifact.resultContent === undefined
+        ? []
+        : [{ path: artifact.path, content: artifact.resultContent }]));
+  }
+
+  private assertGbkCompatibleSources(
+    sources: Array<{ path: string; content: string }>,
+  ): void {
+    const details: string[] = [];
+    for (const source of sources) {
+      const remaining = 10 - details.length;
+      if (remaining <= 0) {
+        break;
+      }
+      for (const issue of findGbkIncompatibleCharacters(source.content, remaining)) {
+        details.push(
+          `${source.path}:${issue.line}:${issue.column}: `
+          + `${JSON.stringify(issue.character)} `
+          + `(${formatUnicodeCodePoint(issue.codePoint)})`,
+        );
+      }
+    }
+    if (details.length === 0) {
+      return;
+    }
+    throw new Error(
+      '检测到 E-cology GBK 环境无法保存的源码字符，已在远端写入前终止操作：\n'
+      + `${details.join('\n')}\n`
+      + '请改用 Unicode 转义或其他纯 ASCII 表达，例如用 "\\u203A" 表示 ›。',
+    );
+  }
+
   private async scanRemote(
     api: FileApi,
     onProgress: (message: string) => void,
@@ -754,7 +1401,7 @@ export class EcodeSyncService {
   ): Promise<RemoteScan> {
     const index = await this.listRemoteIndex(api, cancellation, onProgress);
     const entries = index.files;
-    const unsupported: SyncChange[] = [];
+    const unsupported: SyncChange[] = [...index.pathCollisions];
     const errors: string[] = [];
     const total = entries.size;
     let completed = 0;
@@ -790,7 +1437,10 @@ export class EcodeSyncService {
           .filter((item): item is RemoteFileContent => Boolean(item))
           .map(item => [item.entry.path, item]),
       ),
-      presentPaths: new Set(entries.keys()),
+      presentPaths: new Set([
+        ...entries.keys(),
+        ...index.pathCollisions.map(change => change.path),
+      ]),
       presentDirectories: new Set(index.directories.keys()),
       unsupported,
       errors,
@@ -887,15 +1537,36 @@ export class EcodeSyncService {
       directoryMap.set(directory.path, directory);
     }
     const allDirectoryPaths = new Set(directories.map(item => item.path));
-    const uniquePaths = [...filePaths, ...allDirectoryPaths];
-    assertNoCaseCollisions(uniquePaths);
-    if (new Set(uniquePaths).size !== uniquePaths.length) {
-      throw new Error('远端文件与目录路径冲突');
+    assertNoCaseCollisions(allDirectoryPaths);
+    const directoryPathByKey = new Map<string, string>();
+    for (const directoryPath of allDirectoryPaths) {
+      directoryPathByKey.set(remotePathKey(directoryPath), directoryPath);
     }
+    const collisionKeys = new Set<string>();
+    const pathCollisions: SyncChange[] = [];
+    for (const entry of entries) {
+      const directoryPath = directoryPathByKey.get(remotePathKey(entry.path));
+      if (!directoryPath) {
+        continue;
+      }
+      collisionKeys.add(remotePathKey(entry.path));
+      pathCollisions.push({
+        path: entry.path,
+        status: 'unsupported',
+        remoteId: entry.id,
+        conflictReason: 'remotePathCollision',
+        message: entry.path === directoryPath
+          ? `远端同一路径同时存在文件和目录，无法映射到本地: ${entry.path}`
+          : `远端文件与目录路径仅大小写不同，无法映射到本地: ${entry.path} / ${directoryPath}`,
+      });
+    }
+    const safeEntries = entries.filter(entry =>
+      !collisionKeys.has(remotePathKey(entry.path)));
     return {
-      files: new Map(entries.map(item => [item.path, item])),
+      files: new Map(safeEntries.map(item => [item.path, item])),
       directories: directoryMap,
       ambiguousDirectories,
+      pathCollisions,
     };
   }
 
@@ -1165,6 +1836,86 @@ export class EcodeSyncService {
     };
   }
 
+  private async readRemoteAfterMutation(
+    api: FileApi,
+    entry: RemoteFileEntry,
+    expectedHash: string | undefined,
+    cancellation?: CancellationLike,
+  ): Promise<RemoteFileContent> {
+    let latest: RemoteFileContent | undefined;
+    let lastError: unknown;
+    for (const delayMs of [0, ...REMOTE_VERIFICATION_RETRY_DELAYS_MS]) {
+      this.throwIfCancelled(cancellation);
+      if (delayMs > 0) {
+        await delay(delayMs);
+      }
+      this.throwIfCancelled(cancellation);
+      try {
+        latest = await this.readRemote(api, entry);
+        if (!expectedHash || latest.hash === expectedHash) {
+          return latest;
+        }
+      } catch (error: unknown) {
+        if (error instanceof SessionExpiredError) {
+          throw error;
+        }
+        lastError = error;
+      }
+    }
+    if (latest) {
+      return latest;
+    }
+    throw lastError ?? new Error(`无法回读远端文件: ${entry.path}`);
+  }
+
+  private async verifyUploadResult(
+    api: FileApi,
+    entry: RemoteFileEntry,
+    expectedHash: string | undefined,
+    upload: ApiResponse<unknown>,
+    remotePath: string,
+    cancellation?: CancellationLike,
+  ): Promise<RemoteFileContent> {
+    if (!upload.status) {
+      if (isUnauthorized(upload.code)) {
+        throw new SessionExpiredError(upload.msg || 'Session expired');
+      }
+      if (!isAmbiguousMutationFailure(upload)) {
+        throw new Error(
+          `上传失败: ${remotePath}${upload.msg ? `: ${upload.msg}` : ''}`,
+        );
+      }
+    }
+
+    let verified: RemoteFileContent;
+    try {
+      verified = await this.readRemoteAfterMutation(
+        api,
+        entry,
+        expectedHash,
+        cancellation,
+      );
+    } catch (error: unknown) {
+      if (!upload.status) {
+        throw new Error(
+          `上传请求结果未知: ${remotePath}`
+          + `${upload.msg ? `: ${upload.msg}` : ''}`
+          + `；远端回读失败: ${errorMessage(error)}`,
+        );
+      }
+      throw error;
+    }
+    if (verified.hash !== expectedHash) {
+      throw new Error(
+        upload.status
+          ? '上传后远端内容校验不一致'
+          : `上传请求结果未知且远端内容未达到目标: ${remotePath}`
+            + `${upload.msg ? `: ${upload.msg}` : ''}`,
+      );
+    }
+    return verified;
+  }
+
   private async refreshFormMetadataCache(
     cache: FormMetadataCache,
     remote: RemoteScan,
@@ -1300,14 +2051,16 @@ export class EcodeSyncService {
 
   private async scanLocalFiles(syncRoot: string): Promise<{
     files: Map<string, LocalFileState>;
+    directories: Set<string>;
     unsupported: SyncChange[];
   }> {
     const files = new Map<string, LocalFileState>();
+    const directories = new Set<string>();
     const unsupported: SyncChange[] = [];
     try {
       await fs.access(syncRoot);
     } catch {
-      return { files, unsupported };
+      return { files, directories, unsupported };
     }
 
     const walk = async (directory: string): Promise<void> => {
@@ -1321,6 +2074,7 @@ export class EcodeSyncService {
             message: '不跟随符号链接',
           });
         } else if (entry.isDirectory()) {
+          directories.add(relative);
           await walk(absolute);
         } else if (entry.isFile()) {
           const buffer = await fs.readFile(absolute);
@@ -1349,7 +2103,8 @@ export class EcodeSyncService {
     };
     await walk(syncRoot);
     assertNoCaseCollisions(files.keys());
-    return { files, unsupported };
+    assertNoCaseCollisions(directories);
+    return { files, directories, unsupported };
   }
 
   private async readLocalFileIfExists(
@@ -1593,8 +2348,21 @@ function isUnauthorized(code: number | string | undefined): boolean {
     || code === '1002';
 }
 
+function isAmbiguousMutationFailure(response: ApiResponse<unknown>): boolean {
+  const numericCode = typeof response.code === 'number'
+    ? response.code
+    : typeof response.code === 'string' && /^-?\d+$/.test(response.code)
+      ? Number(response.code)
+      : undefined;
+  return numericCode === -1 || (numericCode !== undefined && numericCode >= 500);
+}
+
 function joinRemote(parent: string, name: string): string {
   return parent ? `${parent}/${name}` : name;
+}
+
+function remotePathKey(value: string): string {
+  return value.toLocaleLowerCase('en-US');
 }
 
 function isDescendantPath(remotePath: string, directoryPath: string): boolean {
@@ -1629,6 +2397,62 @@ function emptyResult(): SyncOperationResult {
   };
 }
 
+function isManifestInitialized(manifest: SyncManifest): boolean {
+  return Number.isFinite(Date.parse(manifest.updatedAt))
+    && Date.parse(manifest.updatedAt) > 0;
+}
+
+function promotionPending(artifact: ReleaseArtifact): DeploymentFileResult {
+  return {
+    path: artifact.path,
+    operation: artifact.operation,
+    status: 'pending',
+    expectedHash: artifact.baseHash,
+  };
+}
+
+function promotionSucceeded(
+  artifact: ReleaseArtifact,
+  recoveryPath?: string,
+): DeploymentFileResult {
+  return {
+    path: artifact.path,
+    operation: artifact.operation,
+    status: 'succeeded',
+    expectedHash: artifact.resultHash,
+    actualHash: artifact.resultHash,
+    recoveryPath,
+  };
+}
+
+function promotionConflict(
+  artifact: ReleaseArtifact,
+  actualHash: string | undefined,
+  message: string,
+): DeploymentFileResult {
+  return {
+    path: artifact.path,
+    operation: artifact.operation,
+    status: 'conflict',
+    expectedHash: artifact.baseHash,
+    actualHash,
+    message,
+  };
+}
+
+function promotionFailed(
+  artifact: ReleaseArtifact,
+  message: string,
+): DeploymentFileResult {
+  return {
+    path: artifact.path,
+    operation: artifact.operation,
+    status: 'failed',
+    expectedHash: artifact.resultHash,
+    message,
+  };
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1657,6 +2481,35 @@ function conflictMessage(reason: StoredConflict['reason']): string {
     remotePathCollision: '远端路径存在冲突',
   };
   return messages[reason];
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function removeEmptyParents(directory: string, root: string): Promise<void> {
+  const resolvedRoot = path.resolve(root);
+  let current = path.resolve(directory);
+  while (current !== resolvedRoot) {
+    const relative = path.relative(resolvedRoot, current);
+    if (
+      relative === '..'
+      || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)
+    ) {
+      throw new Error(`目录超出源码范围: ${current}`);
+    }
+    try {
+      await fs.rmdir(current);
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') {
+        return;
+      }
+      throw error;
+    }
+    current = path.dirname(current);
+  }
 }
 
 async function mapConcurrent<T, R>(

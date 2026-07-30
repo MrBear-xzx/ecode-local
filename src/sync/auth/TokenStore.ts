@@ -1,6 +1,7 @@
 import type * as vscode from 'vscode';
 
 export class TokenStore {
+  readonly identity: string;
   private readonly cookieKey: string;
   private readonly passwordKey: string;
 
@@ -8,7 +9,8 @@ export class TokenStore {
     private readonly secrets: vscode.SecretStorage,
     identity: string,
   ) {
-    const prefix = `ecode.v2.auth.${identity}`;
+    this.identity = identity;
+    const prefix = `ecode.v1.auth.${identity}`;
     this.cookieKey = `${prefix}.cookie`;
     this.passwordKey = `${prefix}.password`;
   }
@@ -40,10 +42,4 @@ export class TokenStore {
     ]);
   }
 
-  async clearAllV2(): Promise<void> {
-    const keys = await this.secrets.keys();
-    await Promise.all(keys
-      .filter(key => key.startsWith('ecode.v2.'))
-      .map(key => this.secrets.delete(key)));
-  }
 }

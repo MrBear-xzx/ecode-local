@@ -106,13 +106,14 @@ export function generateAiGuide(): string {
   return ensureTrailingNewline([
     '# Ecode AI Coding 指南',
     '',
-    '本目录由 Ecode Local 自动生成，用于让 AI 编码工具理解 Ecode 运行时 API、组件和项目内组件注册关系。',
+    '本目录由 Ecode Local 自动生成，保存所有环境共用的 Ecode 运行时 API 与组件知识。',
     '',
     '## 工作区约定',
     '',
-    '- `ecode/` 是唯一的 Ecode 源码目录，远端拉取和推送只作用于该目录。',
-    '- `.ecode-local/ecode-ai/` 是 AI 支持资料目录，不属于 Ecode 源码，禁止同步到远端。',
-    '- `.ecode-local/storage/` 是扩展的同步状态与恢复资料目录，不属于 Ecode 源码。',
+    '- 每个环境使用独立的工作区源码目录，远端拉取和推送只作用于当前活动环境目录。',
+    '- `.ecode-local/common/ecode-ai/` 是公共知识目录，不属于 Ecode 源码，禁止同步到远端。',
+    '- `.ecode-local/<环境目录>/` 保存该环境的同步状态、恢复资料和项目知识。',
+    '- `.ecode-local/promotion/` 保存推送记录、跨环境变更集、源码快照与应用记录。',
     '- 不要假设 Ecode 全局对象来自 npm 包；`WfForm`、`ModeForm`、`ModeList`、`ecodeSDK`、`ecCom` 和 `antd` 由平台运行时提供。',
     '- 平台 JavaScript 编译环境以 Babel 7.5.5 兼容能力为准，生成代码时避免依赖过新的语法和运行时 API。',
     '',
@@ -120,8 +121,8 @@ export function generateAiGuide(): string {
     '',
     '- `ecode-globals.d.ts`：全局 API、签名、参数及嵌套参数。',
     '- `ecode-components.d.ts`：PC 组件、props 及嵌套 props。',
-    '- `workspace-components.md`：当前项目的 `ecodeSDK.setCom/getCom` 组件关系。',
-    '- `workspace-form-metadata.md`：当前源码文件关联的流程/建模表单、主表、明细表和字段中文名。',
+    '- `.ecode-local/<环境目录>/ecode-ai/workspace-components.md`：当前环境的 `ecodeSDK.setCom/getCom` 组件关系。',
+    '- `.ecode-local/<环境目录>/ecode-ai/workspace-form-metadata.md`：当前环境源码关联的表单与字段信息。',
     '',
     '## 生成代码规则',
     '',
@@ -131,6 +132,13 @@ export function generateAiGuide(): string {
     '4. 类型为 `unknown` 表示官方资料不足，必须从现有调用或运行时行为继续确认，不应擅自猜测。',
     '5. `convertFieldNameToId` 未提供表参数时按主表理解，提供 `detail_N` 时只使用对应明细表。',
     '6. 不修改 `.ecode-local/` 中的生成文件；知识变化后使用扩展命令重新生成。',
+    '',
+    '## AI 推送请求',
+    '',
+    '只有用户在当前任务中明确要求推送时，AI 才能在 '
+      + '`.ecode-local/ai-requests/<id>.json` 创建 `action: "push"` 请求。',
+    '请求必须指定当前活动环境目录和相对源码路径。扩展会弹出人工确认，并继续执行远端冲突检查、推送后回读校验和推送记录保存。',
+    '处理结果写入 `.ecode-local/ai-results/<id>.json`。AI 不得直接调用 E-cology 接口、绕过确认、覆盖旧请求或修改结果文件。',
     '',
     '## 常见示例',
     '',
@@ -146,6 +154,7 @@ export function generateAiGuide(): string {
 export function generateWorkspaceComponents(
   workspaceRoot: string,
   calls: readonly IndexedEcodeComponentCall[],
+  environmentDirectory = '环境目录',
 ): string {
   const groups = new Map<string, IndexedEcodeComponentCall[]>();
   for (const call of calls) {
@@ -173,16 +182,18 @@ export function generateWorkspaceComponents(
   return ensureTrailingNewline([
     '# Ecode 工作区组件',
     '',
-    '由 Ecode Local 从 `ecode/` 内的 `ecodeSDK.setCom/getCom` 调用生成。',
+    `由 Ecode Local 从 \`${environmentDirectory}/\` 内的 `
+      + '`ecodeSDK.setCom/getCom` 调用生成。',
     '',
     ...(sections.length > 0
       ? sections
-      : ['当前 `ecode/` 源码中尚未发现静态组件注册或引用。', '']),
+      : [`当前 \`${environmentDirectory}/\` 源码中尚未发现静态组件注册或引用。`, '']),
   ].join('\n'));
 }
 
 export function generateWorkspaceFormMetadata(
   files: readonly CachedFileFormMetadata[],
+  environmentDirectory = '环境目录',
 ): string {
   const groups = new Map<string, {
     context: FormContext;
@@ -192,7 +203,7 @@ export function generateWorkspaceFormMetadata(
     for (const context of file.contexts) {
       const key = JSON.stringify(context);
       const group = groups.get(key) ?? { context, paths: [] };
-      group.paths.push(`ecode/${file.path.replace(/\\/g, '/')}`);
+      group.paths.push(`${environmentDirectory}/${file.path.replace(/\\/g, '/')}`);
       groups.set(key, group);
     }
   }

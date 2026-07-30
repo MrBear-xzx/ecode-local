@@ -1,7 +1,16 @@
+import * as fs from 'fs';
 import * as path from 'path';
-import * as Babel from '@babel/standalone';
 
 const JAVASCRIPT_EXTENSIONS = new Set(['.js', '.jsx']);
+let babel: BabelStandalone | undefined;
+
+interface BabelStandalone {
+  version: string;
+  transform(
+    source: string,
+    options: Record<string, unknown>,
+  ): { code?: string | null };
+}
 
 export class EcodeCompiler {
   compile(remotePath: string, source: string): string {
@@ -10,7 +19,7 @@ export class EcodeCompiler {
     }
 
     try {
-      const result = Babel.transform(source, {
+      const result = loadBabel().transform(source, {
         babelrc: false,
         filename: 'repl',
         sourceMaps: false,
@@ -33,6 +42,17 @@ export class EcodeCompiler {
   }
 
   getVersion(): string {
-    return Babel.version;
+    return loadBabel().version;
   }
+}
+
+function loadBabel(): BabelStandalone {
+  if (babel) {
+    return babel;
+  }
+  const bundledRuntime = path.join(__dirname, 'babel.min.js');
+  babel = module.require(
+    fs.existsSync(bundledRuntime) ? bundledRuntime : '@babel/standalone',
+  ) as BabelStandalone;
+  return babel;
 }

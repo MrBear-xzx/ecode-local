@@ -120,7 +120,9 @@ suite('Auth manager', () => {
 
 function createProfile(serverUrl: string): ConnectionProfile {
   return {
-    version: 3,
+    version: 4,
+    environmentId: 'test-environment',
+    environmentDirectory: 'test_env',
     workspaceFolder: process.cwd(),
     serverUrl,
     username: 'test-user',

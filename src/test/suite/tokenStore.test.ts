@@ -16,15 +16,18 @@ suite('Token store', () => {
     assert.strictEqual(await second.getCookie(), undefined);
   });
 
-  test('clears only v2 Ecode secrets when requested', async () => {
+  test('clears only the selected environment credentials', async () => {
     const secrets = new MemorySecrets();
     const store = new TokenStore(secrets as never, 'identity-a');
+    const other = new TokenStore(secrets as never, 'identity-b');
     await store.storePassword('password-a');
+    await other.storePassword('password-b');
     await secrets.store('unrelated.secret', 'keep');
 
-    await store.clearAllV2();
+    await store.clear();
 
     assert.strictEqual(await store.getPassword(), undefined);
+    assert.strictEqual(await other.getPassword(), 'password-b');
     assert.strictEqual(await secrets.get('unrelated.secret'), 'keep');
   });
 });

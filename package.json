@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -29,18 +29,23 @@
     "onView:ecode.workspace",
     "onCommand:ecode.configure",
     "onCommand:ecode.setup",
+    "onCommand:ecode.addEnvironment",
+    "onCommand:ecode.switchEnvironment",
     "onCommand:ecode.pull",
     "onCommand:ecode.refreshChanges",
     "onCommand:ecode.pushSelected",
+    "onCommand:ecode.rollbackPushFile",
     "onCommand:ecode.openDiff",
     "onCommand:ecode.revertChange",
     "onCommand:ecode.resolveConflict",
+    "onCommand:ecode.createChangeSet",
+    "onCommand:ecode.applyChangeSet",
+    "onCommand:ecode.cancelChangeSet",
     "onCommand:ecode.searchApiDocumentation",
     "onCommand:ecode.openOnlineDocumentation",
     "onCommand:ecode.refreshAiSupport",
     "onCommand:ecode.openAiGuide",
     "onCommand:ecode.removeAiSupport",
-    "onCommand:ecode.confirmSourceDirectoryMigration",
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
     "onLanguage:typescript",
@@ -51,8 +56,18 @@
     "commands": [
       {
         "command": "ecode.configure",
-        "title": "Ecode: 配置连接",
+        "title": "Ecode: 配置当前环境",
         "icon": "$(gear)"
+      },
+      {
+        "command": "ecode.addEnvironment",
+        "title": "Ecode: 新增环境",
+        "icon": "$(add)"
+      },
+      {
+        "command": "ecode.switchEnvironment",
+        "title": "Ecode: 切换环境",
+        "icon": "$(server-environment)"
       },
       {
         "command": "ecode.pull",
@@ -70,6 +85,11 @@
         "icon": "$(cloud-upload)"
       },
       {
+        "command": "ecode.rollbackPushFile",
+        "title": "Ecode: 回退此文件到推送前",
+        "icon": "$(discard)"
+      },
+      {
         "command": "ecode.openDiff",
         "title": "Ecode: 查看差异",
         "icon": "$(diff)"
@@ -83,6 +103,21 @@
         "command": "ecode.resolveConflict",
         "title": "Ecode: 解决冲突",
         "icon": "$(issues)"
+      },
+      {
+        "command": "ecode.createChangeSet",
+        "title": "Ecode: 创建跨环境变更集",
+        "icon": "$(git-pull-request-create)"
+      },
+      {
+        "command": "ecode.applyChangeSet",
+        "title": "Ecode: 应用变更集到当前环境",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "ecode.cancelChangeSet",
+        "title": "Ecode: 取消变更集",
+        "icon": "$(trash)"
       },
       {
         "command": "ecode.searchApiDocumentation",
@@ -108,11 +143,6 @@
         "command": "ecode.removeAiSupport",
         "title": "Ecode: 移除 AI Coding 支持",
         "icon": "$(trash)"
-      },
-      {
-        "command": "ecode.confirmSourceDirectoryMigration",
-        "title": "Ecode: 确认迁移到固定源码目录",
-        "icon": "$(folder-active)"
       }
     ],
     "viewsContainers": {
@@ -133,11 +163,37 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "ecode.rollbackPushFile",
+          "when": "false"
+        }
+      ],
       "view/title": [
         {
           "command": "ecode.configure",
           "when": "view == ecode.workspace",
           "group": "1_connection@1"
+        },
+        {
+          "command": "ecode.addEnvironment",
+          "when": "view == ecode.workspace",
+          "group": "1_connection@2"
+        },
+        {
+          "command": "ecode.switchEnvironment",
+          "when": "view == ecode.workspace",
+          "group": "1_connection@3"
+        },
+        {
+          "command": "ecode.createChangeSet",
+          "when": "view == ecode.workspace",
+          "group": "2_promotion@1"
+        },
+        {
+          "command": "ecode.applyChangeSet",
+          "when": "view == ecode.workspace",
+          "group": "2_promotion@2"
         },
         {
           "command": "ecode.pull",
@@ -157,27 +213,27 @@
         {
           "command": "ecode.searchApiDocumentation",
           "when": "view == ecode.workspace",
-          "group": "2_documentation@1"
+          "group": "3_documentation@1"
         },
         {
           "command": "ecode.openOnlineDocumentation",
           "when": "view == ecode.workspace",
-          "group": "2_documentation@2"
+          "group": "3_documentation@2"
         },
         {
           "command": "ecode.openAiGuide",
           "when": "view == ecode.workspace",
-          "group": "2_documentation@3"
+          "group": "3_documentation@3"
         },
         {
           "command": "ecode.refreshAiSupport",
           "when": "view == ecode.workspace",
-          "group": "3_ai@1"
+          "group": "4_ai@1"
         },
         {
           "command": "ecode.removeAiSupport",
           "when": "view == ecode.workspace",
-          "group": "3_ai@2"
+          "group": "4_ai@2"
         }
       ],
       "view/item/context": [
@@ -195,6 +251,21 @@
           "command": "ecode.revertChange",
           "when": "view == ecode.workspace && viewItem == ecode.change.revertible",
           "group": "inline@2"
+        },
+        {
+          "command": "ecode.rollbackPushFile",
+          "when": "view == ecode.workspace && viewItem == ecode.pushRecordFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.applyChangeSet",
+          "when": "view == ecode.workspace && viewItem == ecode.changeSet",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.cancelChangeSet",
+          "when": "view == ecode.workspace && viewItem == ecode.changeSet",
+          "group": "inline@2"
         }
       ]
     },
@@ -210,7 +281,7 @@
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "在 .ecode-local/ecode-ai 中生成并自动刷新 Ecode AI Coding 支持资料，同时维护工作区根目录 AGENTS.md 的 Ecode 管理区块。"
+          "description": "在 .ecode-local/common/ecode-ai 中生成公共知识，并在当前环境目录下生成项目知识，同时维护工作区根目录 AGENTS.md 的 Ecode 管理区块。"
         }
       }
     }
