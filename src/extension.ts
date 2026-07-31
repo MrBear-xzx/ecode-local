@@ -211,6 +211,10 @@ class ExtensionController {
           this.runCommandSafely(() =>
             this.rollbackPushFile(argument, remotePath)),
       ),
+      vscode.commands.registerCommand('ecode.renamePushRecord', (argument?: unknown) =>
+        this.runCommandSafely(() => this.renamePushRecord(argument))),
+      vscode.commands.registerCommand('ecode.deletePushRecord', (argument?: unknown) =>
+        this.runCommandSafely(() => this.deletePushRecord(argument))),
       vscode.commands.registerCommand(
         'ecode.openPromotionDiff',
         (candidate: PushRecord | ChangeSet, remotePath: string) =>
@@ -542,18 +546,6 @@ class ExtensionController {
       selectedPaths,
     );
 
-    const deletionCount = selected.filter(item => item.change.status === 'localDeleted').length;
-    const confirmation = await vscode.window.showWarningMessage(
-      `确认向 ${profile.serverUrl} 推送 ${selected.length} 项变更`
-        + `${deletionCount > 0 ? `（含 ${deletionCount} 个远端删除）` : ''}？`
-        + ' JavaScript 将使用与 Ecode 在线编辑器一致的 Babel 7.5.5 配置生成编译内容。',
-      { modal: true },
-      '确认推送',
-    );
-    if (confirmation !== '确认推送') {
-      return;
-    }
-
     const execution = await this.executePush(
       profile,
       activeEnvironment,
@@ -564,7 +556,7 @@ class ExtensionController {
       showResult('推送', execution.result);
       if (execution.record) {
         vscode.window.showInformationMessage(
-          `Ecode: 已保存推送记录 ${execution.record.id}`,
+          `Ecode: 已保存推送记录“${execution.record.name}”`,
         );
       }
     }
@@ -617,8 +609,8 @@ class ExtensionController {
     }
     const selectedRecords = await vscode.window.showQuickPick(
       pushRecords.map(record => ({
-        label: new Date(record.createdAt).toLocaleString(),
-        description: `${record.files.length} 个文件`,
+        label: record.name,
+        description: `${new Date(record.createdAt).toLocaleString()} · ${record.files.length} 个文件`,
         detail: `${record.id}${record.status === 'partial' ? ' · 部分成功' : ''}`,
         record,
         picked: false,
@@ -689,7 +681,7 @@ class ExtensionController {
       throw new Error('推送记录中不存在该文件');
     }
     const confirmation = await vscode.window.showWarningMessage(
-      `确认把本地文件 ${remotePath} 恢复到 ${record.id} 推送前？`
+      `确认把本地文件 ${remotePath} 恢复到推送记录“${record.name}”之前？`
         + '此操作不会修改远端和同步基线；恢复后会显示为待推送的本地变更。',
       { modal: true },
       '确认本地回退',
@@ -708,6 +700,54 @@ class ExtensionController {
             : ''}`,
       );
     });
+  }
+
+  private async renamePushRecord(argument?: unknown): Promise<void> {
+    const record = pushRecordFromCommandArgument(argument);
+    if (!record) {
+      throw new Error('未找到要重命名的推送记录');
+    }
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const name = await vscode.window.showInputBox({
+      title: '重命名推送记录',
+      prompt: '推送记录名称',
+      value: record.name,
+      ignoreFocusOut: true,
+      validateInput: value => value.trim() ? undefined : '名称不能为空',
+    });
+    if (name === undefined) {
+      return;
+    }
+    const updated = await this.promotionStore(environment.workspaceFolder)
+      .renamePushRecord(record.id, name);
+    await this.updateViews();
+    vscode.window.showInformationMessage(`Ecode: 推送记录已重命名为“${updated.name}”`);
+  }
+
+  private async deletePushRecord(argument?: unknown): Promise<void> {
+    const record = pushRecordFromCommandArgument(argument);
+    if (!record) {
+      throw new Error('未找到要删除的推送记录');
+    }
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认删除推送记录“${record.name}”？`
+        + '这只会删除该历史记录，不会修改本地、远端、变更集或应用记录。',
+      { modal: true },
+      '确认删除',
+    );
+    if (confirmation !== '确认删除') {
+      return;
+    }
+    await this.promotionStore(environment.workspaceFolder).deletePushRecord(record.id);
+    await this.updateViews();
+    vscode.window.showInformationMessage(`Ecode: 已删除推送记录“${record.name}”`);
   }
 
   private async openPromotionDiff(
@@ -781,20 +821,19 @@ class ExtensionController {
         preflight.files,
       ));
     }
-    const typedName = await vscode.window.showInputBox({
-      title: `应用变更集 ${changeSet.name}`,
-      prompt: `请输入当前环境名称“${target.name}”确认应用 ${artifacts.length} 个文件`,
-      ignoreFocusOut: true,
-      validateInput: value => value === target.name
-        ? undefined
-        : `请输入完整环境名称：${target.name}`,
-    });
-    if (typedName !== target.name) {
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认将变更集“${changeSet.name}”应用到当前环境“${target.name}”？`
+        + `本次将处理 ${artifacts.length} 个文件，写入前仍会执行目标环境预检。`,
+      { modal: true },
+      '确认应用',
+    );
+    if (confirmation !== '确认应用') {
       return;
     }
 
     await this.runExclusive(`正在向 ${target.name} 应用变更...`, async () => {
       const startedAt = new Date().toISOString();
+      const appliedCandidates: PromotionCandidate[] = [];
       const files = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
         title: `Ecode: 应用变更集 ${changeSet.name}`,
@@ -804,6 +843,7 @@ class ExtensionController {
         artifacts,
         message => progress.report({ message }),
         token,
+        candidate => appliedCandidates.push(candidate),
       ));
       const record: DeploymentRecord = {
         schemaVersion: 1,
@@ -816,10 +856,19 @@ class ExtensionController {
         files,
       };
       await promotionStore.saveDeployment(record);
+      const pushRecord = appliedCandidates.length > 0
+        ? await promotionStore.recordPush(
+            target.id,
+            appliedCandidates,
+            artifacts.map(artifact => artifact.path),
+            changeSet.name,
+          )
+        : undefined;
       this.changes = await this.service.refreshLocalChanges();
       if (record.status === 'succeeded') {
         vscode.window.showInformationMessage(
-          `Ecode: 变更集“${changeSet.name}”已成功应用到当前环境 ${target.name}`,
+          `Ecode: 变更集“${changeSet.name}”已成功应用到当前环境 ${target.name}`
+            + `${pushRecord ? `，并保存同名推送记录` : ''}`,
         );
       } else {
         vscode.window.showErrorMessage(formatPromotionFailures(
@@ -1394,7 +1443,7 @@ class ExtensionController {
         pushRecordId: execution.record?.id,
         result: execution.result,
         message: execution.record
-          ? `已保存推送记录 ${execution.record.id}`
+          ? `已保存推送记录“${execution.record.name}”（${execution.record.id}）`
           : '没有文件通过推送后回读验证',
       });
     } catch (error: unknown) {
@@ -1709,6 +1758,21 @@ function isPushRecord(candidate: unknown): candidate is PushRecord {
     && candidate !== null
     && 'environmentId' in candidate
     && 'files' in candidate;
+}
+
+function pushRecordFromCommandArgument(argument: unknown): PushRecord | undefined {
+  if (isPushRecord(argument)) {
+    return argument;
+  }
+  if (
+    typeof argument === 'object'
+    && argument !== null
+    && 'record' in argument
+    && isPushRecord(argument.record)
+  ) {
+    return argument.record;
+  }
+  return undefined;
 }
 
 function isChangeSet(candidate: unknown): candidate is ChangeSet {

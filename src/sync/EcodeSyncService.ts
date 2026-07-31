@@ -46,6 +46,7 @@ interface RemoteScan {
   files: Map<string, RemoteFileContent>;
   presentPaths: Set<string>;
   presentDirectories: Set<string>;
+  ambiguousDirectories: Set<string>;
   unsupported: SyncChange[];
   errors: string[];
 }
@@ -61,6 +62,8 @@ interface RemoteIndex {
   directories: Map<string, RemoteDirectoryEntry>;
   ambiguousDirectories: Set<string>;
   pathCollisions: SyncChange[];
+  observedFilePaths: Set<string>;
+  preloadedFiles: Map<string, RemoteFileContent>;
 }
 
 interface RemoteTreeTask extends RemoteDirectoryEntry {}
@@ -257,6 +260,7 @@ export class EcodeSyncService {
     artifacts: ReleaseArtifact[],
     onProgress: (message: string) => void,
     cancellation?: CancellationLike,
+    onVerifiedCandidate?: (candidate: PromotionCandidate) => void,
   ): Promise<DeploymentFileResult[]> {
     const preflight = await this.verifyRelease(profile, artifacts);
     if (!preflight.success) {
@@ -306,8 +310,10 @@ export class EcodeSyncService {
             remotePathKey(file.path) === remotePathKey(artifact.path));
           let recoveryPath: string | undefined;
           let remoteRecoveryHash: string | undefined;
+          let previousRemote: RemoteFileContent | undefined;
           if (check.status === 'pending' && existing) {
             const current = await this.readRemote(api, existing);
+            previousRemote = current;
             remoteRecoveryHash = current.hash;
             recoveryPath = await this.store.saveRecovery(
               artifact.path,
@@ -388,6 +394,10 @@ export class EcodeSyncService {
             delete context.manifest.files[artifact.path];
             await this.store.deleteConflict(artifact.path);
             await this.store.saveManifest(context.manifest);
+            onVerifiedCandidate?.(releasePromotionCandidate(
+              artifact,
+              previousRemote,
+            ));
             return promotionSucceeded(artifact, recoveryPath);
           }
 
@@ -464,6 +474,10 @@ export class EcodeSyncService {
           await this.store.deleteConflict(artifact.path);
           await this.store.saveManifest(context.manifest);
           remoteIndex.files.set(artifact.path, uploadedEntry);
+          onVerifiedCandidate?.(releasePromotionCandidate(
+            artifact,
+            previousRemote,
+          ));
           return promotionSucceeded(artifact, recoveryPath);
         });
         results.push(result);
@@ -517,6 +531,12 @@ export class EcodeSyncService {
       this.scanRemote(api, onProgress, cancellation),
     );
     this.throwIfCancelled(cancellation);
+    for (const manifestPath of Object.keys(context.manifest.files)) {
+      if ([...remote.ambiguousDirectories].some(directory =>
+        isPathAtOrBelow(manifestPath, directory))) {
+        remote.presentPaths.add(manifestPath);
+      }
+    }
 
     onProgress('正在扫描本地文件...');
     const local = await this.scanLocalFiles(context.syncRoot);
@@ -733,8 +753,7 @@ export class EcodeSyncService {
       }
 
       try {
-        const pathCollision = remoteIndex.pathCollisions.find(item =>
-          remotePathKey(item.path) === remotePathKey(remotePath));
+        const pathCollision = findRemotePathCollision(remoteIndex, remotePath);
         if (pathCollision) {
           throw new Error(pathCollision.message ?? '远端文件与目录路径冲突');
         }
@@ -1205,8 +1224,7 @@ export class EcodeSyncService {
     remoteIndex: RemoteIndex,
     artifact: ReleaseArtifact,
   ): Promise<DeploymentFileResult> {
-    const pathCollision = remoteIndex.pathCollisions.find(change =>
-      remotePathKey(change.path) === remotePathKey(artifact.path));
+    const pathCollision = findRemotePathCollision(remoteIndex, artifact.path);
     if (pathCollision) {
       return promotionConflict(
         artifact,
@@ -1409,7 +1427,10 @@ export class EcodeSyncService {
     const contents = await mapConcurrent([...entries.values()], 4, async entry => {
       this.throwIfCancelled(cancellation);
       try {
-        return await this.readRemote(api, entry);
+        const preloaded = index.preloadedFiles.get(entry.path);
+        return preloaded?.entry.id === entry.id
+          ? preloaded
+          : await this.readRemote(api, entry);
       } catch (error: unknown) {
         if (error instanceof SessionExpiredError) {
           throw error;
@@ -1438,10 +1459,14 @@ export class EcodeSyncService {
           .map(item => [item.entry.path, item]),
       ),
       presentPaths: new Set([
-        ...entries.keys(),
+        ...index.observedFilePaths,
         ...index.pathCollisions.map(change => change.path),
       ]),
-      presentDirectories: new Set(index.directories.keys()),
+      presentDirectories: new Set([
+        ...index.directories.keys(),
+        ...index.ambiguousDirectories,
+      ]),
+      ambiguousDirectories: new Set(index.ambiguousDirectories),
       unsupported,
       errors,
     };
@@ -1467,6 +1492,10 @@ export class EcodeSyncService {
     const root = requireSuccess(rootResponse, '获取远端文件树失败');
     const entries: RemoteFileEntry[] = [];
     const directories: RemoteDirectoryEntry[] = [];
+    const directoryHasDataByNode = new Map<string, boolean>();
+    const traversedPathByNode = new Map<string, string>();
+    const aliasedDirectoryPaths = new Set<string>();
+    const traversalCollisions: SyncChange[] = [];
     let pending: RemoteTreeTask[] = [];
     const system = root.system;
     if (system?.id) {
@@ -1487,8 +1516,41 @@ export class EcodeSyncService {
     let completedDirectories = 0;
     while (pending.length > 0) {
       this.throwIfCancelled(cancellation);
-      const level = pending;
+      const level: RemoteTreeTask[] = [];
+      for (const task of pending) {
+        const nodeKey = remoteDirectoryNodeKey(task);
+        const traversedPath = traversedPathByNode.get(nodeKey);
+        if (traversedPath === undefined) {
+          traversedPathByNode.set(nodeKey, task.path);
+          level.push(task);
+          continue;
+        }
+        if (traversedPath === task.path) {
+          this.output.warn(
+            `远端目录节点重复，已安全去重: ${task.path} `
+              + `(${formatMaskedRemoteIds([task.id])})`,
+          );
+          continue;
+        }
+        if (!aliasedDirectoryPaths.has(task.path)) {
+          aliasedDirectoryPaths.add(task.path);
+          traversalCollisions.push({
+            path: task.path,
+            status: 'unsupported',
+            conflictReason: 'remotePathCollision',
+            message: `远端目录节点同时映射到多个路径，已隔离歧义子树: ${task.path}`,
+          });
+          this.output.warn(
+            `远端目录节点形成重复引用或循环，已隔离: `
+              + `${traversedPath} / ${task.path} `
+              + `(${formatMaskedRemoteIds([task.id])})`,
+          );
+        }
+      }
       pending = [];
+      if (level.length === 0) {
+        continue;
+      }
       const children = await mapConcurrent(level, 4, async task => {
         this.throwIfCancelled(cancellation);
         const payload = requireSuccess(
@@ -1498,6 +1560,12 @@ export class EcodeSyncService {
             : `读取目录失败: ${task.path}`,
         );
         directories.push(task);
+        directoryHasDataByNode.set(
+          remoteDirectoryNodeKey(task),
+          payload.childFile.length > 0
+            || payload.childFolder.length > 0
+            || payload.typeList.length > 0,
+        );
         this.collectFiles(payload.childFile, task.path, entries);
         completedDirectories++;
         onProgress?.(`正在扫描远端目录：已完成 ${completedDirectories} 个`);
@@ -1517,34 +1585,144 @@ export class EcodeSyncService {
       pending.push(...children.flat());
     }
 
-    const filePaths = entries.map(item => item.path);
-    assertNoCaseCollisions(filePaths);
-    if (new Set(filePaths).size !== filePaths.length) {
-      throw new Error('远端文件树包含重复文件路径');
-    }
+    const observedFilePaths = new Set(entries.map(item => item.path));
+    const ambiguousDirectories = new Set(aliasedDirectoryPaths);
+    const pathCollisions: SyncChange[] = [...traversalCollisions];
     const directoryMap = new Map<string, RemoteDirectoryEntry>();
-    const ambiguousDirectories = new Set<string>();
+    const directoriesByPath = new Map<
+      string,
+      Map<string, RemoteDirectoryEntry>
+    >();
     for (const directory of directories) {
-      if (ambiguousDirectories.has(directory.path)) {
-        continue;
-      }
-      const existing = directoryMap.get(directory.path);
-      if (existing && (existing.id !== directory.id || existing.kind !== directory.kind)) {
-        directoryMap.delete(directory.path);
-        ambiguousDirectories.add(directory.path);
-        continue;
-      }
-      directoryMap.set(directory.path, directory);
+      const nodes = directoriesByPath.get(directory.path)
+        ?? new Map<string, RemoteDirectoryEntry>();
+      nodes.set(remoteDirectoryNodeKey(directory), directory);
+      directoriesByPath.set(directory.path, nodes);
     }
-    const allDirectoryPaths = new Set(directories.map(item => item.path));
+    for (const [remotePath, nodesById] of directoriesByPath) {
+      if (ambiguousDirectories.has(remotePath)) {
+        continue;
+      }
+      const nodes = [...nodesById.values()];
+      if (nodes.length === 1) {
+        directoryMap.set(remotePath, nodes[0]);
+        continue;
+      }
+      const populated = nodes.filter(node =>
+        directoryHasDataByNode.get(remoteDirectoryNodeKey(node)) === true);
+      if (populated.length === 1) {
+        directoryMap.set(remotePath, populated[0]);
+        this.output.warn(
+          `远端目录路径重复，已选择唯一有数据节点: ${remotePath} `
+            + `(selected=${formatMaskedRemoteIds([populated[0].id])}; `
+            + `candidates=${formatMaskedRemoteIds(nodes.map(node => node.id))})`,
+        );
+        continue;
+      }
+      ambiguousDirectories.add(remotePath);
+      pathCollisions.push({
+        path: remotePath,
+        status: 'unsupported',
+        conflictReason: 'remotePathCollision',
+        message: `远端目录路径存在多个节点，且无法唯一确定有数据节点，已隔离子树: ${remotePath}`,
+      });
+      this.output.warn(
+        `远端目录路径存在歧义，已隔离子树: ${remotePath} `
+          + `(${formatMaskedRemoteIds(nodes.map(node => node.id))})`,
+      );
+    }
+    for (const directoryPath of [...directoryMap.keys()]) {
+      if ([...ambiguousDirectories].some(ambiguousPath =>
+        isPathAtOrBelow(directoryPath, ambiguousPath))) {
+        directoryMap.delete(directoryPath);
+      }
+    }
+
+    const candidateEntries = entries.filter(entry =>
+      ![...ambiguousDirectories].some(directory =>
+        isPathAtOrBelow(entry.path, directory)));
+    const entriesByPath = new Map<string, RemoteFileEntry[]>();
+    for (const entry of candidateEntries) {
+      const matches = entriesByPath.get(entry.path) ?? [];
+      matches.push(entry);
+      entriesByPath.set(entry.path, matches);
+    }
+    const resolvedEntries: RemoteFileEntry[] = [];
+    const preloadedFiles = new Map<string, RemoteFileContent>();
+    for (const [remotePath, matches] of entriesByPath) {
+      const entriesById = new Map<string, RemoteFileEntry>();
+      for (const entry of matches) {
+        entriesById.set(entry.id, entry);
+      }
+      const uniqueEntries = [...entriesById.values()];
+      if (uniqueEntries.length === 1) {
+        resolvedEntries.push(uniqueEntries[0]);
+        if (matches.length > 1) {
+          this.output.warn(
+            `远端文件节点重复，已安全去重: ${remotePath} `
+              + `(${formatMaskedRemoteIds([uniqueEntries[0].id])})`,
+          );
+        }
+        continue;
+      }
+
+      const inspected = await mapConcurrent(uniqueEntries, 4, async entry => {
+        this.throwIfCancelled(cancellation);
+        try {
+          return {
+            entry,
+            content: await this.readRemote(api, entry),
+          };
+        } catch (error: unknown) {
+          if (error instanceof SessionExpiredError) {
+            throw error;
+          }
+          return { entry, content: undefined };
+        }
+      });
+      const readable = inspected.filter(
+        (item): item is {
+          entry: RemoteFileEntry;
+          content: RemoteFileContent;
+        } => Boolean(item.content),
+      );
+      const populated = readable.filter(item => item.content.content.length > 0);
+      if (readable.length === uniqueEntries.length && populated.length === 1) {
+        const selected = populated[0];
+        resolvedEntries.push(selected.entry);
+        preloadedFiles.set(remotePath, selected.content);
+        this.output.warn(
+          `远端文件路径重复，已选择唯一有数据节点: ${remotePath} `
+            + `(selected=${formatMaskedRemoteIds([selected.entry.id])}; `
+            + `candidates=${formatMaskedRemoteIds(uniqueEntries.map(entry => entry.id))})`,
+        );
+        continue;
+      }
+      pathCollisions.push({
+        path: remotePath,
+        status: 'unsupported',
+        conflictReason: 'remotePathCollision',
+        message: `远端文件路径存在多个节点，且无法唯一确定有数据节点，已标记为不支持: ${remotePath}`,
+      });
+      this.output.warn(
+        `远端文件路径存在歧义，已标记为不支持: ${remotePath} `
+          + `(${formatMaskedRemoteIds(uniqueEntries.map(entry => entry.id))})`,
+      );
+    }
+
+    const allDirectoryPaths = new Set([
+      ...directoryMap.keys(),
+      ...ambiguousDirectories,
+    ]);
     assertNoCaseCollisions(allDirectoryPaths);
     const directoryPathByKey = new Map<string, string>();
     for (const directoryPath of allDirectoryPaths) {
       directoryPathByKey.set(remotePathKey(directoryPath), directoryPath);
     }
-    const collisionKeys = new Set<string>();
-    const pathCollisions: SyncChange[] = [];
-    for (const entry of entries) {
+    const collisionKeys = new Set(
+      pathCollisions.map(change => remotePathKey(change.path)),
+    );
+    for (const entry of resolvedEntries) {
       const directoryPath = directoryPathByKey.get(remotePathKey(entry.path));
       if (!directoryPath) {
         continue;
@@ -1559,14 +1737,29 @@ export class EcodeSyncService {
           ? `远端同一路径同时存在文件和目录，无法映射到本地: ${entry.path}`
           : `远端文件与目录路径仅大小写不同，无法映射到本地: ${entry.path} / ${directoryPath}`,
       });
+      const directory = directoryMap.get(directoryPath);
+      this.output.warn(
+        `远端文件与目录路径冲突，已标记为不支持: `
+          + `${entry.path}${entry.path === directoryPath ? '' : ` / ${directoryPath}`} `
+          + `(${formatMaskedRemoteIds([
+            entry.id,
+            ...(directory ? [directory.id] : []),
+          ])})`,
+      );
     }
-    const safeEntries = entries.filter(entry =>
+    const safeEntries = resolvedEntries.filter(entry =>
       !collisionKeys.has(remotePathKey(entry.path)));
+    const uniquePathCollisions = new Map<string, SyncChange>();
+    for (const collision of pathCollisions) {
+      uniquePathCollisions.set(remotePathKey(collision.path), collision);
+    }
     return {
       files: new Map(safeEntries.map(item => [item.path, item])),
       directories: directoryMap,
       ambiguousDirectories,
-      pathCollisions,
+      pathCollisions: [...uniquePathCollisions.values()],
+      observedFilePaths,
+      preloadedFiles,
     };
   }
 
@@ -2361,8 +2554,55 @@ function joinRemote(parent: string, name: string): string {
   return parent ? `${parent}/${name}` : name;
 }
 
+function remoteDirectoryNodeKey(directory: RemoteDirectoryEntry): string {
+  return `${directory.kind}:${directory.id}`;
+}
+
+function formatMaskedRemoteIds(ids: Iterable<string>): string {
+  return [...new Set(ids)]
+    .sort()
+    .map(maskRemoteId)
+    .join(', ');
+}
+
+function maskRemoteId(id: string): string {
+  if (id.length <= 2) {
+    return `${id.slice(0, 1)}***`;
+  }
+  return `${id.slice(0, 2)}***${id.slice(-2)}`;
+}
+
 function remotePathKey(value: string): string {
   return value.toLocaleLowerCase('en-US');
+}
+
+function isPathAtOrBelow(remotePath: string, directoryPath: string): boolean {
+  return remotePath === directoryPath
+    || isDescendantPath(remotePath, directoryPath);
+}
+
+function findRemotePathCollision(
+  index: RemoteIndex,
+  remotePath: string,
+): SyncChange | undefined {
+  const exact = index.pathCollisions.find(change =>
+    remotePathKey(change.path) === remotePathKey(remotePath));
+  if (exact) {
+    return exact;
+  }
+  const ambiguousDirectory = [...index.ambiguousDirectories].find(directory =>
+    isDescendantPath(remotePathKey(remotePath), remotePathKey(directory)));
+  if (!ambiguousDirectory) {
+    return undefined;
+  }
+  return index.pathCollisions.find(change =>
+    remotePathKey(change.path) === remotePathKey(ambiguousDirectory))
+    ?? {
+      path: ambiguousDirectory,
+      status: 'unsupported',
+      conflictReason: 'remotePathCollision',
+      message: `远端目录路径存在歧义，无法安全写入子树: ${ambiguousDirectory}`,
+    };
 }
 
 function isDescendantPath(remotePath: string, directoryPath: string): boolean {
@@ -2408,6 +2648,23 @@ function promotionPending(artifact: ReleaseArtifact): DeploymentFileResult {
     operation: artifact.operation,
     status: 'pending',
     expectedHash: artifact.baseHash,
+  };
+}
+
+function releasePromotionCandidate(
+  artifact: ReleaseArtifact,
+  previousRemote: RemoteFileContent | undefined,
+): PromotionCandidate {
+  const hasResult = artifact.operation !== 'delete';
+  return {
+    path: artifact.path,
+    operation: previousRemote
+      ? hasResult ? 'modify' : 'delete'
+      : 'add',
+    baseHash: previousRemote?.hash,
+    baseContent: previousRemote?.content,
+    resultHash: hasResult ? artifact.resultHash : undefined,
+    resultContent: hasResult ? artifact.resultContent : undefined,
   };
 }
 

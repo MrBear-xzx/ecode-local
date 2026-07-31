@@ -44,6 +44,7 @@ suite('Ecode UI models', () => {
     const pushRecord: PushRecord = {
       schemaVersion: 1,
       id: 'PUSH-20260730120000-test',
+      name: '采购校验推送',
       environmentId: environment.id,
       createdAt: '2026-07-30T12:00:00.000Z',
       status: 'succeeded',
@@ -135,6 +136,7 @@ suite('Ecode UI models', () => {
     assert.strictEqual(themeIconId(provider.getTreeItem(promotion!)), 'git-pull-request');
     assert.strictEqual(themeIconId(provider.getTreeItem(pushGroup!)), 'history');
     assert.strictEqual(pushItem?.command, undefined);
+    assert.strictEqual(pushItem?.label, pushRecord.name);
     assert.strictEqual(pushItem?.contextValue, 'ecode.pushRecord');
     assert.strictEqual(pushFile?.command?.command, 'ecode.openPromotionDiff');
     assert.strictEqual(pushFile?.contextValue, 'ecode.pushRecordFile');
