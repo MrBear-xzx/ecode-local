@@ -170,6 +170,7 @@ export interface ChangeSet {
 export interface PushRecord {
   schemaVersion: 1;
   id: string;
+  name: string;
   environmentId: string;
   createdAt: string;
   status: 'succeeded' | 'partial';

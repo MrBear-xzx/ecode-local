@@ -105,11 +105,13 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
 
     if (element.type === 'pushRecord') {
       const item = new vscode.TreeItem(
-        new Date(element.record.createdAt).toLocaleString(),
+        element.record.name,
         vscode.TreeItemCollapsibleState.Collapsed,
       );
-      item.description = `${element.record.files.length} 个文件`;
-      item.tooltip = `${element.record.id}\n展开查看推送文件和具体变更`;
+      item.description = `${new Date(element.record.createdAt).toLocaleString()} · `
+        + `${element.record.files.length} 个文件`;
+      item.tooltip = `${element.record.name}\n${element.record.id}\n`
+        + '展开查看推送文件和具体变更；右侧按钮可重命名或删除记录';
       item.contextValue = 'ecode.pushRecord';
       item.iconPath = element.record.status === 'partial'
         ? themeIcon('warning', 'charts.yellow')

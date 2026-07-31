@@ -117,6 +117,7 @@ export class PromotionStore {
     environmentId: string,
     candidates: PromotionCandidate[],
     requestedPaths: string[],
+    name?: string,
   ): Promise<PushRecord> {
     if (candidates.length === 0) {
       throw new Error('没有成功推送并回读验证的文件，无法生成推送记录');
@@ -142,6 +143,7 @@ export class PromotionStore {
     const record: PushRecord = {
       schemaVersion: 1,
       id: `PUSH-${compactTimestamp(now)}-${randomUUID().slice(0, 8)}`,
+      name: normalizePushRecordName(name, now),
       environmentId,
       createdAt: now,
       status: requestedPaths.every(item => successfulPaths.has(item))
@@ -157,8 +159,40 @@ export class PromotionStore {
   async listPushRecords(environmentId?: string): Promise<PushRecord[]> {
     const records = await this.listEntities<PushRecord>('push-records');
     return records
+      .map(normalizeStoredPushRecord)
       .filter(record => !environmentId || record.environmentId === environmentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async renamePushRecord(id: string, name: string): Promise<PushRecord> {
+    const record = await this.readEntity<PushRecord>('push-records', id);
+    if (!record) {
+      throw new Error('推送记录不存在或已删除');
+    }
+    const normalizedName = name.trim();
+    if (!normalizedName) {
+      throw new Error('推送记录名称不能为空');
+    }
+    const updated = {
+      ...normalizeStoredPushRecord(record),
+      name: normalizedName,
+    };
+    await this.writeEntity('push-records', id, updated);
+    return updated;
+  }
+
+  async deletePushRecord(id: string): Promise<void> {
+    if (!isEntityId(id)) {
+      throw new Error('推送记录标识无效');
+    }
+    try {
+      await fs.unlink(path.join(this.root, 'push-records', `${id}.json`));
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('推送记录不存在或已删除');
+      }
+      throw error;
+    }
   }
 
   async materializePushRecord(
@@ -313,6 +347,21 @@ async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
 
 function compactTimestamp(iso: string): string {
   return iso.replace(/\D/g, '').slice(0, 14);
+}
+
+function normalizePushRecordName(name: string | undefined, createdAt: string): string {
+  const normalized = name?.trim();
+  return normalized || new Date(createdAt).toLocaleString();
+}
+
+function normalizeStoredPushRecord(record: PushRecord): PushRecord {
+  const storedName = (record as PushRecord & { name?: unknown }).name;
+  return {
+    ...record,
+    name: typeof storedName === 'string' && storedName.trim()
+      ? storedName.trim()
+      : new Date(record.createdAt).toLocaleString(),
+  };
 }
 
 function isEntityId(value: string): boolean {

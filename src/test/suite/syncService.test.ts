@@ -8,6 +8,7 @@ import type { FormMetadataCache } from '../../domain/formMetadata';
 import { hashText } from '../../domain/text';
 import type {
   ConnectionProfile,
+  PromotionCandidate,
   ReleaseArtifact,
   StoredConflict,
   SyncManifest,
@@ -41,6 +42,7 @@ suite('Ecode sync service', () => {
   let rootTreeRequests: number;
   let updateFileRequests: number;
   let folderDeleteRequests: number;
+  let folderTreeRequests: Map<string, number>;
   let requestedFormIds: string[];
 
   setup(async () => {
@@ -57,6 +59,7 @@ suite('Ecode sync service', () => {
     rootTreeRequests = 0;
     updateFileRequests = 0;
     folderDeleteRequests = 0;
+    folderTreeRequests = new Map();
     requestedFormIds = [];
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
@@ -82,18 +85,12 @@ suite('Ecode sync service', () => {
         }));
         return;
       }
-      if (
-        url.pathname === '/api/ecode/type/tree' &&
-        ['folder-1', 'folder-2'].includes(url.searchParams.get('folderId') ?? '')
-      ) {
-        response.end(JSON.stringify({
-          status: true,
-          data: { typeList: [], childFolder: [], childFile: [] },
-        }));
-        return;
-      }
       if (url.pathname === '/api/ecode/type/tree' && url.searchParams.has('folderId')) {
         const folderId = url.searchParams.get('folderId') ?? '';
+        folderTreeRequests.set(
+          folderId,
+          (folderTreeRequests.get(folderId) ?? 0) + 1,
+        );
         response.end(JSON.stringify({
           status: true,
           data: {
@@ -393,7 +390,7 @@ suite('Ecode sync service', () => {
     assert.strictEqual(harness.authState.reconnects, 1);
   });
 
-  test('pulls files when the server repeats an ambiguous directory path', async () => {
+  test('isolates ambiguous empty remote directories and continues pulling safe files', async () => {
     duplicateFolders = true;
     const harness = createHarness(root, baseUrl);
 
@@ -401,9 +398,225 @@ suite('Ecode sync service', () => {
 
     assert.strictEqual(result.success, true);
     assert.strictEqual(result.pulled, 1);
+    assert.strictEqual(result.unsupported, 1);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'a.js'), 'utf8'),
+      'const remote = true;\n',
+    );
+    assert.ok(harness.service.getLastPlan()?.blocked.some(change =>
+      change.path === 'Type/Duplicate'
+        && change.status === 'unsupported'));
   });
 
-  test('continues pulling when a remote file and directory share one path', async () => {
+  test('deduplicates an identical remote file node before pulling', async () => {
+    files.push({ ...files[0] });
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 1);
+    assert.strictEqual(result.unsupported, 0);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'a.js'), 'utf8'),
+      'const remote = true;\n',
+    );
+  });
+
+  test('deduplicates an identical remote directory task before traversing it', async () => {
+    folders = [
+      { id: 'folder-10', name: 'Same', parentId: 'type-1' },
+      { id: 'folder-10', name: 'Same', parentId: 'type-1' },
+    ];
+    files.push({
+      id: 'file-2',
+      name: 'inside.js',
+      content: 'const inside = true;\n',
+      parentId: 'folder-10',
+    });
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 2);
+    assert.strictEqual(result.unsupported, 0);
+    assert.strictEqual(folderTreeRequests.get('folder-10'), 1);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'Same', 'inside.js'), 'utf8'),
+      'const inside = true;\n',
+    );
+  });
+
+  test('isolates a repeated remote directory node that would form a cycle', async () => {
+    folders = [
+      { id: 'folder-10', name: 'Cycle', parentId: 'type-1' },
+      { id: 'folder-10', name: 'Nested', parentId: 'folder-10' },
+    ];
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 1);
+    assert.strictEqual(result.unsupported, 1);
+    assert.ok(harness.service.getLastPlan()?.blocked.some(change =>
+      change.path === 'Type/Cycle/Nested'
+        && change.status === 'unsupported'));
+  });
+
+  test('allows the same file name in different remote directories', async () => {
+    folders = [
+      { id: 'folder-10', name: 'First', parentId: 'type-1' },
+      { id: 'folder-20', name: 'Second', parentId: 'type-1' },
+    ];
+    files.push(
+      {
+        id: 'file-2',
+        name: 'a.js',
+        content: 'const first = true;\n',
+        parentId: 'folder-10',
+      },
+      {
+        id: 'file-3',
+        name: 'a.js',
+        content: 'const second = true;\n',
+        parentId: 'folder-20',
+      },
+    );
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 3);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'First', 'a.js'), 'utf8'),
+      'const first = true;\n',
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'Second', 'a.js'), 'utf8'),
+      'const second = true;\n',
+    );
+  });
+
+  test('selects the only populated file when different nodes share one path', async () => {
+    files.push({
+      id: 'file-2',
+      name: 'a.js',
+      content: '',
+    });
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 1);
+    assert.strictEqual(result.unsupported, 0);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'a.js'), 'utf8'),
+      'const remote = true;\n',
+    );
+  });
+
+  test('isolates ambiguous files, logs masked ids, and pulls safe files', async () => {
+    files.push(
+      {
+        id: 'file-2',
+        name: 'a.js',
+        content: 'const ambiguous = true;\n',
+      },
+      {
+        id: 'file-3',
+        name: 'safe.js',
+        content: 'const safe = true;\n',
+      },
+    );
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 1);
+    assert.strictEqual(result.unsupported, 1);
+    assert.strictEqual(fs.existsSync(path.join(root, 'ecode', 'Type', 'a.js')), false);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'safe.js'), 'utf8'),
+      'const safe = true;\n',
+    );
+    const warnings = harness.logs.warnings.join('\n');
+    assert.match(warnings, /Type\/a\.js/);
+    assert.match(warnings, /fi\*\*\*-1/);
+    assert.match(warnings, /fi\*\*\*-2/);
+    assert.doesNotMatch(warnings, /file-1|file-2/);
+  });
+
+  test('selects the only populated directory when different nodes share one path', async () => {
+    duplicateFolders = true;
+    files.push({
+      id: 'file-2',
+      name: 'inside.js',
+      content: 'const inside = true;\n',
+      parentId: 'folder-1',
+    });
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 2);
+    assert.strictEqual(result.unsupported, 0);
+    assert.strictEqual(
+      fs.readFileSync(
+        path.join(root, 'ecode', 'Type', 'Duplicate', 'inside.js'),
+        'utf8',
+      ),
+      'const inside = true;\n',
+    );
+  });
+
+  test('isolates an ambiguous directory subtree without deleting tracked files', async () => {
+    folders = [{ id: 'folder-1', name: 'Duplicate', parentId: 'type-1' }];
+    files.push({
+      id: 'file-2',
+      name: 'existing.js',
+      content: 'const existing = true;\n',
+      parentId: 'folder-1',
+    });
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    duplicateFolders = true;
+    files.push({
+      id: 'file-3',
+      name: 'other.js',
+      content: 'const other = true;\n',
+      parentId: 'folder-2',
+    });
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedLocal, 0);
+    assert.strictEqual(result.unsupported, 1);
+    assert.strictEqual(
+      fs.readFileSync(
+        path.join(root, 'ecode', 'Type', 'Duplicate', 'existing.js'),
+        'utf8',
+      ),
+      'const existing = true;\n',
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(root, 'ecode', 'Type', 'Duplicate', 'other.js')),
+      false,
+    );
+    const warnings = harness.logs.warnings.join('\n');
+    assert.match(warnings, /Type\/Duplicate/);
+    assert.match(warnings, /fo\*\*\*-1/);
+    assert.match(warnings, /fo\*\*\*-2/);
+    assert.doesNotMatch(warnings, /folder-1|folder-2/);
+  });
+
+  test('isolates a file-directory collision and continues pulling safe files', async () => {
     folders = [{ id: 'folder-10', name: 'Collision', parentId: 'type-1' }];
     files.push(
       {
@@ -430,12 +643,9 @@ suite('Ecode sync service', () => {
       fs.readFileSync(path.join(root, 'ecode', 'Type', 'Collision', 'inside.js'), 'utf8'),
       'const inside = true;\n',
     );
-    const unsupported = harness.service.getLastPlan()?.changes.find(change =>
-      change.path === 'Type/Collision' && change.status === 'unsupported');
-    assert.match(unsupported?.message ?? '', /同时存在文件和目录/);
   });
 
-  test('blocks additions below an ambiguous remote directory path', async () => {
+  test('blocks pushes while a duplicate remote directory path exists', async () => {
     duplicateFolders = true;
     const localPath = path.join(root, 'ecode', 'Type', 'Duplicate', 'new.js');
     fs.mkdirSync(path.dirname(localPath), { recursive: true });
@@ -449,7 +659,7 @@ suite('Ecode sync service', () => {
 
     assert.strictEqual(result.pushed, 0);
     assert.strictEqual(result.failed, 1);
-    assert.match(result.errors[0], /多个节点/);
+    assert.match(result.errors[0], /Type\/Duplicate.*多个节点/);
   });
 
   test('keeps a different initial local file and records a conflict', async () => {
@@ -660,10 +870,13 @@ suite('Ecode sync service', () => {
       await harness.store.getProfile(),
       [artifact],
     );
+    const appliedCandidates: PromotionCandidate[] = [];
     const results = await harness.service.deployRelease(
       await harness.store.getProfile(),
       [artifact],
       () => undefined,
+      undefined,
+      candidate => appliedCandidates.push(candidate),
     );
 
     assert.strictEqual(preflight.success, true);
@@ -682,6 +895,14 @@ suite('Ecode sync service', () => {
       harness.store.manifest.files['Type/a.js'].baselineHash,
       artifact.resultHash,
     );
+    assert.deepStrictEqual(appliedCandidates, [{
+      path: 'Type/a.js',
+      operation: 'modify',
+      baseHash: hashText('const remote = true;\n'),
+      baseContent: 'const remote = true;\n',
+      resultHash: artifact.resultHash,
+      resultContent: artifact.resultContent,
+    }]);
   });
 
   test('publishes frozen additions and deletions by remote path', async () => {
@@ -774,7 +995,7 @@ suite('Ecode sync service', () => {
     );
   });
 
-  test('does not write any release file when a target path has a structural conflict', async () => {
+  test('does not write any release file when remote names conflict', async () => {
     folders = [{
       id: 'folder-10',
       name: 'Collision',
@@ -787,7 +1008,6 @@ suite('Ecode sync service', () => {
       parentId: 'type-1',
     });
     const harness = createHarness(root, baseUrl);
-    await harness.service.pull(() => undefined);
     const artifacts: ReleaseArtifact[] = [{
       path: 'Type/Collision',
       operation: 'modify',
@@ -808,7 +1028,9 @@ suite('Ecode sync service', () => {
       () => undefined,
     );
 
-    assert.ok(results.some(result => result.status === 'conflict'));
+    assert.strictEqual(results[0].status, 'conflict');
+    assert.match(results[0].message ?? '', /Type\/Collision/);
+    assert.strictEqual(results[1].status, 'pending');
     assert.strictEqual(files[0].content, 'const remote = true;\n');
     assert.strictEqual(files[1].content, 'const collision = true;\n');
     assert.deepStrictEqual(harness.store.recoveries, []);
@@ -1398,6 +1620,7 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
   service: EcodeSyncService;
   store: MemoryStore;
   authState: { reconnects: number };
+  logs: { warnings: string[] };
 } {
   const profile: ConnectionProfile = {
     version: 4,
@@ -1417,9 +1640,10 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
       return client;
     },
   } as unknown as AuthManager;
+  const logs = { warnings: [] as string[] };
   const output = {
     info: () => undefined,
-    warn: () => undefined,
+    warn: (message: unknown) => logs.warnings.push(String(message)),
     error: () => undefined,
   };
   return {
@@ -1430,6 +1654,7 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
     ),
     store,
     authState,
+    logs,
   };
 }
 

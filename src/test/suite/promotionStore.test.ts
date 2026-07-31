@@ -100,9 +100,10 @@ suite('Promotion store', () => {
       baseContent: before,
       resultHash: hashText(after),
       resultContent: after,
-    }], ['Type/a.js', 'Type/failed.js']);
+    }], ['Type/a.js', 'Type/failed.js'], '采购校验推送');
 
     assert.strictEqual(record.status, 'partial');
+    assert.strictEqual(record.name, '采购校验推送');
     assert.deepStrictEqual(
       (await store.listPushRecords('environment-a')).map(item => item.id),
       [record.id],
@@ -116,6 +117,51 @@ suite('Promotion store', () => {
       resultHash: hashText(after),
       resultContent: after,
     }]);
+  });
+
+  test('defaults, renames, and deletes push record names', async () => {
+    const record = await store.recordPush('environment-a', [{
+      path: 'Type/a.js',
+      operation: 'add',
+      resultHash: hashText('source'),
+      resultContent: 'source',
+    }], ['Type/a.js'], '   ');
+
+    assert.strictEqual(record.name, new Date(record.createdAt).toLocaleString());
+    const renamed = await store.renamePushRecord(record.id, '  发布采购校验  ');
+    assert.strictEqual(renamed.name, '发布采购校验');
+    assert.strictEqual((await store.listPushRecords())[0].name, '发布采购校验');
+
+    await store.deletePushRecord(record.id);
+    assert.deepStrictEqual(await store.listPushRecords(), []);
+    await assert.rejects(
+      store.deletePushRecord(record.id),
+      /不存在或已删除/,
+    );
+  });
+
+  test('uses the original timestamp label for legacy unnamed push records', async () => {
+    const createdAt = '2026-07-30T12:00:00.000Z';
+    const recordDirectory = path.join(
+      root,
+      '.ecode-local',
+      'promotion',
+      'push-records',
+    );
+    fs.mkdirSync(recordDirectory, { recursive: true });
+    fs.writeFileSync(path.join(recordDirectory, 'PUSH-legacy.json'), JSON.stringify({
+      schemaVersion: 1,
+      id: 'PUSH-legacy',
+      environmentId: 'environment-a',
+      createdAt,
+      status: 'succeeded',
+      requestedPaths: [],
+      files: [],
+    }));
+
+    const records = await store.listPushRecords();
+
+    assert.strictEqual(records[0].name, new Date(createdAt).toLocaleString());
   });
 
   test('can compose a change set from an earlier push record', async () => {

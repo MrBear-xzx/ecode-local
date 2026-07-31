@@ -32,6 +32,8 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.pull'));
     assert.ok(commands.includes('ecode.refreshChanges'));
     assert.ok(commands.includes('ecode.pushSelected'));
+    assert.ok(commands.includes('ecode.renamePushRecord'));
+    assert.ok(commands.includes('ecode.deletePushRecord'));
     assert.ok(commands.includes('ecode.rollbackPushFile'));
     assert.ok(commands.includes('ecode.openPromotionDiff'));
     assert.ok(commands.includes('ecode.openDiff'));

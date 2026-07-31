@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -35,6 +35,8 @@
     "onCommand:ecode.refreshChanges",
     "onCommand:ecode.pushSelected",
     "onCommand:ecode.rollbackPushFile",
+    "onCommand:ecode.renamePushRecord",
+    "onCommand:ecode.deletePushRecord",
     "onCommand:ecode.openDiff",
     "onCommand:ecode.revertChange",
     "onCommand:ecode.resolveConflict",
@@ -88,6 +90,16 @@
         "command": "ecode.rollbackPushFile",
         "title": "Ecode: 回退此文件到推送前",
         "icon": "$(discard)"
+      },
+      {
+        "command": "ecode.renamePushRecord",
+        "title": "Ecode: 重命名推送记录",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "ecode.deletePushRecord",
+        "title": "Ecode: 删除推送记录",
+        "icon": "$(trash)"
       },
       {
         "command": "ecode.openDiff",
@@ -166,6 +178,14 @@
       "commandPalette": [
         {
           "command": "ecode.rollbackPushFile",
+          "when": "false"
+        },
+        {
+          "command": "ecode.renamePushRecord",
+          "when": "false"
+        },
+        {
+          "command": "ecode.deletePushRecord",
           "when": "false"
         }
       ],
@@ -256,6 +276,16 @@
           "command": "ecode.rollbackPushFile",
           "when": "view == ecode.workspace && viewItem == ecode.pushRecordFile",
           "group": "inline@1"
+        },
+        {
+          "command": "ecode.renamePushRecord",
+          "when": "view == ecode.workspace && viewItem == ecode.pushRecord",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.deletePushRecord",
+          "when": "view == ecode.workspace && viewItem == ecode.pushRecord",
+          "group": "inline@2"
         },
         {
           "command": "ecode.applyChangeSet",
