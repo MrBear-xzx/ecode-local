@@ -232,6 +232,8 @@ suite('Workspace store', () => {
   });
 
   test('scopes stored conflicts to each environment directory', async () => {
+    const developmentRoot = path.join(workspaceFolder, 'dev');
+    const targetRoot = path.join(workspaceFolder, 'target');
     const conflict: StoredConflict = {
       path: 'Type/a.js',
       remoteId: 'file-1',
@@ -241,22 +243,25 @@ suite('Workspace store', () => {
       reason: 'bothModified',
     };
 
-    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
-    await store.saveConflict(conflict);
-    assert.strictEqual((await store.listConflicts()).length, 1);
+    await store.loadManifest('identity-a', developmentRoot);
+    await store.saveConflict(developmentRoot, conflict);
+    assert.strictEqual((await store.listConflicts(developmentRoot)).length, 1);
 
-    await store.loadManifest('identity-b', path.join(workspaceFolder, 'target'));
-    assert.strictEqual((await store.listConflicts()).length, 0);
+    await store.loadManifest('identity-b', targetRoot);
+    assert.strictEqual((await store.listConflicts(targetRoot)).length, 0);
 
-    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
-    assert.strictEqual((await store.loadConflict('Type/a.js'))?.remoteId, 'file-1');
+    assert.strictEqual(
+      (await store.loadConflict(developmentRoot, 'Type/a.js'))?.remoteId,
+      'file-1',
+    );
   });
 
   test('keeps distinct recovery copies created for the same file', async () => {
-    await store.loadManifest('identity-a', path.join(workspaceFolder, 'dev'));
+    const syncRoot = path.join(workspaceFolder, 'dev');
+    await store.loadManifest('identity-a', syncRoot);
 
-    const first = await store.saveRecovery('Type/a.js', 'remote version');
-    const second = await store.saveRecovery('Type/a.js', 'local version');
+    const first = await store.saveRecovery(syncRoot, 'Type/a.js', 'remote version');
+    const second = await store.saveRecovery(syncRoot, 'Type/a.js', 'local version');
 
     assert.notStrictEqual(first, second);
     assert.strictEqual(fs.readFileSync(first, 'utf8'), 'remote version');

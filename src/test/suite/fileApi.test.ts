@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import * as http from 'http';
-import { AddressInfo } from 'net';
+import { type AddressInfo } from 'net';
 import { EcodeApiClient } from '../../sync/api/EcodeApiClient';
 import { FileApi } from '../../sync/api/FileApi';
 
@@ -64,7 +64,7 @@ suite('File API', () => {
         request.method === 'POST'
         && request.url === '/api/workflow/formSetting/fieldSet/getFieldList'
       ) {
-        collectForm(request).then(form => {
+        respondWithForm(request, response, form => {
           posted.set(request.url ?? '', form);
           response.end(JSON.stringify({
             status: true,
@@ -75,7 +75,7 @@ suite('File API', () => {
         request.method === 'POST'
         && request.url === '/api/ec/dev/table/datas'
       ) {
-        collectForm(request).then(form => {
+        respondWithForm(request, response, form => {
           posted.set(request.url ?? '', form);
           response.end(JSON.stringify({
             status: true,
@@ -107,7 +107,7 @@ suite('File API', () => {
           }));
         });
       } else if (request.method === 'POST' && request.url?.startsWith('/api/cloudstore/ecode/')) {
-        collectForm(request).then(form => {
+        respondWithForm(request, response, form => {
           posted.set(request.url ?? '', form);
           if (request.url === '/api/cloudstore/ecode/rejected') {
             response.end(JSON.stringify({ api_status: false, code: '214', msg: 'rejected' }));
@@ -278,4 +278,15 @@ async function collectForm(request: http.IncomingMessage): Promise<URLSearchPara
     chunks.push(Buffer.from(chunk));
   }
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+}
+
+function respondWithForm(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  respond: (form: URLSearchParams) => void,
+): void {
+  void collectForm(request).then(respond, error => {
+    response.statusCode = 500;
+    response.end(JSON.stringify({ status: false, msg: String(error) }));
+  });
 }

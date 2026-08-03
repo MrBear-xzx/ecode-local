@@ -128,10 +128,11 @@ AI 只有在用户明确授权推送时才能创建 `.ecode-local/ai-requests/<i
 
 ```bash
 npm run build
+npm run lint
 npx tsc --noEmit
 npm test
 ```
 
-使用现有 `package-lock.json` 和 npm 工作流。当前没有 ESLint 配置，`npm run lint` 不能作为有效验证。
+使用现有 `package-lock.json` 和 npm 工作流。`npm run lint`、严格类型检查和扩展宿主测试均应在提交前通过。
 
 兼容 VS Code 1.93+、泛微 E-cology 9 Ecode 和 0.6 项目格式；JavaScript/JSX 编译行为以 Ecode Babel 7.5.5 为准。

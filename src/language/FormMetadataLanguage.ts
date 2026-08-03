@@ -10,7 +10,7 @@ import type {
   FormReferenceRole,
 } from './formKnowledge';
 import {
-  WorkspaceFormMetadataRegistry,
+  type WorkspaceFormMetadataRegistry,
 } from './WorkspaceFormMetadataRegistry';
 
 interface FieldCandidate {

@@ -23,13 +23,13 @@ import {
   validateEnvironmentDirectory,
 } from '../domain/paths';
 import { hashText } from '../domain/text';
+import { writeJsonAtomic, writeTextAtomic } from './AtomicFileStore';
 
 const MANIFEST_FILE = 'sync-manifest.json';
 const FORM_METADATA_FILE = 'form-metadata.json';
 
 export class WorkspaceStore {
   private workspaceFolder: string | undefined;
-  private activeEnvironmentRoot: string | undefined;
   private readonly checkedGitIgnoreRoots = new Set<string>();
 
   constructor(workspaceFolder?: string) {
@@ -38,7 +38,6 @@ export class WorkspaceStore {
 
   setWorkspaceFolder(workspaceFolder: string): void {
     this.workspaceFolder = path.resolve(workspaceFolder);
-    this.activeEnvironmentRoot = undefined;
   }
 
   async getProfile(): Promise<ConnectionProfile | undefined> {
@@ -145,7 +144,6 @@ export class WorkspaceStore {
       ...configuration,
       activeEnvironmentId: id,
     });
-    this.activeEnvironmentRoot = undefined;
     return toEnvironmentProfile(workspaceFolder, environment);
   }
 
@@ -233,9 +231,9 @@ export class WorkspaceStore {
     );
   }
 
-  async saveSnapshot(content: string): Promise<string> {
+  async saveSnapshot(syncRoot: string, content: string): Promise<string> {
     const key = hashText(content);
-    const directory = path.join(await this.requireEnvironmentRoot(), 'snapshots');
+    const directory = path.join(await this.environmentStorageRoot(syncRoot), 'snapshots');
     await fs.mkdir(directory, { recursive: true });
     const file = path.join(directory, `${key}.txt`);
     try {
@@ -244,29 +242,32 @@ export class WorkspaceStore {
       if (!isFileSystemError(error, 'ENOENT')) {
         throw error;
       }
-      await fs.writeFile(file, content, 'utf8');
+      await writeTextAtomic(file, content);
     }
     return key;
   }
 
-  async readSnapshot(key: string): Promise<string> {
+  async readSnapshot(syncRoot: string, key: string): Promise<string> {
     return fs.readFile(
-      path.join(await this.requireEnvironmentRoot(), 'snapshots', `${key}.txt`),
+      path.join(await this.environmentStorageRoot(syncRoot), 'snapshots', `${key}.txt`),
       'utf8',
     );
   }
 
-  async saveConflict(conflict: StoredConflict): Promise<void> {
-    const directory = path.join(await this.requireEnvironmentRoot(), 'conflicts');
+  async saveConflict(syncRoot: string, conflict: StoredConflict): Promise<void> {
+    const directory = path.join(await this.environmentStorageRoot(syncRoot), 'conflicts');
     await fs.mkdir(directory, { recursive: true });
     await writeJsonAtomic(path.join(directory, `${hashText(conflict.path)}.json`), conflict);
   }
 
-  async loadConflict(remotePath: string): Promise<StoredConflict | undefined> {
+  async loadConflict(
+    syncRoot: string,
+    remotePath: string,
+  ): Promise<StoredConflict | undefined> {
     try {
       const raw = await fs.readFile(
         path.join(
-          await this.requireEnvironmentRoot(),
+          await this.environmentStorageRoot(syncRoot),
           'conflicts',
           `${hashText(remotePath)}.json`,
         ),
@@ -281,8 +282,8 @@ export class WorkspaceStore {
     }
   }
 
-  async listConflicts(): Promise<StoredConflict[]> {
-    const directory = path.join(await this.requireEnvironmentRoot(), 'conflicts');
+  async listConflicts(syncRoot: string): Promise<StoredConflict[]> {
+    const directory = path.join(await this.environmentStorageRoot(syncRoot), 'conflicts');
     try {
       const names = await fs.readdir(directory);
       const values = await Promise.all(names
@@ -305,10 +306,10 @@ export class WorkspaceStore {
     }
   }
 
-  async deleteConflict(remotePath: string): Promise<void> {
+  async deleteConflict(syncRoot: string, remotePath: string): Promise<void> {
     try {
       await fs.unlink(path.join(
-        await this.requireEnvironmentRoot(),
+        await this.environmentStorageRoot(syncRoot),
         'conflicts',
         `${hashText(remotePath)}.json`,
       ));
@@ -319,8 +320,12 @@ export class WorkspaceStore {
     }
   }
 
-  async saveRecovery(remotePath: string, content: string): Promise<string> {
-    const directory = path.join(await this.requireEnvironmentRoot(), 'recovery');
+  async saveRecovery(
+    syncRoot: string,
+    remotePath: string,
+    content: string,
+  ): Promise<string> {
+    const directory = path.join(await this.environmentStorageRoot(syncRoot), 'recovery');
     await fs.mkdir(directory, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const baseName = `${stamp}-${hashText(remotePath).slice(0, 12)}`;
@@ -387,18 +392,9 @@ export class WorkspaceStore {
       workspaceFolder,
       environmentDirectory,
     );
-    this.activeEnvironmentRoot = environmentRoot;
     await this.ensureGitIgnore(workspaceFolder);
     await fs.mkdir(environmentRoot, { recursive: true });
     return environmentRoot;
-  }
-
-  private async requireEnvironmentRoot(): Promise<string> {
-    if (!this.activeEnvironmentRoot) {
-      throw new Error('同步清单尚未加载，无法确定环境存储目录');
-    }
-    await fs.mkdir(this.activeEnvironmentRoot, { recursive: true });
-    return this.activeEnvironmentRoot;
   }
 
   private requireWorkspaceFolder(candidate?: string): string {
@@ -445,17 +441,6 @@ export class WorkspaceStore {
       // Git 忽略规则是辅助保护，失败不阻断同步。
     }
   }
-}
-
-async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
-  await writeTextAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-async function writeTextAtomic(file: string, content: string): Promise<void> {
-  const temporary = `${file}.tmp`;
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(temporary, content, 'utf8');
-  await fs.rename(temporary, file);
 }
 
 export function updateGitIgnoreForEcodeLocal(current: string): string {

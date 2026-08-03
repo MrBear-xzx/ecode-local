@@ -3,14 +3,10 @@ import { randomUUID } from 'crypto';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
-  AI_PUSH_REQUEST_DIRECTORY,
-  AI_PUSH_RESULT_DIRECTORY,
-  type AiPushRequest,
-  type AiPushResult,
-  parseAiPushRequest,
-} from './ai/AiPushRequest';
+  AiPushRequestController,
+  type PushExecution,
+} from './ai/AiPushRequestController';
 import { AiSupportService } from './ai/AiSupportService';
-import { ECODE_LOCAL_DIRECTORY } from './domain/constants';
 import {
   resolveEnvironmentSourceRoot,
   resolveSafeLocalPath,
@@ -53,11 +49,6 @@ import {
 } from './ui/VirtualDocumentProvider';
 
 let output: vscode.LogOutputChannel;
-
-interface PushExecution {
-  result: SyncOperationResult;
-  record?: PushRecord;
-}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel('Ecode', { log: true });
@@ -176,8 +167,7 @@ class ExtensionController {
   private busy = false;
   private changes: SyncChange[] = [];
   private localWatcher: vscode.Disposable | undefined;
-  private aiPushWatcher: vscode.Disposable | undefined;
-  private readonly processingAiPushRequests = new Set<string>();
+  private readonly aiPushRequests: AiPushRequestController;
   private localRefreshTimer: NodeJS.Timeout | undefined;
   private aiRefreshTimer: NodeJS.Timeout | undefined;
   private lastAiSupportError: string | undefined;
@@ -192,7 +182,26 @@ class ExtensionController {
     private readonly formMetadataRegistry: WorkspaceFormMetadataRegistry,
     private readonly aiSupport: AiSupportService,
     private readonly promotionDiff: PromotionDiffProvider,
-  ) {}
+  ) {
+    this.aiPushRequests = new AiPushRequestController(
+      store,
+      service,
+      output,
+      () => this.busy,
+      changes => {
+        this.changes = changes;
+      },
+      isPushableChange,
+      (profile, environment, selectedPaths, promotionCandidates) =>
+        this.executePush(
+          profile,
+          environment,
+          selectedPaths,
+          promotionCandidates,
+        ),
+      showResult,
+    );
+  }
 
   registerCommands(): vscode.Disposable[] {
     return [
@@ -257,7 +266,7 @@ class ExtensionController {
         output.warn(`Initial local scan failed: ${errorMessage(error)}`);
       }
       this.configureLocalWatcher(profile);
-      this.configureAiPushWatcher(profile.workspaceFolder);
+      this.aiPushRequests.configure(profile.workspaceFolder);
       await this.refreshAiSupport(false);
     }
     await this.updateViews();
@@ -266,8 +275,7 @@ class ExtensionController {
   dispose(): void {
     this.localWatcher?.dispose();
     this.localWatcher = undefined;
-    this.aiPushWatcher?.dispose();
-    this.aiPushWatcher = undefined;
+    this.aiPushRequests.dispose();
     if (this.localRefreshTimer) {
       clearTimeout(this.localRefreshTimer);
       this.localRefreshTimer = undefined;
@@ -286,15 +294,17 @@ class ExtensionController {
     if (!workspaceFolder) {
       return;
     }
-    this.store.setWorkspaceFolder(workspaceFolder.uri.fsPath);
+    // 配置期间使用独立 Store，只有环境成功保存并需要激活时才切换控制器上下文。
+    // 这样在多根工作区中取消任一步骤，都不会让现有 Watcher 与 Store 指向不同目录。
+    const configurationStore = new WorkspaceStore(workspaceFolder.uri.fsPath);
 
-    const currentEnvironment = await this.store.getActiveEnvironment();
+    const currentEnvironment = await configurationStore.getActiveEnvironment();
     const activeEnvironment = createNew
       ? undefined
       : currentEnvironment;
     const previous = activeEnvironment
       ?? currentEnvironment;
-    const configuredEnvironments = await this.store.getEnvironments();
+    const configuredEnvironments = await configurationStore.getEnvironments();
     const environmentName = await vscode.window.showInputBox({
       title: '配置 Ecode 环境 (1/5)',
       prompt: '环境名称',
@@ -374,7 +384,7 @@ class ExtensionController {
       if (!result.success) {
         throw new Error(result.message);
       }
-      const savedEnvironment = await this.store.saveEnvironment({
+      const savedEnvironment = await configurationStore.saveEnvironment({
         id: environmentId,
         name: environmentName.trim(),
         directory: profile.environmentDirectory,
@@ -383,11 +393,8 @@ class ExtensionController {
         username: profile.username,
       }, !createNew || !currentEnvironment);
       if (!createNew || !currentEnvironment) {
-        await this.formMetadataRegistry.reload(profile, this.store);
-        this.changes = await this.service.refreshLocalChanges();
-        this.configureLocalWatcher(profile);
-        this.configureAiPushWatcher(profile.workspaceFolder);
-        await this.refreshAiSupport(false);
+        this.activateWorkspaceContext(profile);
+        await this.refreshWorkspaceContext(profile);
       }
       vscode.window.showInformationMessage(
         createNew && currentEnvironment
@@ -443,11 +450,8 @@ class ExtensionController {
     }
     const environment = await this.store.setActiveEnvironment(selected.environment.id);
     const profile = toConnectionProfile(environment);
-    await this.formMetadataRegistry.reload(profile, this.store);
-    this.changes = await this.service.refreshLocalChanges();
-    this.configureLocalWatcher(profile);
-    this.configureAiPushWatcher(profile.workspaceFolder);
-    await this.refreshAiSupport(false);
+    this.activateWorkspaceContext(profile);
+    await this.refreshWorkspaceContext(profile);
     await this.updateViews();
     vscode.window.showInformationMessage(`Ecode: 已切换到 ${environment.name}`);
   }
@@ -1277,206 +1281,6 @@ class ExtensionController {
     }
   }
 
-  private configureAiPushWatcher(workspaceFolder: string): void {
-    this.aiPushWatcher?.dispose();
-    this.aiPushWatcher = undefined;
-    const requestsRoot = path.join(
-      workspaceFolder,
-      ECODE_LOCAL_DIRECTORY,
-      AI_PUSH_REQUEST_DIRECTORY,
-    );
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(requestsRoot, '*.json'),
-    );
-    const process = (uri: vscode.Uri): void => {
-      void this.processAiPushRequestFile(workspaceFolder, uri.fsPath);
-    };
-    this.aiPushWatcher = vscode.Disposable.from(
-      watcher,
-      watcher.onDidCreate(process),
-      watcher.onDidChange(process),
-    );
-    void this.processPendingAiPushRequests(workspaceFolder);
-  }
-
-  private async processPendingAiPushRequests(
-    workspaceFolder: string,
-  ): Promise<void> {
-    const requestsRoot = path.join(
-      workspaceFolder,
-      ECODE_LOCAL_DIRECTORY,
-      AI_PUSH_REQUEST_DIRECTORY,
-    );
-    try {
-      const names = await fs.promises.readdir(requestsRoot);
-      for (const name of names.filter(item => item.endsWith('.json'))) {
-        await this.processAiPushRequestFile(
-          workspaceFolder,
-          path.join(requestsRoot, name),
-        );
-      }
-    } catch (error: unknown) {
-      if (!isFileSystemError(error, 'ENOENT')) {
-        output.warn(`Unable to scan AI push requests: ${errorMessage(error)}`);
-      }
-    }
-  }
-
-  private async processAiPushRequestFile(
-    workspaceFolder: string,
-    requestFile: string,
-  ): Promise<void> {
-    const fileName = path.basename(requestFile);
-    const fallbackId = path.basename(fileName, '.json');
-    if (
-      !/^[A-Za-z0-9_-]{1,64}$/.test(fallbackId)
-      || this.processingAiPushRequests.has(requestFile)
-    ) {
-      return;
-    }
-    const resultFile = path.join(
-      workspaceFolder,
-      ECODE_LOCAL_DIRECTORY,
-      AI_PUSH_RESULT_DIRECTORY,
-      `${fallbackId}.json`,
-    );
-    if (fs.existsSync(resultFile)) {
-      return;
-    }
-    this.processingAiPushRequests.add(requestFile);
-    let request: AiPushRequest | undefined;
-    try {
-      request = parseAiPushRequest(
-        await fs.promises.readFile(requestFile, 'utf8'),
-        fileName,
-      );
-      const environment = await this.store.getActiveEnvironment();
-      const profile = await this.store.getProfile();
-      if (!environment || !profile) {
-        throw new Error('当前没有活动环境');
-      }
-      if (request.environmentDirectory !== environment.directory) {
-        await this.writeAiPushResult(resultFile, {
-          schemaVersion: 1,
-          id: request.id,
-          action: 'push',
-          environmentDirectory: request.environmentDirectory,
-          processedAt: new Date().toISOString(),
-          status: 'rejected',
-          message: `当前活动环境目录为 ${environment.directory}，请先人工切换环境`,
-        });
-        return;
-      }
-      if (this.busy) {
-        await this.writeAiPushResult(resultFile, {
-          schemaVersion: 1,
-          id: request.id,
-          action: 'push',
-          environmentDirectory: request.environmentDirectory,
-          processedAt: new Date().toISOString(),
-          status: 'failed',
-          message: '已有同步操作正在执行，请使用新的请求 id 重试',
-        });
-        return;
-      }
-      if (!await this.service.hasSyncBaseline()) {
-        throw new Error('当前环境尚未建立同步基线，请先人工执行全量拉取');
-      }
-      this.changes = await this.service.refreshLocalChanges();
-      const pushable = new Set(this.changes
-        .filter(isPushableChange)
-        .map(change => change.path));
-      const unavailable = request.paths.filter(item => !pushable.has(item));
-      if (unavailable.length > 0) {
-        throw new Error(
-          `以下路径不是当前可推送的本地变更：${unavailable.join('、')}`,
-        );
-      }
-      const candidates = await this.service.preparePromotionCandidates(request.paths);
-      const confirmation = await vscode.window.showWarningMessage(
-        `AI 请求向“${environment.name}”（${profile.serverUrl}）推送 `
-          + `${request.paths.length} 个文件。请求 ${request.id}。`
-          + '扩展仍会执行远端冲突检查和推送后回读校验。',
-        { modal: true },
-        '确认 AI 推送',
-      );
-      if (confirmation !== '确认 AI 推送') {
-        await this.writeAiPushResult(resultFile, {
-          schemaVersion: 1,
-          id: request.id,
-          action: 'push',
-          environmentDirectory: request.environmentDirectory,
-          processedAt: new Date().toISOString(),
-          status: 'cancelled',
-          message: '用户未确认推送',
-        });
-        return;
-      }
-      const execution = await this.executePush(
-        profile,
-        environment,
-        request.paths,
-        candidates,
-      );
-      if (!execution) {
-        await this.writeAiPushResult(resultFile, {
-          schemaVersion: 1,
-          id: request.id,
-          action: 'push',
-          environmentDirectory: request.environmentDirectory,
-          processedAt: new Date().toISOString(),
-          status: 'failed',
-          message: '推送未完成，详情见 Ecode Output',
-        });
-        return;
-      }
-      showResult('AI 推送', execution.result);
-      await this.writeAiPushResult(resultFile, {
-        schemaVersion: 1,
-        id: request.id,
-        action: 'push',
-        environmentDirectory: request.environmentDirectory,
-        processedAt: new Date().toISOString(),
-        status: execution.result.success && execution.record?.status === 'succeeded'
-          ? 'succeeded'
-          : execution.record ? 'partial' : 'failed',
-        pushRecordId: execution.record?.id,
-        result: execution.result,
-        message: execution.record
-          ? `已保存推送记录“${execution.record.name}”（${execution.record.id}）`
-          : '没有文件通过推送后回读验证',
-      });
-    } catch (error: unknown) {
-      const message = errorMessage(error);
-      output.warn(`AI push request ${fallbackId} rejected: ${message}`);
-      await this.writeAiPushResult(resultFile, {
-        schemaVersion: 1,
-        id: request?.id ?? fallbackId,
-        action: 'push',
-        environmentDirectory: request?.environmentDirectory,
-        processedAt: new Date().toISOString(),
-        status: 'rejected',
-        message,
-      });
-    } finally {
-      this.processingAiPushRequests.delete(requestFile);
-    }
-  }
-
-  private async writeAiPushResult(
-    file: string,
-    result: AiPushResult,
-  ): Promise<void> {
-    const temporary = `${file}.tmp`;
-    await fs.promises.mkdir(path.dirname(file), { recursive: true });
-    await fs.promises.writeFile(
-      temporary,
-      `${JSON.stringify(result, null, 2)}\n`,
-      'utf8',
-    );
-    await fs.promises.rename(temporary, file);
-  }
-
   private configureLocalWatcher(profile: ConnectionProfile): void {
     this.localWatcher?.dispose();
     this.localWatcher = undefined;
@@ -1502,6 +1306,21 @@ class ExtensionController {
       watcher.onDidChange(schedule),
       watcher.onDidDelete(schedule),
     );
+  }
+
+  private activateWorkspaceContext(profile: ConnectionProfile): void {
+    // Store 与两个 Watcher 必须在同一个同步片段中切换，避免后续异步刷新失败时
+    // 留下“新 Store + 旧 Watcher”的混合上下文。
+    this.store.setWorkspaceFolder(profile.workspaceFolder);
+    this.changes = [];
+    this.configureLocalWatcher(profile);
+    this.aiPushRequests.configure(profile.workspaceFolder);
+  }
+
+  private async refreshWorkspaceContext(profile: ConnectionProfile): Promise<void> {
+    await this.formMetadataRegistry.reload(profile, this.store);
+    this.changes = await this.service.refreshLocalChanges();
+    await this.refreshAiSupport(false);
   }
 
   private scheduleLocalRefresh(): void {
@@ -1818,13 +1637,4 @@ function changeSetFromCommandArgument(argument: unknown): ChangeSet | undefined 
     return argument.changeSet;
   }
   return undefined;
-}
-
-function isFileSystemError(
-  error: unknown,
-  code: string,
-): error is NodeJS.ErrnoException {
-  return error instanceof Error
-    && 'code' in error
-    && (error as NodeJS.ErrnoException).code === code;
 }

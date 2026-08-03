@@ -1,7 +1,7 @@
 import * as assert from 'assert';
 import * as crypto from 'crypto';
 import * as http from 'http';
-import { AddressInfo } from 'net';
+import { type AddressInfo } from 'net';
 import type { ConnectionProfile } from '../../domain/types';
 import { AuthManager } from '../../sync/auth/AuthManager';
 
