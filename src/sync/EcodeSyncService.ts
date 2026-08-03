@@ -3,7 +3,6 @@ import * as path from 'path';
 import type * as vscode from 'vscode';
 import {
   assertNoSymlinkSegments,
-  assertNoCaseCollisions,
   normalizeRemotePath,
   resolveSafeLocalPath,
   resolveEnvironmentSourceRoot,
@@ -15,7 +14,7 @@ import {
   formatUnicodeCodePoint,
 } from '../domain/gbk';
 import { buildLocalChanges, buildSyncPlan } from '../domain/syncPlanner';
-import { hashText, isSupportedText, serverFingerprint } from '../domain/text';
+import { hashText, serverFingerprint } from '../domain/text';
 import type {
   ConnectionProfile,
   DeploymentFileResult,
@@ -34,39 +33,31 @@ import type {
 } from '../domain/types';
 import type { WorkspaceStore } from '../storage/WorkspaceStore';
 import { EcodeCompiler } from './EcodeCompiler';
+import {
+  SessionExpiredError,
+  SyncCancelledError,
+  isUnauthorized,
+  requireSuccess,
+} from './EcodeErrors';
 import { FileApi } from './api/FileApi';
-import type { ApiResponse, TreeNode, TreePayload } from './api/types';
+import type { ApiResponse, TreeNode } from './api/types';
 import type { AuthManager } from './auth/AuthManager';
+import {
+  LocalWorkspaceScanner,
+  type LocalScan,
+} from './LocalWorkspaceScanner';
+import { ManifestCheckpoint } from './ManifestCheckpoint';
+import {
+  RemoteWorkspaceScanner,
+  isPathAtOrBelow,
+  remotePathKey,
+  type CancellationLike,
+  type RemoteDirectoryEntry,
+  type RemoteIndex,
+  type RemoteScan,
+} from './RemoteWorkspaceScanner';
 
-interface CancellationLike {
-  readonly isCancellationRequested: boolean;
-}
-
-interface RemoteScan {
-  files: Map<string, RemoteFileContent>;
-  presentPaths: Set<string>;
-  presentDirectories: Set<string>;
-  ambiguousDirectories: Set<string>;
-  unsupported: SyncChange[];
-  errors: string[];
-}
-
-interface RemoteDirectoryEntry {
-  id: string;
-  path: string;
-  kind: 'type' | 'folder';
-}
-
-interface RemoteIndex {
-  files: Map<string, RemoteFileEntry>;
-  directories: Map<string, RemoteDirectoryEntry>;
-  ambiguousDirectories: Set<string>;
-  pathCollisions: SyncChange[];
-  observedFilePaths: Set<string>;
-  preloadedFiles: Map<string, RemoteFileContent>;
-}
-
-interface RemoteTreeTask extends RemoteDirectoryEntry {}
+export { SyncCancelledError } from './EcodeErrors';
 
 interface RemoteFolderDeletion {
   directory: RemoteDirectoryEntry;
@@ -84,6 +75,8 @@ export class EcodeSyncService {
     private readonly auth: AuthManager,
     private readonly output: vscode.LogOutputChannel,
     private readonly compiler = new EcodeCompiler(),
+    private readonly localScanner = new LocalWorkspaceScanner(),
+    private readonly remoteScanner = new RemoteWorkspaceScanner(output),
   ) {}
 
   getLastPlan(): SyncPlan | undefined {
@@ -105,7 +98,7 @@ export class EcodeSyncService {
     if (!isManifestInitialized(context.manifest)) {
       throw new Error('当前环境尚未建立同步基线，请先执行全量拉取');
     }
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     const changes = new Map(
       buildLocalChanges(context.manifest, local.files).map(change => [change.path, change]),
     );
@@ -124,7 +117,7 @@ export class EcodeSyncService {
           : change.status === 'localDeleted' ? 'delete' : 'modify',
         baseHash: baseline?.baselineHash,
         baseContent: baseline
-          ? await this.store.readSnapshot(baseline.snapshotKey)
+          ? await this.store.readSnapshot(context.syncRoot, baseline.snapshotKey)
           : undefined,
         resultHash: localFile?.hash,
         resultContent: localFile?.content,
@@ -156,7 +149,7 @@ export class EcodeSyncService {
     if (!isManifestInitialized(context.manifest)) {
       throw new Error('当前环境尚未建立同步基线');
     }
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     const conflicts: string[] = [];
     for (const candidate of candidates) {
       const current = local.files.get(candidate.path);
@@ -203,7 +196,7 @@ export class EcodeSyncService {
       const current = local.files.get(candidate.path);
       if (current) {
         recoveryPaths.push(
-          await this.store.saveRecovery(candidate.path, current.content),
+          await this.store.saveRecovery(context.syncRoot, candidate.path, current.content),
         );
       }
     }
@@ -228,7 +221,7 @@ export class EcodeSyncService {
   ): Promise<ReleaseVerification> {
     this.validateReleaseArtifacts(artifacts);
     const remoteIndex = await this.withAuthentication(profile, api =>
-      this.listRemoteIndex(api));
+      this.remoteScanner.listIndex(api));
     let files = await this.withAuthentication(profile, async api =>
       mapConcurrent(artifacts, 4, async artifact =>
         this.verifyReleaseArtifact(api, remoteIndex, artifact)));
@@ -240,7 +233,7 @@ export class EcodeSyncService {
         '目标环境尚未建立同步基线，请先切换到该环境并执行全量拉取',
       ));
     } else {
-      const local = await this.scanLocalFiles(context.syncRoot);
+      const local = await this.localScanner.scan(context.syncRoot);
       files = artifacts.map((artifact, index) =>
         this.verifyTargetLocalArtifact(
           local,
@@ -268,7 +261,8 @@ export class EcodeSyncService {
     }
     const context = await this.loadContext(profile);
     let remoteIndex = await this.withAuthentication(profile, api =>
-      this.listRemoteIndex(api));
+      this.remoteScanner.listIndex(api));
+    const localState = await this.localScanner.scan(context.syncRoot);
     const preflightByPath = new Map(preflight.files.map(file => [file.path, file]));
     const results: DeploymentFileResult[] = [];
 
@@ -294,9 +288,8 @@ export class EcodeSyncService {
             return check;
           }
           const existing = remoteIndex.files.get(artifact.path);
-          const latestLocal = await this.scanLocalFiles(context.syncRoot);
           const localCheck = this.verifyTargetLocalArtifact(
-            latestLocal,
+            localState,
             artifact,
             check,
           );
@@ -306,16 +299,17 @@ export class EcodeSyncService {
           ) {
             return localCheck;
           }
-          const localFile = [...latestLocal.files.values()].find(file =>
+          const localFile = [...localState.files.values()].find(file =>
             remotePathKey(file.path) === remotePathKey(artifact.path));
           let recoveryPath: string | undefined;
           let remoteRecoveryHash: string | undefined;
           let previousRemote: RemoteFileContent | undefined;
           if (check.status === 'pending' && existing) {
-            const current = await this.readRemote(api, existing);
+            const current = await this.remoteScanner.readFile(api, existing);
             previousRemote = current;
             remoteRecoveryHash = current.hash;
             recoveryPath = await this.store.saveRecovery(
+              context.syncRoot,
               artifact.path,
               current.content,
             );
@@ -333,6 +327,7 @@ export class EcodeSyncService {
                 artifact,
                 localFile?.hash,
               );
+              this.updateLocalStateAfterRelease(localState, artifact, localFile?.path);
               delete context.manifest.files[artifact.path];
             } else {
               if (!existing) {
@@ -342,7 +337,7 @@ export class EcodeSyncService {
                   '目标环境远端文件在应用期间消失',
                 );
               }
-              const verified = await this.readRemote(api, existing);
+              const verified = await this.remoteScanner.readFile(api, existing);
               if (verified.hash !== artifact.resultHash) {
                 return promotionConflict(
                   artifact,
@@ -355,9 +350,10 @@ export class EcodeSyncService {
                 artifact,
                 localFile?.hash,
               );
-              await this.setBaseline(context.manifest, verified);
+              this.updateLocalStateAfterRelease(localState, artifact, localFile?.path);
+              await this.setBaseline(context.syncRoot, context.manifest, verified);
             }
-            await this.store.deleteConflict(artifact.path);
+            await this.store.deleteConflict(context.syncRoot, artifact.path);
             await this.store.saveManifest(context.manifest);
             return promotionSucceeded(artifact);
           }
@@ -391,8 +387,9 @@ export class EcodeSyncService {
               artifact,
               localFile?.hash,
             );
+            this.updateLocalStateAfterRelease(localState, artifact, localFile?.path);
             delete context.manifest.files[artifact.path];
-            await this.store.deleteConflict(artifact.path);
+            await this.store.deleteConflict(context.syncRoot, artifact.path);
             await this.store.saveManifest(context.manifest);
             onVerifiedCandidate?.(releasePromotionCandidate(
               artifact,
@@ -470,8 +467,9 @@ export class EcodeSyncService {
             artifact,
             localFile?.hash,
           );
-          await this.setBaseline(context.manifest, verified);
-          await this.store.deleteConflict(artifact.path);
+          this.updateLocalStateAfterRelease(localState, artifact, localFile?.path);
+          await this.setBaseline(context.syncRoot, context.manifest, verified);
+          await this.store.deleteConflict(context.syncRoot, artifact.path);
           await this.store.saveManifest(context.manifest);
           remoteIndex.files.set(artifact.path, uploadedEntry);
           onVerifiedCandidate?.(releasePromotionCandidate(
@@ -500,8 +498,9 @@ export class EcodeSyncService {
       };
       return [];
     }
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     const changes = await this.mergeStoredConflicts(
+      context.syncRoot,
       context.manifest,
       local.files,
       buildLocalChanges(context.manifest, local.files),
@@ -528,7 +527,7 @@ export class EcodeSyncService {
 
     onProgress('正在验证连接...');
     const remote = await this.withAuthentication(context.profile, api =>
-      this.scanRemote(api, onProgress, cancellation),
+      this.remoteScanner.scan(api, onProgress, cancellation),
     );
     this.throwIfCancelled(cancellation);
     for (const manifestPath of Object.keys(context.manifest.files)) {
@@ -539,7 +538,7 @@ export class EcodeSyncService {
     }
 
     onProgress('正在扫描本地文件...');
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     onProgress('正在计算同步计划...');
     const plan = buildSyncPlan(
       context.manifest,
@@ -552,120 +551,148 @@ export class EcodeSyncService {
     result.failed += remote.errors.length;
     result.errors.push(...remote.errors);
     const deletedLocalParents = new Set<string>();
+    const manifestCheckpoint = new ManifestCheckpoint(() =>
+      this.store.saveManifest(context.manifest));
+    // 即使远端为空，首次拉取也需要持久化初始化时间以建立同步基线。
+    await manifestCheckpoint.markDirty();
 
-    for (const item of plan.changes) {
-      if (item.status === 'conflict') {
-        const content = remote.files.get(item.path);
-        const scannedLocal = local.files.get(item.path);
-        if (content && scannedLocal?.hash === content.hash) {
+   try {
+      for (const item of plan.changes) {
+        if (item.status === 'conflict') {
+          const content = remote.files.get(item.path);
+          const scannedLocal = local.files.get(item.path);
+          if (content && scannedLocal?.hash === content.hash) {
+            const localPath = resolveSafeLocalPath(context.syncRoot, item.path);
+            assertNoSymlinkSegments(context.syncRoot, localPath);
+            const currentLocal = await this.localScanner.readFileIfExists(localPath, item.path);
+            if (currentLocal?.hash === content.hash) {
+              await this.setBaseline(context.syncRoot, context.manifest, content);
+              await this.store.deleteConflict(context.syncRoot, item.path);
+              await manifestCheckpoint.markDirty();
+              result.pulled++;
+              continue;
+            }
+          }
+          result.conflicts++;
+          if (content && item.conflictReason) {
+            await this.store.saveConflict(context.syncRoot, {
+              path: item.path,
+              remoteId: content.entry.id,
+              remoteContent: content.content,
+              remoteHash: content.hash,
+              detectedAt: new Date().toISOString(),
+              reason: item.conflictReason,
+            });
+          } else if (item.conflictReason === 'remoteDeletedLocalModified') {
+            await this.saveRemoteDeletionConflict(
+              context.syncRoot,
+              context.manifest,
+              item.path,
+            );
+          }
+        } else if (item.status === 'unsupported') {
+          result.unsupported++;
+        }
+      }
+
+      let applied = 0;
+      for (const item of plan.executable) {
+        if (cancellation?.isCancellationRequested) {
+          await manifestCheckpoint.flush();
+        }
+        this.throwIfCancelled(cancellation);
+        applied++;
+        onProgress(`正在应用远端变更 ${applied}/${plan.executable.length}: ${item.path}`);
+        if (local.unsupported.some(change => change.path === item.path)) {
+          continue;
+        }
+        try {
           const localPath = resolveSafeLocalPath(context.syncRoot, item.path);
           assertNoSymlinkSegments(context.syncRoot, localPath);
-          const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
-          if (currentLocal?.hash === content.hash) {
-            await this.setBaseline(context.manifest, content);
-            await this.store.deleteConflict(item.path);
-            await this.store.saveManifest(context.manifest);
-            result.pulled++;
+          if (item.status === 'remoteDeleted') {
+            const baseline = context.manifest.files[item.path];
+            if (!baseline) {
+              continue;
+            }
+            const currentLocal = await this.localScanner.readFileIfExists(localPath, item.path);
+            if (currentLocal && currentLocal.hash !== baseline.baselineHash) {
+              await this.saveRemoteDeletionConflict(
+                context.syncRoot,
+                context.manifest,
+                item.path,
+              );
+              result.conflicts++;
+              continue;
+            }
+            if (currentLocal) {
+              const recovery = await this.store.saveRecovery(
+                context.syncRoot,
+                item.path,
+                currentLocal.content,
+              );
+              await fs.unlink(localPath);
+              deletedLocalParents.add(path.posix.dirname(item.path));
+              this.output.info(`Remote deletion applied: ${item.path}; recovery: ${recovery}`);
+              result.deletedLocal++;
+            }
+            delete context.manifest.files[item.path];
+            await this.store.deleteConflict(context.syncRoot, item.path);
+            await manifestCheckpoint.markDirty();
             continue;
           }
-        }
-        result.conflicts++;
-        if (content && item.conflictReason) {
-          await this.store.saveConflict({
-            path: item.path,
-            remoteId: content.entry.id,
-            remoteContent: content.content,
-            remoteHash: content.hash,
-            detectedAt: new Date().toISOString(),
-            reason: item.conflictReason,
-          });
-        } else if (item.conflictReason === 'remoteDeletedLocalModified') {
-          await this.saveRemoteDeletionConflict(context.manifest, item.path);
-        }
-      } else if (item.status === 'unsupported') {
-        result.unsupported++;
-      }
-    }
 
-    let applied = 0;
-    for (const item of plan.executable) {
-      this.throwIfCancelled(cancellation);
-      applied++;
-      onProgress(`正在应用远端变更 ${applied}/${plan.executable.length}: ${item.path}`);
-      if (local.unsupported.some(change => change.path === item.path)) {
-        continue;
-      }
-      try {
-        const localPath = resolveSafeLocalPath(context.syncRoot, item.path);
-        assertNoSymlinkSegments(context.syncRoot, localPath);
-        if (item.status === 'remoteDeleted') {
-          const baseline = context.manifest.files[item.path];
-          if (!baseline) {
+          const remoteFile = remote.files.get(item.path);
+          if (!remoteFile) {
             continue;
           }
-          const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
-          if (currentLocal && currentLocal.hash !== baseline.baselineHash) {
-            await this.saveRemoteDeletionConflict(context.manifest, item.path);
+          const localFile = local.files.get(item.path);
+          const currentLocal = await this.localScanner.readFileIfExists(localPath, item.path);
+          if (currentLocal?.hash !== localFile?.hash) {
+            const reason = localFile ? 'bothModified' : 'initialCollision';
+            await this.store.saveConflict(
+              context.syncRoot,
+              toStoredConflict(remoteFile, reason),
+            );
+            this.lastRemoteFiles.set(item.path, remoteFile);
             result.conflicts++;
             continue;
           }
-          if (currentLocal) {
-            const recovery = await this.store.saveRecovery(item.path, currentLocal.content);
-            await fs.unlink(localPath);
-            deletedLocalParents.add(path.posix.dirname(item.path));
-            this.output.info(`Remote deletion applied: ${item.path}; recovery: ${recovery}`);
-            result.deletedLocal++;
+          if (!currentLocal || currentLocal.hash !== remoteFile.hash) {
+            await fs.mkdir(path.dirname(localPath), { recursive: true });
+            await fs.writeFile(localPath, remoteFile.content, 'utf8');
           }
-          delete context.manifest.files[item.path];
-          await this.store.deleteConflict(item.path);
-          await this.store.saveManifest(context.manifest);
-          continue;
-        }
-
-        const remoteFile = remote.files.get(item.path);
-        if (!remoteFile) {
-          continue;
-        }
-        const localFile = local.files.get(item.path);
-        const currentLocal = await this.readLocalFileIfExists(localPath, item.path);
-        if (currentLocal?.hash !== localFile?.hash) {
-          const reason = localFile ? 'bothModified' : 'initialCollision';
-          await this.store.saveConflict(toStoredConflict(remoteFile, reason));
-          this.lastRemoteFiles.set(item.path, remoteFile);
-          result.conflicts++;
-          continue;
-        }
-        if (!currentLocal || currentLocal.hash !== remoteFile.hash) {
-          await fs.mkdir(path.dirname(localPath), { recursive: true });
-          await fs.writeFile(localPath, remoteFile.content, 'utf8');
-        }
-        await this.setBaseline(context.manifest, remoteFile);
-        await this.store.saveManifest(context.manifest);
-        result.pulled++;
-      } catch (error: unknown) {
-        result.failed++;
-        result.errors.push(`${item.path}: ${errorMessage(error)}`);
-      }
-    }
-
-    await this.pruneRemoteDeletedLocalDirectories(
-      context.syncRoot,
-      deletedLocalParents,
-      remote.presentDirectories,
-    );
-
-    for (const [remotePath, remoteFile] of remote.files) {
-      const change = plan.changes.find(item => item.path === remotePath);
-      if (change?.status === 'clean') {
-        const entry = context.manifest.files[remotePath];
-        if (entry) {
-          entry.remoteId = remoteFile.entry.id;
-          entry.lastVerifiedAt = new Date().toISOString();
+          await this.setBaseline(context.syncRoot, context.manifest, remoteFile);
+          await manifestCheckpoint.markDirty();
+          result.pulled++;
+        } catch (error: unknown) {
+          result.failed++;
+          result.errors.push(`${item.path}: ${errorMessage(error)}`);
         }
       }
-    }
 
-    await this.store.saveManifest(context.manifest);
+      await this.pruneRemoteDeletedLocalDirectories(
+        context.syncRoot,
+        deletedLocalParents,
+        remote.presentDirectories,
+      );
+
+      const changeByPath = new Map(plan.changes.map(change => [change.path, change]));
+      for (const [remotePath, remoteFile] of remote.files) {
+        const change = changeByPath.get(remotePath);
+        if (change?.status === 'clean') {
+          const entry = context.manifest.files[remotePath];
+          if (entry) {
+            entry.remoteId = remoteFile.entry.id;
+            entry.lastVerifiedAt = new Date().toISOString();
+            await manifestCheckpoint.markDirty();
+          }
+        }
+      }
+
+    } finally {
+      // 本地文件可能已经应用；任何后处理异常都不能让清单停留在旧状态。
+      await manifestCheckpoint.flush();
+    }
     this.throwIfCancelled(cancellation);
     try {
       await this.withAuthentication(context.profile, api =>
@@ -680,7 +707,7 @@ export class EcodeSyncService {
     }
     this.lastRemoteFiles = remote.files;
 
-    const refreshedLocal = await this.scanLocalFiles(context.syncRoot);
+    const refreshedLocal = await this.localScanner.scan(context.syncRoot);
     this.lastPlan = buildSyncPlan(
       context.manifest,
       refreshedLocal.files,
@@ -702,7 +729,7 @@ export class EcodeSyncService {
       throw new Error('当前环境尚未建立同步基线，请先执行全量拉取');
     }
     onProgress('正在扫描本地文件...');
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     const localChanges = new Map(
       buildLocalChanges(context.manifest, local.files).map(item => [item.path, item]),
     );
@@ -715,7 +742,7 @@ export class EcodeSyncService {
     const pushConflicts = new Map<string, SyncChange>();
     const result = emptyResult();
     let remoteIndex = await this.withAuthentication(context.profile, api =>
-      this.listRemoteIndex(
+      this.remoteScanner.listIndex(
         api,
         cancellation,
         message => onProgress(`准备推送：${message}`),
@@ -780,7 +807,7 @@ export class EcodeSyncService {
               for (const deletedPath of folderDeletion.filePaths) {
                 handledDeletedFiles.add(deletedPath);
                 delete context.manifest.files[deletedPath];
-                await this.store.deleteConflict(deletedPath);
+                await this.store.deleteConflict(context.syncRoot, deletedPath);
               }
               await this.store.saveManifest(context.manifest);
               result.deletedRemote += folderDeletion.filePaths.length;
@@ -794,14 +821,20 @@ export class EcodeSyncService {
             }
             const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
             assertNoSymlinkSegments(context.syncRoot, localPath);
-            if (await this.readLocalFileIfExists(localPath, remotePath)) {
+            if (await this.localScanner.readFileIfExists(localPath, remotePath)) {
               throw new Error('本地文件已重新出现，请刷新变更后重试');
             }
 
             const existing = remoteIndex.files.get(remotePath);
             if (existing) {
               if (existing.id !== baseline.remoteId) {
-                await this.recordPushConflict(api, remotePath, existing, 'remotePathCollision');
+                await this.recordPushConflict(
+                  context.syncRoot,
+                  api,
+                  remotePath,
+                  existing,
+                  'remotePathCollision',
+                );
                 result.conflicts++;
                 pushConflicts.set(remotePath, {
                   path: remotePath,
@@ -814,9 +847,12 @@ export class EcodeSyncService {
                 return;
               }
 
-              const latest = await this.readRemote(api, existing);
+              const latest = await this.remoteScanner.readFile(api, existing);
               if (latest.hash !== baseline.baselineHash) {
-                await this.store.saveConflict(toStoredConflict(latest, 'localDeletedRemoteModified'));
+                await this.store.saveConflict(
+                  context.syncRoot,
+                  toStoredConflict(latest, 'localDeletedRemoteModified'),
+                );
                 this.lastRemoteFiles.set(remotePath, latest);
                 result.conflicts++;
                 pushConflicts.set(remotePath, {
@@ -831,7 +867,7 @@ export class EcodeSyncService {
                 return;
               }
 
-              if (await this.readLocalFileIfExists(localPath, remotePath)) {
+              if (await this.localScanner.readFileIfExists(localPath, remotePath)) {
                 throw new Error('本地文件在远端删除前重新出现，请刷新变更后重试');
               }
               const deletion = await api.deleteFile(existing.id);
@@ -854,7 +890,7 @@ export class EcodeSyncService {
             }
 
             delete context.manifest.files[remotePath];
-            await this.store.deleteConflict(remotePath);
+            await this.store.deleteConflict(context.syncRoot, remotePath);
             await this.store.saveManifest(context.manifest);
             result.deletedRemote++;
           });
@@ -868,16 +904,19 @@ export class EcodeSyncService {
         await this.withAuthentication(context.profile, async api => {
           let existing = remoteIndex.files.get(remotePath);
           if (change.status === 'localAdded' && existing) {
-            const latest = await this.readRemote(api, existing);
+            const latest = await this.remoteScanner.readFile(api, existing);
             if (latest.hash === localFile.hash) {
-              await this.setBaseline(context.manifest, latest);
-              await this.store.deleteConflict(remotePath);
+              await this.setBaseline(context.syncRoot, context.manifest, latest);
+              await this.store.deleteConflict(context.syncRoot, remotePath);
               await this.store.saveManifest(context.manifest);
               this.lastRemoteFiles.set(remotePath, latest);
               result.pushed++;
               return;
             }
-            await this.store.saveConflict(toStoredConflict(latest, 'initialCollision'));
+            await this.store.saveConflict(
+              context.syncRoot,
+              toStoredConflict(latest, 'initialCollision'),
+            );
             this.lastRemoteFiles.set(remotePath, latest);
             result.conflicts++;
             pushConflicts.set(remotePath, {
@@ -909,7 +948,13 @@ export class EcodeSyncService {
               return;
             }
             if (existing.id !== baseline.remoteId) {
-              await this.recordPushConflict(api, remotePath, existing, 'remotePathCollision');
+              await this.recordPushConflict(
+                context.syncRoot,
+                api,
+                remotePath,
+                existing,
+                'remotePathCollision',
+              );
               result.conflicts++;
               pushConflicts.set(remotePath, {
                 path: remotePath,
@@ -922,17 +967,20 @@ export class EcodeSyncService {
               });
               return;
             }
-            const latest = await this.readRemote(api, existing);
+            const latest = await this.remoteScanner.readFile(api, existing);
             if (latest.hash !== baseline.baselineHash) {
               if (latest.hash === localFile.hash) {
-                await this.setBaseline(context.manifest, latest);
-                await this.store.deleteConflict(remotePath);
+                await this.setBaseline(context.syncRoot, context.manifest, latest);
+                await this.store.deleteConflict(context.syncRoot, remotePath);
                 await this.store.saveManifest(context.manifest);
                 this.lastRemoteFiles.set(remotePath, latest);
                 result.pushed++;
                 return;
               }
-              await this.store.saveConflict(toStoredConflict(latest, 'bothModified'));
+              await this.store.saveConflict(
+                context.syncRoot,
+                toStoredConflict(latest, 'bothModified'),
+              );
               this.lastRemoteFiles.set(remotePath, latest);
               result.conflicts++;
               pushConflicts.set(remotePath, {
@@ -974,7 +1022,13 @@ export class EcodeSyncService {
             );
             if (existing) {
               remoteIndex.files.set(remotePath, existing);
-              await this.recordPushConflict(api, remotePath, existing, 'initialCollision');
+              await this.recordPushConflict(
+                context.syncRoot,
+                api,
+                remotePath,
+                existing,
+                'initialCollision',
+              );
               result.conflicts++;
               pushConflicts.set(remotePath, {
                 path: remotePath,
@@ -1018,7 +1072,7 @@ export class EcodeSyncService {
             cancellation,
           );
 
-          await this.setBaseline(context.manifest, verified);
+          await this.setBaseline(context.syncRoot, context.manifest, verified);
           await this.store.saveManifest(context.manifest);
           this.lastRemoteFiles.set(remotePath, verified);
           remoteIndex.files.set(remotePath, uploadedEntry);
@@ -1030,7 +1084,7 @@ export class EcodeSyncService {
       }
     }
 
-    const refreshed = await this.scanLocalFiles(context.syncRoot);
+    const refreshed = await this.localScanner.scan(context.syncRoot);
     const changes = buildLocalChanges(context.manifest, refreshed.files)
       .filter(item => !pushConflicts.has(item.path));
     changes.push(...pushConflicts.values());
@@ -1050,7 +1104,9 @@ export class EcodeSyncService {
   async getBaselineContent(remotePath: string): Promise<string> {
     const context = await this.loadContext();
     const entry = context.manifest.files[remotePath];
-    return entry ? this.store.readSnapshot(entry.snapshotKey) : '';
+    return entry
+      ? this.store.readSnapshot(context.syncRoot, entry.snapshotKey)
+      : '';
   }
 
   async getLatestRemoteContent(remotePath: string): Promise<string> {
@@ -1058,26 +1114,31 @@ export class EcodeSyncService {
     if (remembered) {
       return remembered.content;
     }
-    const conflict = await this.store.loadConflict(remotePath);
+    const context = await this.loadContext();
+    const conflict = await this.store.loadConflict(context.syncRoot, remotePath);
     return conflict?.remoteContent ?? '';
   }
 
   async acceptRemote(remotePath: string): Promise<string | undefined> {
     const context = await this.loadContext();
-    const conflict = await this.requireCurrentConflict(context.profile, remotePath);
+    const conflict = await this.requireCurrentConflict(
+      context.profile,
+      context.syncRoot,
+      remotePath,
+    );
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     assertNoSymlinkSegments(context.syncRoot, localPath);
     let recovery: string | undefined;
     try {
       const localContent = await fs.readFile(localPath, 'utf8');
-      recovery = await this.store.saveRecovery(remotePath, localContent);
+      recovery = await this.store.saveRecovery(context.syncRoot, remotePath, localContent);
     } catch {
       // 本地文件不存在时无需备份
     }
 
     await fs.mkdir(path.dirname(localPath), { recursive: true });
     await fs.writeFile(localPath, conflict.remoteContent, 'utf8');
-    await this.setBaseline(context.manifest, {
+    await this.setBaseline(context.syncRoot, context.manifest, {
       entry: {
         id: conflict.remoteId,
         path: remotePath,
@@ -1090,7 +1151,7 @@ export class EcodeSyncService {
       formContexts: [],
       formMetadataWarnings: [],
     });
-    await this.store.deleteConflict(remotePath);
+    await this.store.deleteConflict(context.syncRoot, remotePath);
     await this.store.saveManifest(context.manifest);
     await this.refreshLocalChanges();
     return recovery;
@@ -1098,10 +1159,14 @@ export class EcodeSyncService {
 
   async markMerged(remotePath: string): Promise<void> {
     const context = await this.loadContext();
-    const conflict = await this.requireCurrentConflict(context.profile, remotePath);
+    const conflict = await this.requireCurrentConflict(
+      context.profile,
+      context.syncRoot,
+      remotePath,
+    );
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     await fs.access(localPath);
-    await this.setBaseline(context.manifest, {
+    await this.setBaseline(context.syncRoot, context.manifest, {
       entry: {
         id: conflict.remoteId,
         path: remotePath,
@@ -1114,14 +1179,14 @@ export class EcodeSyncService {
       formContexts: [],
       formMetadataWarnings: [],
     });
-    await this.store.deleteConflict(remotePath);
+    await this.store.deleteConflict(context.syncRoot, remotePath);
     await this.store.saveManifest(context.manifest);
     await this.refreshLocalChanges();
   }
 
   async revertLocalChange(remotePath: string): Promise<string | undefined> {
     const context = await this.loadContext();
-    const local = await this.scanLocalFiles(context.syncRoot);
+    const local = await this.localScanner.scan(context.syncRoot);
     const change = buildLocalChanges(context.manifest, local.files)
       .find(item => item.path === remotePath);
     if (!change || !['localAdded', 'localModified', 'localDeleted'].includes(change.status)) {
@@ -1131,7 +1196,7 @@ export class EcodeSyncService {
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     assertNoSymlinkSegments(context.syncRoot, localPath);
     const scannedLocal = local.files.get(remotePath);
-    const currentLocal = await this.readLocalFileIfExists(localPath, remotePath);
+    const currentLocal = await this.localScanner.readFileIfExists(localPath, remotePath);
     if (currentLocal?.hash !== scannedLocal?.hash) {
       throw new Error('本地文件在回退前再次变化，请刷新后重试');
     }
@@ -1141,19 +1206,30 @@ export class EcodeSyncService {
       if (!currentLocal) {
         throw new Error('本地新增文件已不存在');
       }
-      recovery = await this.store.saveRecovery(remotePath, currentLocal.content);
+      recovery = await this.store.saveRecovery(
+        context.syncRoot,
+        remotePath,
+        currentLocal.content,
+      );
       await fs.unlink(localPath);
     } else {
       const baseline = context.manifest.files[remotePath];
       if (!baseline) {
         throw new Error('未找到可用于回退的同步基线');
       }
-      const baselineContent = await this.store.readSnapshot(baseline.snapshotKey);
+      const baselineContent = await this.store.readSnapshot(
+        context.syncRoot,
+        baseline.snapshotKey,
+      );
       if (hashText(baselineContent) !== baseline.baselineHash) {
         throw new Error('同步基线快照校验失败，已停止回退');
       }
       if (currentLocal) {
-        recovery = await this.store.saveRecovery(remotePath, currentLocal.content);
+        recovery = await this.store.saveRecovery(
+          context.syncRoot,
+          remotePath,
+          currentLocal.content,
+        );
       }
       await fs.mkdir(path.dirname(localPath), { recursive: true });
       await fs.writeFile(localPath, baselineContent, 'utf8');
@@ -1165,18 +1241,22 @@ export class EcodeSyncService {
 
   async acceptRemoteDeletion(remotePath: string): Promise<string | undefined> {
     const context = await this.loadContext();
-    await this.requireRemoteDeletionConflict(context.profile, remotePath);
+    await this.requireRemoteDeletionConflict(
+      context.profile,
+      context.syncRoot,
+      remotePath,
+    );
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     assertNoSymlinkSegments(context.syncRoot, localPath);
-    const currentLocal = await this.readLocalFileIfExists(localPath, remotePath);
+    const currentLocal = await this.localScanner.readFileIfExists(localPath, remotePath);
     const recovery = currentLocal
-      ? await this.store.saveRecovery(remotePath, currentLocal.content)
+      ? await this.store.saveRecovery(context.syncRoot, remotePath, currentLocal.content)
       : undefined;
     if (currentLocal) {
       await fs.unlink(localPath);
     }
     delete context.manifest.files[remotePath];
-    await this.store.deleteConflict(remotePath);
+    await this.store.deleteConflict(context.syncRoot, remotePath);
     await this.store.saveManifest(context.manifest);
     await this.refreshLocalChanges();
     return recovery;
@@ -1184,14 +1264,18 @@ export class EcodeSyncService {
 
   async keepLocalAfterRemoteDeletion(remotePath: string): Promise<void> {
     const context = await this.loadContext();
-    await this.requireRemoteDeletionConflict(context.profile, remotePath);
+    await this.requireRemoteDeletionConflict(
+      context.profile,
+      context.syncRoot,
+      remotePath,
+    );
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     assertNoSymlinkSegments(context.syncRoot, localPath);
-    if (!await this.readLocalFileIfExists(localPath, remotePath)) {
+    if (!await this.localScanner.readFileIfExists(localPath, remotePath)) {
       throw new Error('本地文件已不存在，无法保留并重新创建远端文件');
     }
     delete context.manifest.files[remotePath];
-    await this.store.deleteConflict(remotePath);
+    await this.store.deleteConflict(context.syncRoot, remotePath);
     await this.store.saveManifest(context.manifest);
     await this.refreshLocalChanges();
   }
@@ -1233,7 +1317,9 @@ export class EcodeSyncService {
       );
     }
     const existing = remoteIndex.files.get(artifact.path);
-    const remote = existing ? await this.readRemote(api, existing) : undefined;
+    const remote = existing
+      ? await this.remoteScanner.readFile(api, existing)
+      : undefined;
     if (
       artifact.operation !== 'delete'
       && remote?.hash === artifact.resultHash
@@ -1246,11 +1332,7 @@ export class EcodeSyncService {
   }
 
   private verifyTargetLocalArtifact(
-    local: {
-      files: Map<string, LocalFileState>;
-      directories: Set<string>;
-      unsupported: SyncChange[];
-    },
+    local: LocalScan,
     artifact: ReleaseArtifact,
     remoteResult: DeploymentFileResult,
   ): DeploymentFileResult {
@@ -1312,11 +1394,11 @@ export class EcodeSyncService {
     }
     const localPath = resolveSafeLocalPath(syncRoot, artifact.path);
     assertNoSymlinkSegments(syncRoot, localPath);
-    const current = await this.readLocalFileIfExists(localPath, artifact.path);
+    const current = await this.localScanner.readFileIfExists(localPath, artifact.path);
     if (current?.hash !== localFile.hash) {
       throw new Error(`${artifact.path}: 目标环境本地源码在应用准备期间发生变化`);
     }
-    await this.store.saveRecovery(artifact.path, current.content);
+    await this.store.saveRecovery(syncRoot, artifact.path, current.content);
   }
 
   private async reconcileReleaseArtifactLocal(
@@ -1326,7 +1408,7 @@ export class EcodeSyncService {
   ): Promise<void> {
     const localPath = resolveSafeLocalPath(syncRoot, artifact.path);
     assertNoSymlinkSegments(syncRoot, localPath);
-    const current = await this.readLocalFileIfExists(localPath, artifact.path);
+    const current = await this.localScanner.readFileIfExists(localPath, artifact.path);
     if (current?.hash !== expectedLocalHash) {
       throw new Error(`${artifact.path}: 目标环境本地源码在应用期间发生变化，已停止覆盖`);
     }
@@ -1341,6 +1423,33 @@ export class EcodeSyncService {
     }
     await fs.mkdir(path.dirname(localPath), { recursive: true });
     await fs.writeFile(localPath, artifact.resultContent, 'utf8');
+  }
+
+  private updateLocalStateAfterRelease(
+    local: LocalScan,
+    artifact: ReleaseArtifact,
+    previousLocalPath?: string,
+  ): void {
+    if (previousLocalPath) {
+      local.files.delete(previousLocalPath);
+    }
+    if (artifact.operation === 'delete') {
+      local.files.delete(artifact.path);
+      return;
+    }
+    if (artifact.resultContent === undefined || artifact.resultHash === undefined) {
+      return;
+    }
+    local.files.set(artifact.path, {
+      path: artifact.path,
+      content: artifact.resultContent,
+      hash: artifact.resultHash,
+    });
+    let parent = path.posix.dirname(artifact.path);
+    while (parent !== '.') {
+      local.directories.add(parent);
+      parent = path.posix.dirname(parent);
+    }
   }
 
   private validateReleaseArtifacts(artifacts: ReleaseArtifact[]): void {
@@ -1410,369 +1519,6 @@ export class EcodeSyncService {
       + `${details.join('\n')}\n`
       + '请改用 Unicode 转义或其他纯 ASCII 表达，例如用 "\\u203A" 表示 ›。',
     );
-  }
-
-  private async scanRemote(
-    api: FileApi,
-    onProgress: (message: string) => void,
-    cancellation?: CancellationLike,
-  ): Promise<RemoteScan> {
-    const index = await this.listRemoteIndex(api, cancellation, onProgress);
-    const entries = index.files;
-    const unsupported: SyncChange[] = [...index.pathCollisions];
-    const errors: string[] = [];
-    const total = entries.size;
-    let completed = 0;
-    onProgress(`正在读取远端文件 0/${total}`);
-    const contents = await mapConcurrent([...entries.values()], 4, async entry => {
-      this.throwIfCancelled(cancellation);
-      try {
-        const preloaded = index.preloadedFiles.get(entry.path);
-        return preloaded?.entry.id === entry.id
-          ? preloaded
-          : await this.readRemote(api, entry);
-      } catch (error: unknown) {
-        if (error instanceof SessionExpiredError) {
-          throw error;
-        }
-        if (error instanceof EcodeOperationError && error.code !== undefined) {
-          errors.push(`${entry.path}: ${error.message}`);
-          return undefined;
-        }
-        unsupported.push({
-          path: entry.path,
-          status: 'unsupported',
-          remoteId: entry.id,
-          message: errorMessage(error),
-        });
-        return undefined;
-      } finally {
-        completed++;
-        onProgress(`正在读取远端文件 ${completed}/${total}: ${entry.path}`);
-      }
-    });
-
-    return {
-      files: new Map(
-        contents
-          .filter((item): item is RemoteFileContent => Boolean(item))
-          .map(item => [item.entry.path, item]),
-      ),
-      presentPaths: new Set([
-        ...index.observedFilePaths,
-        ...index.pathCollisions.map(change => change.path),
-      ]),
-      presentDirectories: new Set([
-        ...index.directories.keys(),
-        ...index.ambiguousDirectories,
-      ]),
-      ambiguousDirectories: new Set(index.ambiguousDirectories),
-      unsupported,
-      errors,
-    };
-  }
-
-  private async listRemoteIndex(
-    api: FileApi,
-    cancellation?: CancellationLike,
-    onProgress?: (message: string) => void,
-  ): Promise<RemoteIndex> {
-    onProgress?.('正在读取远端文件树...');
-    const rootResponse = await api.listTree();
-    if (
-      !rootResponse.status
-      && rootResponse.code === undefined
-      && !rootResponse.msg
-    ) {
-      throw new EcodeOperationError(
-        '获取远端文件树失败：服务端返回 status=false，且未提供错误码或错误消息；'
-        + '请重新配置连接并确认登录账号具有 Ecode 源码读取权限',
-      );
-    }
-    const root = requireSuccess(rootResponse, '获取远端文件树失败');
-    const entries: RemoteFileEntry[] = [];
-    const directories: RemoteDirectoryEntry[] = [];
-    const directoryHasDataByNode = new Map<string, boolean>();
-    const traversedPathByNode = new Map<string, string>();
-    const aliasedDirectoryPaths = new Set<string>();
-    const traversalCollisions: SyncChange[] = [];
-    let pending: RemoteTreeTask[] = [];
-    const system = root.system;
-    if (system?.id) {
-      pending.push({
-        id: system.id,
-        path: normalizeRemotePath(system.name),
-        kind: 'type',
-      });
-    }
-    for (const type of root.typeList) {
-      pending.push({
-        id: type.id,
-        path: normalizeRemotePath(type.name),
-        kind: 'type',
-      });
-    }
-
-    let completedDirectories = 0;
-    while (pending.length > 0) {
-      this.throwIfCancelled(cancellation);
-      const level: RemoteTreeTask[] = [];
-      for (const task of pending) {
-        const nodeKey = remoteDirectoryNodeKey(task);
-        const traversedPath = traversedPathByNode.get(nodeKey);
-        if (traversedPath === undefined) {
-          traversedPathByNode.set(nodeKey, task.path);
-          level.push(task);
-          continue;
-        }
-        if (traversedPath === task.path) {
-          this.output.warn(
-            `远端目录节点重复，已安全去重: ${task.path} `
-              + `(${formatMaskedRemoteIds([task.id])})`,
-          );
-          continue;
-        }
-        if (!aliasedDirectoryPaths.has(task.path)) {
-          aliasedDirectoryPaths.add(task.path);
-          traversalCollisions.push({
-            path: task.path,
-            status: 'unsupported',
-            conflictReason: 'remotePathCollision',
-            message: `远端目录节点同时映射到多个路径，已隔离歧义子树: ${task.path}`,
-          });
-          this.output.warn(
-            `远端目录节点形成重复引用或循环，已隔离: `
-              + `${traversedPath} / ${task.path} `
-              + `(${formatMaskedRemoteIds([task.id])})`,
-          );
-        }
-      }
-      pending = [];
-      if (level.length === 0) {
-        continue;
-      }
-      const children = await mapConcurrent(level, 4, async task => {
-        this.throwIfCancelled(cancellation);
-        const payload = requireSuccess(
-          await this.listDirectory(api, task),
-          task.kind === 'type'
-            ? `读取分类失败: ${task.path}`
-            : `读取目录失败: ${task.path}`,
-        );
-        directories.push(task);
-        directoryHasDataByNode.set(
-          remoteDirectoryNodeKey(task),
-          payload.childFile.length > 0
-            || payload.childFolder.length > 0
-            || payload.typeList.length > 0,
-        );
-        this.collectFiles(payload.childFile, task.path, entries);
-        completedDirectories++;
-        onProgress?.(`正在扫描远端目录：已完成 ${completedDirectories} 个`);
-        return [
-          ...payload.childFolder.map(folder => ({
-            id: folder.id,
-            path: normalizeRemotePath(joinRemote(task.path, folder.name)),
-            kind: 'folder' as const,
-          })),
-          ...payload.typeList.map(type => ({
-            id: type.id,
-            path: normalizeRemotePath(joinRemote(task.path, type.name)),
-            kind: 'type' as const,
-          })),
-        ];
-      });
-      pending.push(...children.flat());
-    }
-
-    const observedFilePaths = new Set(entries.map(item => item.path));
-    const ambiguousDirectories = new Set(aliasedDirectoryPaths);
-    const pathCollisions: SyncChange[] = [...traversalCollisions];
-    const directoryMap = new Map<string, RemoteDirectoryEntry>();
-    const directoriesByPath = new Map<
-      string,
-      Map<string, RemoteDirectoryEntry>
-    >();
-    for (const directory of directories) {
-      const nodes = directoriesByPath.get(directory.path)
-        ?? new Map<string, RemoteDirectoryEntry>();
-      nodes.set(remoteDirectoryNodeKey(directory), directory);
-      directoriesByPath.set(directory.path, nodes);
-    }
-    for (const [remotePath, nodesById] of directoriesByPath) {
-      if (ambiguousDirectories.has(remotePath)) {
-        continue;
-      }
-      const nodes = [...nodesById.values()];
-      if (nodes.length === 1) {
-        directoryMap.set(remotePath, nodes[0]);
-        continue;
-      }
-      const populated = nodes.filter(node =>
-        directoryHasDataByNode.get(remoteDirectoryNodeKey(node)) === true);
-      if (populated.length === 1) {
-        directoryMap.set(remotePath, populated[0]);
-        this.output.warn(
-          `远端目录路径重复，已选择唯一有数据节点: ${remotePath} `
-            + `(selected=${formatMaskedRemoteIds([populated[0].id])}; `
-            + `candidates=${formatMaskedRemoteIds(nodes.map(node => node.id))})`,
-        );
-        continue;
-      }
-      ambiguousDirectories.add(remotePath);
-      pathCollisions.push({
-        path: remotePath,
-        status: 'unsupported',
-        conflictReason: 'remotePathCollision',
-        message: `远端目录路径存在多个节点，且无法唯一确定有数据节点，已隔离子树: ${remotePath}`,
-      });
-      this.output.warn(
-        `远端目录路径存在歧义，已隔离子树: ${remotePath} `
-          + `(${formatMaskedRemoteIds(nodes.map(node => node.id))})`,
-      );
-    }
-    for (const directoryPath of [...directoryMap.keys()]) {
-      if ([...ambiguousDirectories].some(ambiguousPath =>
-        isPathAtOrBelow(directoryPath, ambiguousPath))) {
-        directoryMap.delete(directoryPath);
-      }
-    }
-
-    const candidateEntries = entries.filter(entry =>
-      ![...ambiguousDirectories].some(directory =>
-        isPathAtOrBelow(entry.path, directory)));
-    const entriesByPath = new Map<string, RemoteFileEntry[]>();
-    for (const entry of candidateEntries) {
-      const matches = entriesByPath.get(entry.path) ?? [];
-      matches.push(entry);
-      entriesByPath.set(entry.path, matches);
-    }
-    const resolvedEntries: RemoteFileEntry[] = [];
-    const preloadedFiles = new Map<string, RemoteFileContent>();
-    for (const [remotePath, matches] of entriesByPath) {
-      const entriesById = new Map<string, RemoteFileEntry>();
-      for (const entry of matches) {
-        entriesById.set(entry.id, entry);
-      }
-      const uniqueEntries = [...entriesById.values()];
-      if (uniqueEntries.length === 1) {
-        resolvedEntries.push(uniqueEntries[0]);
-        if (matches.length > 1) {
-          this.output.warn(
-            `远端文件节点重复，已安全去重: ${remotePath} `
-              + `(${formatMaskedRemoteIds([uniqueEntries[0].id])})`,
-          );
-        }
-        continue;
-      }
-
-      const inspected = await mapConcurrent(uniqueEntries, 4, async entry => {
-        this.throwIfCancelled(cancellation);
-        try {
-          return {
-            entry,
-            content: await this.readRemote(api, entry),
-          };
-        } catch (error: unknown) {
-          if (error instanceof SessionExpiredError) {
-            throw error;
-          }
-          return { entry, content: undefined };
-        }
-      });
-      const readable = inspected.filter(
-        (item): item is {
-          entry: RemoteFileEntry;
-          content: RemoteFileContent;
-        } => Boolean(item.content),
-      );
-      const populated = readable.filter(item => item.content.content.length > 0);
-      if (readable.length === uniqueEntries.length && populated.length === 1) {
-        const selected = populated[0];
-        resolvedEntries.push(selected.entry);
-        preloadedFiles.set(remotePath, selected.content);
-        this.output.warn(
-          `远端文件路径重复，已选择唯一有数据节点: ${remotePath} `
-            + `(selected=${formatMaskedRemoteIds([selected.entry.id])}; `
-            + `candidates=${formatMaskedRemoteIds(uniqueEntries.map(entry => entry.id))})`,
-        );
-        continue;
-      }
-      pathCollisions.push({
-        path: remotePath,
-        status: 'unsupported',
-        conflictReason: 'remotePathCollision',
-        message: `远端文件路径存在多个节点，且无法唯一确定有数据节点，已标记为不支持: ${remotePath}`,
-      });
-      this.output.warn(
-        `远端文件路径存在歧义，已标记为不支持: ${remotePath} `
-          + `(${formatMaskedRemoteIds(uniqueEntries.map(entry => entry.id))})`,
-      );
-    }
-
-    const allDirectoryPaths = new Set([
-      ...directoryMap.keys(),
-      ...ambiguousDirectories,
-    ]);
-    assertNoCaseCollisions(allDirectoryPaths);
-    const directoryPathByKey = new Map<string, string>();
-    for (const directoryPath of allDirectoryPaths) {
-      directoryPathByKey.set(remotePathKey(directoryPath), directoryPath);
-    }
-    const collisionKeys = new Set(
-      pathCollisions.map(change => remotePathKey(change.path)),
-    );
-    for (const entry of resolvedEntries) {
-      const directoryPath = directoryPathByKey.get(remotePathKey(entry.path));
-      if (!directoryPath) {
-        continue;
-      }
-      collisionKeys.add(remotePathKey(entry.path));
-      pathCollisions.push({
-        path: entry.path,
-        status: 'unsupported',
-        remoteId: entry.id,
-        conflictReason: 'remotePathCollision',
-        message: entry.path === directoryPath
-          ? `远端同一路径同时存在文件和目录，无法映射到本地: ${entry.path}`
-          : `远端文件与目录路径仅大小写不同，无法映射到本地: ${entry.path} / ${directoryPath}`,
-      });
-      const directory = directoryMap.get(directoryPath);
-      this.output.warn(
-        `远端文件与目录路径冲突，已标记为不支持: `
-          + `${entry.path}${entry.path === directoryPath ? '' : ` / ${directoryPath}`} `
-          + `(${formatMaskedRemoteIds([
-            entry.id,
-            ...(directory ? [directory.id] : []),
-          ])})`,
-      );
-    }
-    const safeEntries = resolvedEntries.filter(entry =>
-      !collisionKeys.has(remotePathKey(entry.path)));
-    const uniquePathCollisions = new Map<string, SyncChange>();
-    for (const collision of pathCollisions) {
-      uniquePathCollisions.set(remotePathKey(collision.path), collision);
-    }
-    return {
-      files: new Map(safeEntries.map(item => [item.path, item])),
-      directories: directoryMap,
-      ambiguousDirectories,
-      pathCollisions: [...uniquePathCollisions.values()],
-      observedFilePaths,
-      preloadedFiles,
-    };
-  }
-
-  private collectFiles(nodes: TreeNode[], parentPath: string, entries: RemoteFileEntry[]): void {
-    for (const node of nodes) {
-      const remotePath = normalizeRemotePath(joinRemote(parentPath, node.name));
-      entries.push({
-        id: node.id,
-        path: remotePath,
-        name: node.name,
-        kind: 'text',
-      });
-    }
   }
 
   private async ensureRemoteDirectory(
@@ -1901,7 +1647,7 @@ export class EcodeSyncService {
       if (!baseline || !existing || existing.id !== baseline.remoteId) {
         return false;
       }
-      const latest = await this.readRemote(api, existing);
+      const latest = await this.remoteScanner.readFile(api, existing);
       if (latest.hash !== baseline.baselineHash) {
         return false;
       }
@@ -1958,22 +1704,13 @@ export class EcodeSyncService {
     }
   }
 
-  private listDirectory(
-    api: FileApi,
-    directory: RemoteDirectoryEntry,
-  ): Promise<ApiResponse<TreePayload>> {
-    return directory.kind === 'type'
-      ? api.listTree('', directory.id)
-      : api.listTree(directory.id);
-  }
-
   private async findRemoteFoldersInDirectory(
     api: FileApi,
     parent: RemoteDirectoryEntry,
     folderName: string,
   ): Promise<TreeNode[]> {
     const payload = requireSuccess(
-      await this.listDirectory(api, parent),
+      await this.remoteScanner.listDirectory(api, parent),
       `读取远端父目录失败: ${parent.path}`,
     );
     return payload.childFolder.filter(folder => folder.name === folderName);
@@ -1986,7 +1723,7 @@ export class EcodeSyncService {
     remotePath: string,
   ): Promise<RemoteFileEntry | undefined> {
     const payload = requireSuccess(
-      await this.listDirectory(api, parent),
+      await this.remoteScanner.listDirectory(api, parent),
       `读取远端父目录失败: ${parent.path}`,
     );
     const matches = payload.childFile.filter(file => file.name === fileName);
@@ -2013,22 +1750,6 @@ export class EcodeSyncService {
     throw new Error(`${prefix}${response.msg ? `: ${response.msg}` : ''}`);
   }
 
-  private async readRemote(api: FileApi, entry: RemoteFileEntry): Promise<RemoteFileContent> {
-    const response = await api.viewFileDetail(entry.id);
-    const detail = requireSuccess(response, `读取远端文件失败: ${entry.path}`);
-    if (!isSupportedText(detail.content)) {
-      throw new Error('当前版本不支持二进制或非 UTF-8 文件');
-    }
-    return {
-      entry,
-      content: detail.content,
-      hash: hashText(detail.content),
-      formMetadataState: detail.formMetadataState,
-      formContexts: detail.formContexts,
-      formMetadataWarnings: detail.formMetadataWarnings,
-    };
-  }
-
   private async readRemoteAfterMutation(
     api: FileApi,
     entry: RemoteFileEntry,
@@ -2044,7 +1765,7 @@ export class EcodeSyncService {
       }
       this.throwIfCancelled(cancellation);
       try {
-        latest = await this.readRemote(api, entry);
+        latest = await this.remoteScanner.readFile(api, entry);
         if (!expectedHash || latest.hash === expectedHash) {
           return latest;
         }
@@ -2242,89 +1963,12 @@ export class EcodeSyncService {
     }
   }
 
-  private async scanLocalFiles(syncRoot: string): Promise<{
-    files: Map<string, LocalFileState>;
-    directories: Set<string>;
-    unsupported: SyncChange[];
-  }> {
-    const files = new Map<string, LocalFileState>();
-    const directories = new Set<string>();
-    const unsupported: SyncChange[] = [];
-    try {
-      await fs.access(syncRoot);
-    } catch {
-      return { files, directories, unsupported };
-    }
-
-    const walk = async (directory: string): Promise<void> => {
-      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-        const absolute = path.join(directory, entry.name);
-        const relative = path.relative(syncRoot, absolute).split(path.sep).join('/');
-        if (entry.isSymbolicLink()) {
-          unsupported.push({
-            path: relative,
-            status: 'unsupported',
-            message: '不跟随符号链接',
-          });
-        } else if (entry.isDirectory()) {
-          directories.add(relative);
-          await walk(absolute);
-        } else if (entry.isFile()) {
-          const buffer = await fs.readFile(absolute);
-          let content: string;
-          try {
-            content = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
-          } catch {
-            unsupported.push({
-              path: relative,
-              status: 'unsupported',
-              message: '当前版本仅支持 UTF-8 文本',
-            });
-            continue;
-          }
-          if (!isSupportedText(content)) {
-            unsupported.push({
-              path: relative,
-              status: 'unsupported',
-              message: '当前版本不支持二进制文件',
-            });
-            continue;
-          }
-          files.set(relative, { path: relative, content, hash: hashText(content) });
-        }
-      }
-    };
-    await walk(syncRoot);
-    assertNoCaseCollisions(files.keys());
-    assertNoCaseCollisions(directories);
-    return { files, directories, unsupported };
-  }
-
-  private async readLocalFileIfExists(
-    localPath: string,
-    remotePath: string,
-  ): Promise<LocalFileState | undefined> {
-    try {
-      const stat = await fs.lstat(localPath);
-      if (stat.isSymbolicLink()) {
-        throw new Error(`同步路径包含符号链接: ${localPath}`);
-      }
-      const buffer = await fs.readFile(localPath);
-      const content = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
-      if (!isSupportedText(content)) {
-        throw new Error(`当前版本不支持非文本本地文件: ${remotePath}`);
-      }
-      return { path: remotePath, content, hash: hashText(content) };
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return undefined;
-      }
-      throw error;
-    }
-  }
-
-  private async setBaseline(manifest: SyncManifest, remote: RemoteFileContent): Promise<void> {
-    const snapshotKey = await this.store.saveSnapshot(remote.content);
+  private async setBaseline(
+    syncRoot: string,
+    manifest: SyncManifest,
+    remote: RemoteFileContent,
+  ): Promise<void> {
+    const snapshotKey = await this.store.saveSnapshot(syncRoot, remote.content);
     const entry: ManifestEntry = {
       remoteId: remote.entry.id,
       path: remote.entry.path,
@@ -2337,18 +1981,20 @@ export class EcodeSyncService {
   }
 
   private async recordPushConflict(
+    syncRoot: string,
     api: FileApi,
     remotePath: string,
     entry: RemoteFileEntry,
     reason: StoredConflict['reason'],
   ): Promise<void> {
-    const latest = await this.readRemote(api, entry);
-    await this.store.saveConflict(toStoredConflict(latest, reason));
+    const latest = await this.remoteScanner.readFile(api, entry);
+    await this.store.saveConflict(syncRoot, toStoredConflict(latest, reason));
     this.lastRemoteFiles.set(remotePath, latest);
     this.output.warn(`Push blocked by conflict: ${remotePath}`);
   }
 
   private async saveRemoteDeletionConflict(
+    syncRoot: string,
     manifest: SyncManifest,
     remotePath: string,
   ): Promise<void> {
@@ -2356,7 +2002,7 @@ export class EcodeSyncService {
     if (!baseline) {
       return;
     }
-    await this.store.saveConflict({
+    await this.store.saveConflict(syncRoot, {
       path: remotePath,
       remoteId: baseline.remoteId,
       remoteContent: '',
@@ -2368,12 +2014,13 @@ export class EcodeSyncService {
   }
 
   private async mergeStoredConflicts(
+    syncRoot: string,
     manifest: SyncManifest,
     localFiles: Map<string, LocalFileState>,
     changes: SyncChange[],
   ): Promise<SyncChange[]> {
     const merged = new Map(changes.map(change => [change.path, change]));
-    for (const conflict of await this.store.listConflicts()) {
+    for (const conflict of await this.store.listConflicts(syncRoot)) {
       const baseline = manifest.files[conflict.path];
       const local = localFiles.get(conflict.path);
       if (conflict.remoteDeleted) {
@@ -2388,7 +2035,7 @@ export class EcodeSyncService {
             message: conflictMessage('remoteDeletedLocalModified'),
           });
         } else {
-          await this.store.deleteConflict(conflict.path);
+          await this.store.deleteConflict(syncRoot, conflict.path);
         }
         continue;
       }
@@ -2426,9 +2073,10 @@ export class EcodeSyncService {
 
   private async requireCurrentConflict(
     profile: ConnectionProfile,
+    syncRoot: string,
     remotePath: string,
   ): Promise<StoredConflict> {
-    const stored = await this.store.loadConflict(remotePath);
+    const stored = await this.store.loadConflict(syncRoot, remotePath);
     if (!stored) {
       throw new Error('未找到可处理的冲突记录，请先重新拉取');
     }
@@ -2442,11 +2090,11 @@ export class EcodeSyncService {
         name: path.posix.basename(remotePath),
         kind: 'text',
       };
-      return this.readRemote(api, entry);
+      return this.remoteScanner.readFile(api, entry);
     });
     if (latest.hash !== stored.remoteHash) {
       const refreshed = toStoredConflict(latest, stored.reason);
-      await this.store.saveConflict(refreshed);
+      await this.store.saveConflict(syncRoot, refreshed);
       throw new Error('远端在冲突处理期间再次变化，请重新查看差异');
     }
     return stored;
@@ -2454,9 +2102,10 @@ export class EcodeSyncService {
 
   private async requireRemoteDeletionConflict(
     profile: ConnectionProfile,
+    syncRoot: string,
     remotePath: string,
   ): Promise<StoredConflict> {
-    const stored = await this.store.loadConflict(remotePath);
+    const stored = await this.store.loadConflict(syncRoot, remotePath);
     if (
       !stored
       || !stored.remoteDeleted
@@ -2465,7 +2114,7 @@ export class EcodeSyncService {
       throw new Error('未找到远端删除冲突记录，请先重新拉取');
     }
     const existing = await this.withAuthentication(profile, async api =>
-      (await this.listRemoteIndex(api)).files.get(remotePath),
+      (await this.remoteScanner.listIndex(api)).files.get(remotePath),
     );
     if (existing) {
       throw new Error('远端文件已重新出现，请重新拉取并检查差异');
@@ -2502,45 +2151,6 @@ export class EcodeSyncService {
   }
 }
 
-export class SyncCancelledError extends Error {
-  constructor() {
-    super('同步操作已取消');
-    this.name = 'SyncCancelledError';
-  }
-}
-
-class SessionExpiredError extends Error {}
-
-class EcodeOperationError extends Error {
-  constructor(message: string, readonly code?: number | string) {
-    super(message);
-  }
-}
-
-function requireSuccess<T>(response: ApiResponse<T>, prefix: string): T {
-  if (!response.status || response.data === undefined) {
-    if (isUnauthorized(response.code)) {
-      throw new SessionExpiredError(response.msg || 'Session expired');
-    }
-    const detail = response.msg
-      ?? (response.code !== undefined ? `错误码 ${response.code}` : undefined);
-    throw new EcodeOperationError(
-      `${prefix}${detail ? `: ${detail}` : ''}`,
-      response.code,
-    );
-  }
-  return response.data;
-}
-
-function isUnauthorized(code: number | string | undefined): boolean {
-  return code === 401
-    || code === '401'
-    || code === '002'
-    || code === '005'
-    || code === '1001'
-    || code === '1002';
-}
-
 function isAmbiguousMutationFailure(response: ApiResponse<unknown>): boolean {
   const numericCode = typeof response.code === 'number'
     ? response.code
@@ -2548,37 +2158,6 @@ function isAmbiguousMutationFailure(response: ApiResponse<unknown>): boolean {
       ? Number(response.code)
       : undefined;
   return numericCode === -1 || (numericCode !== undefined && numericCode >= 500);
-}
-
-function joinRemote(parent: string, name: string): string {
-  return parent ? `${parent}/${name}` : name;
-}
-
-function remoteDirectoryNodeKey(directory: RemoteDirectoryEntry): string {
-  return `${directory.kind}:${directory.id}`;
-}
-
-function formatMaskedRemoteIds(ids: Iterable<string>): string {
-  return [...new Set(ids)]
-    .sort()
-    .map(maskRemoteId)
-    .join(', ');
-}
-
-function maskRemoteId(id: string): string {
-  if (id.length <= 2) {
-    return `${id.slice(0, 1)}***`;
-  }
-  return `${id.slice(0, 2)}***${id.slice(-2)}`;
-}
-
-function remotePathKey(value: string): string {
-  return value.toLocaleLowerCase('en-US');
-}
-
-function isPathAtOrBelow(remotePath: string, directoryPath: string): boolean {
-  return remotePath === directoryPath
-    || isDescendantPath(remotePath, directoryPath);
 }
 
 function findRemotePathCollision(

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { EcodeSyncService } from '../sync/EcodeSyncService';
+import { type EcodeSyncService } from '../sync/EcodeSyncService';
 
 export const BASELINE_SCHEME = 'ecode-baseline';
 export const REMOTE_SCHEME = 'ecode-remote';

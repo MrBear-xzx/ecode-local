@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { AddressInfo } from 'net';
+import { type AddressInfo } from 'net';
 import type { FormMetadataCache } from '../../domain/formMetadata';
 import { hashText } from '../../domain/text';
 import type {
@@ -15,6 +15,7 @@ import type {
 } from '../../domain/types';
 import type { WorkspaceStore } from '../../storage/WorkspaceStore';
 import { EcodeSyncService, SyncCancelledError } from '../../sync/EcodeSyncService';
+import { LocalWorkspaceScanner } from '../../sync/LocalWorkspaceScanner';
 import { EcodeApiClient } from '../../sync/api/EcodeApiClient';
 import type { AuthManager } from '../../sync/auth/AuthManager';
 
@@ -343,6 +344,40 @@ suite('Ecode sync service', () => {
     assert.ok(progress.some(message => message.includes('扫描远端目录')));
     assert.ok(progress.some(message => message.includes('读取远端文件 1/1')));
     assert.ok(progress.some(message => message.includes('扫描本地文件')));
+  });
+
+  test('batches manifest persistence during a full pull', async () => {
+    files = Array.from({ length: 51 }, (_, index) => ({
+      id: `file-${index}`,
+      name: `file-${index}.js`,
+      content: `const value = ${index};\n`,
+    }));
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.pulled, files.length);
+    assert.strictEqual(harness.store.manifestSaves, 3);
+  });
+
+  test('flushes the manifest when pull post-processing exits unexpectedly', async () => {
+    files = [
+      { id: 'file-1', name: 'first.js', content: 'const first = true;\n' },
+      { id: 'file-2', name: 'second.js', content: 'const second = true;\n' },
+    ];
+    const harness = createHarness(root, baseUrl);
+
+    await assert.rejects(
+      harness.service.pull(message => {
+        if (message.includes('正在应用远端变更 2/2')) {
+          throw new Error('simulated progress failure');
+        }
+      }),
+      /simulated progress failure/,
+    );
+
+    assert.strictEqual(harness.store.manifestSaves, 1);
+    assert.ok(harness.store.manifest.files['Type/first.js']);
   });
 
   test('does not report every local file before an environment baseline exists', async () => {
@@ -906,8 +941,10 @@ suite('Ecode sync service', () => {
   });
 
   test('publishes frozen additions and deletions by remote path', async () => {
-    const harness = createHarness(root, baseUrl);
+    const localScanner = new TrackingLocalWorkspaceScanner();
+    const harness = createHarness(root, baseUrl, localScanner);
     await harness.service.pull(() => undefined);
+    localScanner.scanCalls = 0;
     const addedContent = 'const addedByRelease = true;\n';
     const artifacts: ReleaseArtifact[] = [{
       path: 'Type/a.js',
@@ -945,6 +982,7 @@ suite('Ecode sync service', () => {
       harness.store.manifest.files['Type/released.js'].baselineHash,
       hashText(addedContent),
     );
+    assert.strictEqual(localScanner.scanCalls, 2);
   });
 
   test('creates a missing target file for a source modification at the same relative path', async () => {
@@ -1444,7 +1482,7 @@ suite('Ecode sync service', () => {
     const localPath = path.join(root, 'ecode', 'Type', 'a.js');
     fs.writeFileSync(localPath, content);
     files[0].content = content;
-    await harness.store.saveConflict({
+    await harness.store.saveConflict(path.join(root, 'ecode'), {
       path: 'Type/a.js',
       remoteId: 'file-1',
       remoteContent: content,
@@ -1616,7 +1654,11 @@ suite('Ecode sync service', () => {
   });
 });
 
-function createHarness(workspaceFolder: string, serverUrl: string): {
+function createHarness(
+  workspaceFolder: string,
+  serverUrl: string,
+  localScanner?: LocalWorkspaceScanner,
+): {
   service: EcodeSyncService;
   store: MemoryStore;
   authState: { reconnects: number };
@@ -1651,6 +1693,8 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
       store as unknown as WorkspaceStore,
       auth,
       output as never,
+      undefined,
+      localScanner,
     ),
     store,
     authState,
@@ -1660,6 +1704,7 @@ function createHarness(workspaceFolder: string, serverUrl: string): {
 
 class MemoryStore {
   manifest: SyncManifest;
+  manifestSaves = 0;
   formMetadata: FormMetadataCache;
   failFormMetadataSave = false;
   conflicts = new Map<string, StoredConflict>();
@@ -1694,6 +1739,7 @@ class MemoryStore {
   }
 
   async saveManifest(manifest: SyncManifest): Promise<void> {
+    this.manifestSaves++;
     manifest.updatedAt = new Date().toISOString();
     this.manifest = manifest;
   }
@@ -1714,34 +1760,50 @@ class MemoryStore {
     this.formMetadata = cache;
   }
 
-  async saveSnapshot(content: string): Promise<string> {
+  async saveSnapshot(_syncRoot: string, content: string): Promise<string> {
     const key = String(this.snapshots.size + 1);
     this.snapshots.set(key, content);
     return key;
   }
 
-  async readSnapshot(key: string): Promise<string> {
+  async readSnapshot(_syncRoot: string, key: string): Promise<string> {
     return this.snapshots.get(key) ?? '';
   }
 
-  async saveConflict(conflict: StoredConflict): Promise<void> {
+  async saveConflict(_syncRoot: string, conflict: StoredConflict): Promise<void> {
     this.conflicts.set(conflict.path, conflict);
   }
 
-  async loadConflict(remotePath: string): Promise<StoredConflict | undefined> {
+  async loadConflict(
+    _syncRoot: string,
+    remotePath: string,
+  ): Promise<StoredConflict | undefined> {
     return this.conflicts.get(remotePath);
   }
 
-  async listConflicts(): Promise<StoredConflict[]> {
+  async listConflicts(_syncRoot: string): Promise<StoredConflict[]> {
     return [...this.conflicts.values()];
   }
 
-  async deleteConflict(remotePath: string): Promise<void> {
+  async deleteConflict(_syncRoot: string, remotePath: string): Promise<void> {
     this.conflicts.delete(remotePath);
   }
 
-  async saveRecovery(remotePath: string, content: string): Promise<string> {
+  async saveRecovery(
+    _syncRoot: string,
+    remotePath: string,
+    content: string,
+  ): Promise<string> {
     this.recoveries.push({ path: remotePath, content });
     return 'recovery.txt';
+  }
+}
+
+class TrackingLocalWorkspaceScanner extends LocalWorkspaceScanner {
+  scanCalls = 0;
+
+  override async scan(syncRoot: string) {
+    this.scanCalls++;
+    return super.scan(syncRoot);
   }
 }

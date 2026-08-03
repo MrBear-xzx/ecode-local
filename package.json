@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -320,7 +320,7 @@
     "vscode:prepublish": "node esbuild.mjs --production",
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "lint": "eslint src --ext .ts",
+    "lint": "eslint src",
     "test": "node -e \"require('fs').rmSync('out/test',{recursive:true,force:true})\" && tsc && node ./out/test/runTest.js",
     "package": "vsce package --no-dependencies"
   },

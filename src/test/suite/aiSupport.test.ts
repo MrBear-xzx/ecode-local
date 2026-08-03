@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as ts from 'typescript';
 import * as vscode from 'vscode';
 import { parseAiPushRequest } from '../../ai/AiPushRequest';
+import { AiPushRequestController } from '../../ai/AiPushRequestController';
 import {
   generateComponentDeclarations,
   generateGlobalDeclarations,
@@ -21,6 +22,8 @@ import {
   WorkspaceComponentRegistry,
   type IndexedEcodeComponentCall,
 } from '../../language/WorkspaceComponentRegistry';
+import type { WorkspaceStore } from '../../storage/WorkspaceStore';
+import type { EcodeSyncService } from '../../sync/EcodeSyncService';
 
 suite('AI coding support', () => {
   test('normalizes documented types conservatively', () => {
@@ -125,6 +128,65 @@ suite('AI coding support', () => {
       }), 'push_001.json'),
       /只能包含英文字母/,
     );
+  });
+
+  test('invalidates a pending AI request when the workspace context changes', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-generation-'));
+    const workspaceA = path.join(root, 'workspace-a');
+    const workspaceB = path.join(root, 'workspace-b');
+    const requestDirectory = path.join(workspaceA, '.ecode-local', 'ai-requests');
+    fs.mkdirSync(requestDirectory, { recursive: true });
+    fs.mkdirSync(workspaceB, { recursive: true });
+    fs.writeFileSync(path.join(requestDirectory, 'pending.json'), JSON.stringify({
+      schemaVersion: 1,
+      id: 'pending',
+      action: 'push',
+      environmentDirectory: 'dev',
+      paths: ['Type/a.js'],
+      createdAt: new Date().toISOString(),
+    }), 'utf8');
+    let baselineChecks = 0;
+    let executions = 0;
+    const store = {
+      getActiveEnvironment: async () => undefined,
+      getProfile: async () => undefined,
+    } as unknown as WorkspaceStore;
+    const service = {
+      hasSyncBaseline: async () => {
+        baselineChecks++;
+        return true;
+      },
+    } as unknown as EcodeSyncService;
+    const controller = new AiPushRequestController(
+      store,
+      service,
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      () => false,
+      () => undefined,
+      () => true,
+      async () => {
+        executions++;
+        return undefined;
+      },
+      () => undefined,
+    );
+
+    try {
+      controller.configure(workspaceA);
+      await delay(20);
+      controller.configure(workspaceB);
+      await delay(400);
+
+      assert.strictEqual(baselineChecks, 0);
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(
+        fs.existsSync(path.join(workspaceA, '.ecode-local', 'ai-results', 'pending.json')),
+        false,
+      );
+    } finally {
+      controller.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('documents only the supplied ecode component calls with relative paths', () => {
@@ -348,4 +410,8 @@ function pathKey(filePath: string): string {
   return process.platform === 'win32'
     ? path.resolve(filePath).toLowerCase()
     : path.resolve(filePath);
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
 }

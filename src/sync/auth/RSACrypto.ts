@@ -19,7 +19,7 @@ export interface RsaInfo {
 export class RSACrypto {
   /** 将 base64 公钥转为 PEM 格式 */
   normalizePublicKey(rawKey: string): string {
-    let cleaned = rawKey
+    const cleaned = rawKey
       .replace(/-----BEGIN[^-]+-----/g, '')
       .replace(/-----END[^-]+-----/g, '')
       .replace(/[\s\r\n]/g, '');

@@ -14,6 +14,7 @@ import type {
   PushRecord,
   ReleaseArtifact,
 } from '../domain/types';
+import { writeJsonAtomic, writeTextAtomic } from './AtomicFileStore';
 
 export class PromotionStore {
   private readonly root: string;
@@ -274,7 +275,7 @@ export class PromotionStore {
       await fs.access(file);
     } catch {
       await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, content, 'utf8');
+      await writeTextAtomic(file, content);
     }
     return key;
   }
@@ -336,13 +337,6 @@ export class PromotionStore {
     }
     await writeJsonAtomic(path.join(this.root, directory, `${id}.json`), value);
   }
-}
-
-async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
-  const temporary = `${file}.tmp`;
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await fs.rename(temporary, file);
 }
 
 function compactTimestamp(iso: string): string {

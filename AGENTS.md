@@ -14,7 +14,7 @@
 - `npm test`：编译测试入口，再通过 `@vscode/test-electron` 启动扩展宿主并运行测试。
 - `npm run package`：生成经过压缩的生产版 `.vsix`。
 
-使用现有 `package-lock.json` 和 npm 工作流。虽然 `package.json` 声明了 `npm run lint`，但仓库目前没有 ESLint 配置，因此该命令暂不能作为有效验证步骤。
+使用现有 `package-lock.json` 和 npm 工作流。`npm run lint` 使用仓库根目录的 ESLint Flat Config 检查 TypeScript 源码。
 
 ## 编码风格与命名约定
 

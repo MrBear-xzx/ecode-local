@@ -1,4 +1,4 @@
-import { EcodeApiClient } from './EcodeApiClient';
+import { type EcodeApiClient } from './EcodeApiClient';
 import { extractFormMetadata } from './FormMetadataParser';
 import type { FormContext, FormField, FormTable } from '../../domain/formMetadata';
 import type {

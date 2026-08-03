@@ -43,7 +43,7 @@ import {
   type NestedSchema,
 } from './nestedKnowledge';
 import {
-  WorkspaceComponentRegistry,
+  type WorkspaceComponentRegistry,
   type RegisteredEcodeComponent,
 } from './WorkspaceComponentRegistry';
 import {
@@ -59,7 +59,7 @@ import {
 } from './formKnowledge';
 import {
   ECODE_FORM_SCHEME,
-  WorkspaceFormMetadataRegistry,
+  type WorkspaceFormMetadataRegistry,
 } from './WorkspaceFormMetadataRegistry';
 
 export const ECODE_DOC_SCHEME = 'ecode-doc';
