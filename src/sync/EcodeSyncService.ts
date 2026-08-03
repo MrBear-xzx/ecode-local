@@ -556,7 +556,7 @@ export class EcodeSyncService {
     // 即使远端为空，首次拉取也需要持久化初始化时间以建立同步基线。
     await manifestCheckpoint.markDirty();
 
-   try {
+    try {
       for (const item of plan.changes) {
         if (item.status === 'conflict') {
           const content = remote.files.get(item.path);
