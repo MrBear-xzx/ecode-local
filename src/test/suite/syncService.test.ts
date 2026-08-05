@@ -462,6 +462,35 @@ suite('Ecode sync service', () => {
         && change.status === 'unsupported'));
   });
 
+  test('allows device-like names and isolates other invalid remote names', async () => {
+    folders = [{ id: 'folder-invalid', name: 'Invalid:Folder', parentId: 'type-1' }];
+    files.push({
+      id: 'file-invalid',
+      name: 'CON.js',
+      content: 'const invalid = true;\n',
+      parentId: 'type-1',
+    });
+    const harness = createHarness(root, baseUrl);
+
+    const result = await harness.service.pull(() => undefined);
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pulled, 2);
+    assert.strictEqual(result.unsupported, 1);
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'a.js'), 'utf8'),
+      'const remote = true;\n',
+    );
+    assert.ok(harness.service.getLastPlan()?.blocked.some(change =>
+      change.path === 'Type/Invalid:Folder'
+        && change.status === 'unsupported'));
+    assert.strictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'CON.js'), 'utf8'),
+      'const invalid = true;\n',
+    );
+    assert.strictEqual(folderTreeRequests.get('folder-invalid'), undefined);
+  });
+
   test('deduplicates an identical remote file node before pulling', async () => {
     files.push({ ...files[0] });
     const harness = createHarness(root, baseUrl);

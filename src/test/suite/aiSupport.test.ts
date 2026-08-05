@@ -324,6 +324,108 @@ suite('AI coding support', () => {
     }
   });
 
+  test('prunes the oldest AI request and result pairs beyond the history limit', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-history-'));
+    const requestDirectory = path.join(root, '.ecode-local', 'agent-cli', 'requests');
+    const resultDirectory = path.join(root, '.ecode-local', 'agent-cli', 'results');
+    fs.mkdirSync(requestDirectory, { recursive: true });
+    fs.mkdirSync(resultDirectory, { recursive: true });
+    for (let index = 1; index <= 3; index++) {
+      const id = `history_00${index}`;
+      const requestFile = path.join(requestDirectory, `${id}.json`);
+      const resultFile = path.join(resultDirectory, `${id}.json`);
+      fs.writeFileSync(requestFile, JSON.stringify({
+        schemaVersion: 2,
+        id,
+        action: 'getState',
+        environmentDirectory: 'workspace',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }), 'utf8');
+      fs.writeFileSync(resultFile, JSON.stringify({
+        schemaVersion: 2,
+        id,
+        action: 'getState',
+        processedAt: new Date().toISOString(),
+        status: 'succeeded',
+      }), 'utf8');
+      const modifiedAt = new Date(Date.now() - (4 - index) * 1_000);
+      fs.utimesSync(requestFile, modifiedAt, modifiedAt);
+      fs.utimesSync(resultFile, modifiedAt, modifiedAt);
+    }
+    let executions = 0;
+    const controller = new AiRequestController(
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      async () => {
+        executions++;
+        return { status: 'succeeded' };
+      },
+      2,
+      60_000,
+    );
+    try {
+      controller.configure(root);
+      await delay(1_200);
+
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(fs.existsSync(path.join(requestDirectory, 'history_001.json')), false);
+      assert.strictEqual(fs.existsSync(path.join(resultDirectory, 'history_001.json')), false);
+      assert.strictEqual(fs.existsSync(path.join(requestDirectory, 'history_002.json')), true);
+      assert.strictEqual(fs.existsSync(path.join(resultDirectory, 'history_003.json')), true);
+    } finally {
+      controller.dispose();
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    }
+  });
+
+  test('does not prune pending AI requests when history is over the limit', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-pending-history-'));
+    const requestDirectory = path.join(root, '.ecode-local', 'agent-cli', 'requests');
+    fs.mkdirSync(requestDirectory, { recursive: true });
+    for (let index = 1; index <= 3; index++) {
+      const id = `pending_00${index}`;
+      fs.writeFileSync(path.join(requestDirectory, `${id}.json`), JSON.stringify({
+        schemaVersion: 2,
+        id,
+        action: 'getState',
+        environmentDirectory: 'workspace',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }), 'utf8');
+    }
+    let executions = 0;
+    const controller = new AiRequestController(
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      async () => {
+        executions++;
+        return { status: 'succeeded' };
+      },
+      1,
+      60_000,
+    );
+    try {
+      controller.configure(root);
+      await delay(1_500);
+
+      assert.strictEqual(executions, 3);
+    } finally {
+      controller.dispose();
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    }
+  });
+
   test('documents only the supplied ecode component calls with relative paths', () => {
     const workspaceRoot = path.join('C:', 'workspace', 'business');
     const calls: IndexedEcodeComponentCall[] = [

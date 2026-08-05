@@ -47,15 +47,18 @@ suite('Path safety', () => {
     assert.match(validateEnvironmentDirectory('common') ?? '', /保留名称/);
     assert.match(validateEnvironmentDirectory('promotion') ?? '', /保留名称/);
     assert.match(validateEnvironmentDirectory('CON') ?? '', /Windows 保留名称/);
+    assert.match(validateEnvironmentDirectory('COM1') ?? '', /Windows 保留名称/);
+    assert.match(validateEnvironmentDirectory('lpt9') ?? '', /Windows 保留名称/);
   });
 
-  test('rejects unsafe remote paths and Windows reserved names', () => {
+  test('rejects unsafe remote paths while allowing device-like names', () => {
     assert.throws(() => normalizeRemotePath('../secret.txt'));
     assert.throws(() => normalizeRemotePath('Type/../secret.txt'));
     assert.throws(() => normalizeRemotePath('Type//secret.txt'));
     assert.throws(() => normalizeRemotePath('/absolute.txt'));
     assert.throws(() => normalizeRemotePath('folder\\file.txt'));
-    assert.throws(() => normalizeRemotePath('folder/CON.txt'));
+    assert.strictEqual(normalizeRemotePath('folder/CON.txt'), 'folder/CON.txt');
+    assert.strictEqual(normalizeRemotePath('COM1/file.js'), 'COM1/file.js');
     assert.throws(() => normalizeRemotePath('folder/file:name.txt'));
     assert.throws(() => normalizeRemotePath('folder/trailing.'));
   });

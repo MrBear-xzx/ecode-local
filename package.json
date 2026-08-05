@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {

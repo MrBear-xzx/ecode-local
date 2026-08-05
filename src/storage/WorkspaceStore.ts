@@ -154,6 +154,7 @@ export class WorkspaceStore {
   async deleteEnvironment(id: string): Promise<{
     deletedEnvironment: EnvironmentProfile;
     activeEnvironment: EnvironmentProfile;
+    cleanupPendingPath?: string;
   }> {
     const workspaceFolder = this.requireWorkspaceFolder();
     const configuration = await this.readEnvironmentConfiguration(workspaceFolder);
@@ -174,22 +175,23 @@ export class WorkspaceStore {
       throw new Error('删除环境后无法确定新的活动环境');
     }
 
-    await fs.rm(resolveEnvironmentSourceRoot(workspaceFolder, environment.directory), {
-      recursive: true,
-      force: true,
-    });
-    await fs.rm(resolveEnvironmentDataRoot(workspaceFolder, environment.directory), {
-      recursive: true,
-      force: true,
-    });
-    await this.writeEnvironmentConfiguration(workspaceFolder, {
-      ...configuration,
-      activeEnvironmentId,
-      environments: remaining,
+    const stagingRoot = resolveEnvironmentDeletionStagingRoot(
+      workspaceFolder,
+    );
+    const cleanupPendingPath = await moveEnvironmentDataAndCommit({
+      sourceRoot: resolveEnvironmentSourceRoot(workspaceFolder, environment.directory),
+      dataRoot: resolveEnvironmentDataRoot(workspaceFolder, environment.directory),
+      stagingRoot,
+      commit: () => this.writeEnvironmentConfiguration(workspaceFolder, {
+        ...configuration,
+        activeEnvironmentId,
+        environments: remaining,
+      }),
     });
     return {
       deletedEnvironment: toEnvironmentProfile(workspaceFolder, environment),
       activeEnvironment: toEnvironmentProfile(workspaceFolder, activeEnvironment),
+      cleanupPendingPath,
     };
   }
 
@@ -514,6 +516,121 @@ export function updateGitIgnoreForEcodeLocal(current: string): string {
     prefix += eol;
   }
   return `${prefix}# Ecode Local generated files${eol}/.ecode-local/${eol}`;
+}
+
+interface EnvironmentDeletionTransaction {
+  sourceRoot: string;
+  dataRoot: string;
+  stagingRoot: string;
+  commit: () => Promise<void>;
+}
+
+export async function moveEnvironmentDataAndCommit(
+  transaction: EnvironmentDeletionTransaction,
+): Promise<string | undefined> {
+  const staged = [
+    {
+      original: transaction.sourceRoot,
+      staged: path.join(transaction.stagingRoot, 'source'),
+    },
+    {
+      original: transaction.dataRoot,
+      staged: path.join(transaction.stagingRoot, 'data'),
+    },
+  ];
+  const moved: typeof staged = [];
+  await fs.mkdir(transaction.stagingRoot, { recursive: true });
+  try {
+    for (const item of staged) {
+      if (await moveIfExists(item.original, item.staged)) {
+        moved.push(item);
+      }
+    }
+  } catch (error: unknown) {
+    await restoreMovedEnvironmentData(moved, transaction.stagingRoot, error);
+    throw error;
+  }
+
+  try {
+    await transaction.commit();
+  } catch (error: unknown) {
+    await restoreMovedEnvironmentData(moved, transaction.stagingRoot, error);
+    throw error;
+  }
+
+  try {
+    await fs.rm(transaction.stagingRoot, { recursive: true, force: true });
+  } catch {
+    // 配置已经提交；保留隔离数据并让调用方提示用户手工清理。
+    return transaction.stagingRoot;
+  }
+  try {
+    await removeEmptyDirectory(path.dirname(transaction.stagingRoot));
+  } catch {
+    // 空的父级隔离目录不包含环境数据，清理失败不影响删除结果。
+  }
+  return undefined;
+}
+
+async function moveIfExists(source: string, destination: string): Promise<boolean> {
+  try {
+    await fs.rename(source, destination);
+    return true;
+  } catch (error: unknown) {
+    if (isFileSystemError(error, 'ENOENT')) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function restoreMovedEnvironmentData(
+  moved: Array<{ original: string; staged: string }>,
+  stagingRoot: string,
+  originalError: unknown,
+): Promise<void> {
+  const restoreErrors: string[] = [];
+  for (const item of [...moved].reverse()) {
+    try {
+      await fs.mkdir(path.dirname(item.original), { recursive: true });
+      await fs.rename(item.staged, item.original);
+    } catch (error: unknown) {
+      restoreErrors.push(`${item.original}: ${errorMessage(error)}`);
+    }
+  }
+  if (restoreErrors.length > 0) {
+    throw new Error(
+      `环境删除失败，且隔离数据恢复不完整: ${errorMessage(originalError)}；`
+      + `${restoreErrors.join('；')}；剩余数据位于 ${stagingRoot}`,
+    );
+  }
+  await removeEmptyDirectory(stagingRoot);
+  await removeEmptyDirectory(path.dirname(stagingRoot));
+}
+
+async function removeEmptyDirectory(directory: string): Promise<void> {
+  try {
+    await fs.rmdir(directory);
+  } catch (error: unknown) {
+    if (
+      !isFileSystemError(error, 'ENOENT')
+      && !isFileSystemError(error, 'ENOTEMPTY')
+      && !isFileSystemError(error, 'EEXIST')
+    ) {
+      throw error;
+    }
+  }
+}
+
+function resolveEnvironmentDeletionStagingRoot(
+  workspaceFolder: string,
+): string {
+  return path.join(
+    workspaceFolder,
+    ECODE_LOCAL_DIRECTORY,
+    'deletion-staging',
+    `delete-${randomUUID()}`,
+  );
 }
 
 async function isInsideGitRepository(directory: string): Promise<boolean> {
