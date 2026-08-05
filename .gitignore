@@ -1,4 +1,5 @@
 node_modules/
+.ecode-local/
 out/
 dist/
 .vscode-test/
@@ -7,4 +8,4 @@ dist/
 Thumbs.db
 *.log
 reference/
-scripts/
+/scripts/

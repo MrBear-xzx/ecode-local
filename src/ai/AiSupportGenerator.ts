@@ -133,12 +133,13 @@ export function generateAiGuide(): string {
     '5. `convertFieldNameToId` 未提供表参数时按主表理解，提供 `detail_N` 时只使用对应明细表。',
     '6. 不修改 `.ecode-local/` 中的生成文件；知识变化后使用扩展命令重新生成。',
     '',
-    '## AI 推送请求',
+    '## AI 操作接口',
     '',
-    '只有用户在当前任务中明确要求推送时，AI 才能在 '
-      + '`.ecode-local/ai-requests/<id>.json` 创建 `action: "push"` 请求。',
-    '请求必须指定当前活动环境目录和相对源码路径。扩展会弹出人工确认，并继续执行远端冲突检查、推送后回读校验和推送记录保存。',
-    '处理结果写入 `.ecode-local/ai-results/<id>.json`。AI 不得直接调用 E-cology 接口、绕过确认、覆盖旧请求或修改结果文件。',
+    '完整调用流程和 action 参数见 `skills/ecode-local/SKILL.md` 及其 '
+      + '`references/actions.md`。通用 Agent 运行 Skill 提供的 `scripts/ecode-agent.cjs`，'
+      + '由 CLI 处理内部通信并输出结构化结果。',
+    '扩展统一执行环境和路径校验、Agent CLI 授权校验、远端冲突检查、编译/GBK 校验、'
+      + '推送后回读验证与历史记录维护。AI 不得直接调用 E-cology 接口或绕过这些保护。',
     '',
     '## 常见示例',
     '',

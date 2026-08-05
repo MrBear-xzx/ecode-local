@@ -1,9 +1,13 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  countChanges,
   isPushableChange,
   validateEnvironmentDirectoryInput,
   validateEnvironmentName,
+  visibleAiChanges,
 } from '../../extension';
 import type { EnvironmentProfile, SyncChange } from '../../domain/types';
 
@@ -23,12 +27,23 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(ext?.isActive);
   });
 
+  test('does not create Ecode files in an unconfigured workspace', () => {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    assert.ok(workspaceFolder);
+    assert.strictEqual(
+      fs.existsSync(path.join(workspaceFolder, '.ecode-local')),
+      false,
+    );
+    assert.strictEqual(fs.existsSync(path.join(workspaceFolder, 'AGENTS.md')), false);
+  });
+
   test('Ecode commands should be registered', async () => {
     const commands = await vscode.commands.getCommands(true);
     assert.ok(commands.includes('ecode.setup'));
     assert.ok(commands.includes('ecode.configure'));
     assert.ok(commands.includes('ecode.addEnvironment'));
     assert.ok(commands.includes('ecode.switchEnvironment'));
+    assert.ok(commands.includes('ecode.deleteEnvironment'));
     assert.ok(commands.includes('ecode.pull'));
     assert.ok(commands.includes('ecode.refreshChanges'));
     assert.ok(commands.includes('ecode.pushSelected'));
@@ -41,15 +56,19 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.resolveConflict'));
     assert.ok(commands.includes('ecode.createChangeSet'));
     assert.ok(commands.includes('ecode.applyChangeSet'));
-    assert.ok(commands.includes('ecode.cancelChangeSet'));
+    assert.ok(commands.includes('ecode.deleteChangeSet'));
+    assert.ok(!commands.includes('ecode.cancelChangeSet'));
     assert.ok(!commands.includes('ecode.freezeRelease'));
     assert.ok(!commands.includes('ecode.abandonChangeSet'));
     assert.ok(!commands.includes('ecode.deployRelease'));
     assert.ok(commands.includes('ecode.searchApiDocumentation'));
     assert.ok(commands.includes('ecode.openOnlineDocumentation'));
     assert.ok(commands.includes('ecode.refreshAiSupport'));
+    assert.ok(commands.includes('ecode.enableAiSupport'));
     assert.ok(commands.includes('ecode.openAiGuide'));
     assert.ok(commands.includes('ecode.removeAiSupport'));
+    assert.ok(!commands.includes('ecode.ai.inspect'));
+    assert.ok(!commands.includes('ecode.ai.execute'));
     assert.ok(!commands.includes('ecode.confirmSourceDirectoryMigration'));
     assert.ok(!commands.includes('ecode.branchNew'));
   });
@@ -69,6 +88,29 @@ suite('Ecode Extension Test Suite', () => {
 
     assert.strictEqual(isPushableChange(converged), true);
     assert.strictEqual(isPushableChange(divergent), false);
+  });
+
+  test('omits clean pull entries from Agent state while retaining counts', () => {
+    const changes: SyncChange[] = Array.from({ length: 20_000 }, (_, index) => ({
+      path: `Type/clean-${index}.js`,
+      status: 'clean',
+    }));
+    changes.push({
+      path: 'Type/conflict.js',
+      status: 'conflict',
+      conflictReason: 'bothModified',
+    });
+
+    assert.deepStrictEqual(visibleAiChanges(changes), [changes[changes.length - 1]]);
+    assert.deepStrictEqual(countChanges(changes), {
+      total: 20_001,
+      clean: 20_000,
+      conflict: 1,
+    });
+    assert.ok(Buffer.byteLength(JSON.stringify({
+      changeCounts: countChanges(changes),
+      changes: visibleAiChanges(changes),
+    })) < 1024 * 1024);
   });
 
   test('environment name validation rejects duplicates while typing', () => {
@@ -151,6 +193,7 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(overflow.includes('ecode.configure'));
     assert.ok(overflow.includes('ecode.addEnvironment'));
     assert.ok(overflow.includes('ecode.switchEnvironment'));
+    assert.ok(overflow.includes('ecode.enableAiSupport'));
     assert.ok(overflow.includes('ecode.createChangeSet'));
     assert.ok(overflow.includes('ecode.applyChangeSet'));
     assert.ok(overflow.includes('ecode.searchApiDocumentation'));

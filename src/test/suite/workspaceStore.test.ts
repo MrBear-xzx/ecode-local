@@ -175,6 +175,57 @@ suite('Workspace store', () => {
     );
   });
 
+  test('deletes an environment with its source and local data, then switches active environment', async () => {
+    const development = await store.saveEnvironment({
+      name: '开发环境',
+      directory: 'dev',
+      workspaceFolder,
+      serverUrl: 'https://dev.example',
+      username: 'developer',
+    });
+    const temporary = await store.saveEnvironment({
+      name: '临时环境',
+      directory: 'temporary',
+      workspaceFolder,
+      serverUrl: 'https://temporary.example',
+      username: 'tester',
+    });
+    const sourceRoot = path.join(workspaceFolder, temporary.directory);
+    const dataRoot = environmentRoot(temporary.directory);
+    fs.mkdirSync(sourceRoot, { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'local.js'), 'const local = true;\n');
+    fs.writeFileSync(path.join(dataRoot, 'state.json'), '{}');
+
+    const result = await store.deleteEnvironment(temporary.id);
+
+    assert.strictEqual(result.deletedEnvironment.id, temporary.id);
+    assert.strictEqual(result.activeEnvironment.id, development.id);
+    assert.strictEqual((await store.getActiveEnvironment())?.id, development.id);
+    assert.deepStrictEqual((await store.getEnvironments()).map(item => item.id), [development.id]);
+    assert.strictEqual(fs.existsSync(sourceRoot), false);
+    assert.strictEqual(fs.existsSync(dataRoot), false);
+  });
+
+  test('refuses to delete the last environment and preserves its files', async () => {
+    const environment = await store.saveEnvironment({
+      name: '唯一环境',
+      directory: 'only',
+      workspaceFolder,
+      serverUrl: 'https://only.example',
+      username: 'tester',
+    });
+    const sourceRoot = path.join(workspaceFolder, environment.directory);
+    fs.mkdirSync(sourceRoot, { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'keep.js'), 'const keep = true;\n');
+
+    await assert.rejects(
+      store.deleteEnvironment(environment.id),
+      /不能删除最后一个/,
+    );
+    assert.strictEqual(fs.existsSync(path.join(sourceRoot, 'keep.js')), true);
+    assert.strictEqual((await store.getActiveEnvironment())?.id, environment.id);
+  });
+
   test('persists form metadata in the matching environment directory', async () => {
     const syncRoot = path.join(workspaceFolder, 'dev');
     const cache: FormMetadataCache = {

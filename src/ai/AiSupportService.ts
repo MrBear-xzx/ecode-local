@@ -27,6 +27,10 @@ const COMMON_MANAGED_FILES = [
   'ecode-globals.d.ts',
   'ecode-components.d.ts',
   'ecode-ai-guide.md',
+  'skills/ecode-local/SKILL.md',
+  'skills/ecode-local/agents/openai.yaml',
+  'skills/ecode-local/references/actions.md',
+  'skills/ecode-local/scripts/ecode-agent.cjs',
   'manifest.json',
 ] as const;
 const ENVIRONMENT_MANAGED_FILES = [
@@ -49,6 +53,7 @@ export class AiSupportService {
     private readonly formRegistry: WorkspaceFormMetadataRegistry,
     private readonly extensionVersion: string,
     private readonly output: vscode.LogOutputChannel,
+    private readonly extensionRoot: string,
   ) {}
 
   isEnabled(workspaceFolder: string): boolean {
@@ -81,6 +86,7 @@ export class AiSupportService {
       'ecode-globals.d.ts': generateGlobalDeclarations(),
       'ecode-components.d.ts': generateComponentDeclarations(),
       'ecode-ai-guide.md': generateAiGuide(),
+      ...await this.loadSkillFiles(),
     };
     commonGenerated['manifest.json'] = generatedManifest(
       this.extensionVersion,
@@ -183,6 +189,14 @@ export class AiSupportService {
         throw error;
       }
     }
+    await removeEmptyDirectories([
+      path.join(directory, 'skills', 'ecode-local', 'agents'),
+      path.join(directory, 'skills', 'ecode-local', 'references'),
+      path.join(directory, 'skills', 'ecode-local', 'scripts'),
+      path.join(directory, 'skills', 'ecode-local'),
+      path.join(directory, 'skills'),
+      directory,
+    ]);
   }
 
   guideUri(workspaceFolder: string): vscode.Uri {
@@ -190,6 +204,44 @@ export class AiSupportService {
       commonAiDirectory(workspaceFolder),
       'ecode-ai-guide.md',
     ));
+  }
+
+  skillUri(workspaceFolder: string): vscode.Uri {
+    return vscode.Uri.file(path.join(
+      commonAiDirectory(workspaceFolder),
+      'skills',
+      'ecode-local',
+      'SKILL.md',
+    ));
+  }
+
+  cliUri(workspaceFolder: string): vscode.Uri {
+    return vscode.Uri.file(path.join(
+      commonAiDirectory(workspaceFolder),
+      'skills',
+      'ecode-local',
+      'scripts',
+      'ecode-agent.cjs',
+    ));
+  }
+
+  private async loadSkillFiles(): Promise<Record<string, string>> {
+    const sourceRoot = path.join(
+      this.extensionRoot,
+      'resources',
+      'skills',
+      'ecode-local',
+    );
+    const entries = [
+      ['skills/ecode-local/SKILL.md', 'SKILL.md'],
+      ['skills/ecode-local/agents/openai.yaml', 'agents/openai.yaml'],
+      ['skills/ecode-local/references/actions.md', 'references/actions.md'],
+      ['skills/ecode-local/scripts/ecode-agent.cjs', 'scripts/ecode-agent.cjs'],
+    ] as const;
+    return Object.fromEntries(await Promise.all(entries.map(async ([target, source]) => [
+      target,
+      await fs.readFile(path.join(sourceRoot, ...source.split('/')), 'utf8'),
+    ])));
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -201,9 +253,8 @@ export class AiSupportService {
 
 export function updateManagedAgentsContent(
   current: string | undefined,
-  environmentDirectory = '环境目录',
+  environmentDirectory: string,
 ): string {
-  const environmentAiRoot = `.ecode-local/${environmentDirectory}/ecode-ai`;
   const block = [
     AGENTS_START,
     '## Ecode 项目说明',
@@ -213,71 +264,28 @@ export function updateManagedAgentsContent(
     'Ecode 是运行在 E-cology 浏览器环境中的前端扩展平台，不是独立的 '
       + 'Node.js、React CLI 或普通 Web 项目。源码由 Ecode 平台加载、编译和执行。',
     '',
-    '### 目录约定',
+    '### AI 工作入口',
     '',
-    `- \`${environmentDirectory}/\`：当前活动环境的 Ecode 业务源码目录。`,
-    '- `.ecode-local/common/ecode-ai/`：公共 API 与组件知识，不属于业务源码。',
-    `- \`.ecode-local/${environmentDirectory}/\`：当前环境的同步状态、字段缓存、快照、`
-      + '冲突、恢复副本及项目知识，不属于业务源码。',
-    '- `.ecode-local/promotion/`：推送记录、跨环境变更集、源码快照与应用记录。',
-    '- 不要直接修改 `.ecode-local/` 中的文件；唯一例外是下述 AI 推送请求文件。',
-    '- 不要把 `.ecode-local/`、`AGENTS.md` 或工作区其他文件当作 Ecode 远端源码。',
+    '- 处理 Ecode 环境、同步、冲突、推送记录、变更集、API/组件知识或 AI 支持时，'
+      + '必须先阅读 `.ecode-local/common/ecode-ai/skills/ecode-local/SKILL.md`。',
+    '- 所有扩展功能统一通过 Skill 提供的 `scripts/ecode-agent.cjs` 调用。',
+    `- 当前活动环境源码目录是 \`${environmentDirectory}/\`。`,
+    `- 当前环境项目知识位于 \`.ecode-local/${environmentDirectory}/ecode-ai/\`。`,
+    '- 公共 API 与组件知识位于 `.ecode-local/common/ecode-ai/`。',
     '',
-    '### 运行时约定',
+    '### 不可绕过的边界',
     '',
-    '以下对象通常由 Ecode/E-cology 运行时全局提供，无须 npm 安装或 import：',
-    '',
-    '- `ecodeSDK`',
-    '- `WfForm`',
-    '- `ModeForm`',
-    '- `ModeList`',
-    '- `ecCom`',
-    '- `antd`',
-    '- 对应的 `window.*` 对象',
-    '',
-    '不要因为源码中没有 import 就擅自添加 npm 依赖、模拟实现或替代封装。',
-    '',
-    'Ecode JavaScript 编译兼容能力以 Babel 7.5.5 为准。'
-      + '生成代码时避免使用目标环境无法支持的新语法和新运行时 API。',
-    '',
-    '### 修改代码前',
-    '',
-    '1. 阅读 `.ecode-local/common/ecode-ai/ecode-ai-guide.md`。',
-    '2. API、参数和返回值以 `.ecode-local/common/ecode-ai/ecode-globals.d.ts` 为准。',
-    '3. PC 组件和 props 以 `.ecode-local/common/ecode-ai/ecode-components.d.ts` 为准。',
-    `4. 表单字段以 \`${environmentAiRoot}/workspace-form-metadata.md\` 为准。`,
-    `5. 使用 \`ecodeSDK.getCom\` 前，检查 \`${environmentAiRoot}/workspace-components.md\` `
-      + '中是否存在对应的 `setCom` 注册。',
-    `6. 优先搜索 \`${environmentDirectory}/\` 中已有的同类调用和项目编码模式。`,
-    '7. 类型为 `unknown` 表示资料不足，需要从现有源码或用户信息继续确认，不得自行编造参数。',
-    '',
-    '### 修改边界',
-    '',
-    `- 业务代码修改应限制在 \`${environmentDirectory}/\` 中，`
-      + '除非用户明确要求修改工作区配置或文档。',
-    '- 不要直接编辑生成的 AI 文件。',
-    '- 不要假设业务工作区使用 Git。',
-    '- 不要自动执行远端推送、删除或发布操作。',
-    '',
-    '### AI 推送请求接口',
-    '',
-    '- 只有用户在当前任务中明确要求推送时，AI 才能创建推送请求；代码修改、测试通过或此前授权都不等于推送授权。',
-    `- 请求写入 \`.ecode-local/ai-requests/<id>.json\`，其中环境目录必须是当前活动目录 \`${environmentDirectory}\`。`,
-    '- `<id>` 只能包含英文字母、数字、下划线和横线，最长 64 位；每次请求使用新的 id，禁止覆盖旧请求。',
-    '- `paths` 使用相对于环境源码目录的 `/` 分隔路径，只能包含本次明确要求推送的文件，最多 100 个。',
-    '- 扩展会校验文件状态、弹出人工确认、执行远端冲突检查和回读验证；AI 不得绕过确认或直接调用 E-cology 接口。',
-    '- 处理结果位于 `.ecode-local/ai-results/<id>.json`。读取结果并向用户报告；不要修改请求或结果文件。',
-    '',
-    '```json',
-    '{',
-    '  "schemaVersion": 1,',
-    '  "id": "push_20260730_001",',
-    '  "action": "push",',
-    `  "environmentDirectory": "${environmentDirectory}",`,
-    '  "paths": ["Type/example.js"],',
-    '  "createdAt": "2026-07-30T12:00:00.000Z"',
-    '}',
-    '```',
+    '- 业务代码修改限制在活动环境源码目录，除非用户明确要求其他文件。',
+    '- 不直接读写 `.ecode-local/agent-cli/` 或其他内部状态；由 CLI 负责通信。',
+    '- 用户要求只读时仍可运行 CLI，但只能调用只读 action。',
+    '- 不把 `.ecode-local/`、`AGENTS.md` 或工作区其他文件推送到 Ecode。',
+    '- 不自动执行远端推送、删除、冲突处理或变更集应用；每次操作都需要当前任务授权。',
+    '- 推送必须有单独、明确的当前任务授权；代码修改或测试通过不等于推送授权。',
+    '- 需要确认的 CLI action 必须先取得当前任务授权，再添加 `--confirmed`；VS Code 不会重复确认。',
+    '- 拉取无需确认；不绕过远端冲突检查、编译/GBK 校验和写后回读验证。',
+    '- `ecodeSDK`、`WfForm`、`ModeForm`、`ModeList`、`ecCom` 和 `antd` '
+      + '由 Ecode 运行时提供，不因缺少 import 而安装依赖。',
+    '- JavaScript 语法兼容能力以 Babel 7.5.5 为准。',
     AGENTS_END,
   ].join('\n');
   if (current === undefined || current.length === 0) {
@@ -375,6 +383,18 @@ async function removeOptionalFile(file: string): Promise<void> {
   } catch (error: unknown) {
     if (!isFileSystemError(error, 'ENOENT')) {
       throw error;
+    }
+  }
+}
+
+async function removeEmptyDirectories(directories: readonly string[]): Promise<void> {
+  for (const directory of directories) {
+    try {
+      await fs.rmdir(directory);
+    } catch (error: unknown) {
+      if (!isFileSystemError(error, 'ENOENT') && !isFileSystemError(error, 'ENOTEMPTY')) {
+        throw error;
+      }
     }
   }
 }

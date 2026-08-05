@@ -40,6 +40,10 @@ export class WorkspaceStore {
     this.workspaceFolder = path.resolve(workspaceFolder);
   }
 
+  getWorkspaceFolder(): string | undefined {
+    return this.workspaceFolder;
+  }
+
   async getProfile(): Promise<ConnectionProfile | undefined> {
     const environment = await this.getActiveEnvironment();
     return environment ? toConnectionProfile(environment) : undefined;
@@ -145,6 +149,48 @@ export class WorkspaceStore {
       activeEnvironmentId: id,
     });
     return toEnvironmentProfile(workspaceFolder, environment);
+  }
+
+  async deleteEnvironment(id: string): Promise<{
+    deletedEnvironment: EnvironmentProfile;
+    activeEnvironment: EnvironmentProfile;
+  }> {
+    const workspaceFolder = this.requireWorkspaceFolder();
+    const configuration = await this.readEnvironmentConfiguration(workspaceFolder);
+    const environment = configuration?.environments.find(item => item.id === id);
+    if (!configuration || !environment) {
+      throw new Error('未找到要删除的 Ecode 环境');
+    }
+    if (configuration.environments.length === 1) {
+      throw new Error('不能删除最后一个 Ecode 环境；请先新增其他环境');
+    }
+
+    const remaining = configuration.environments.filter(item => item.id !== id);
+    const activeEnvironmentId = configuration.activeEnvironmentId === id
+      ? remaining[0].id
+      : configuration.activeEnvironmentId;
+    const activeEnvironment = remaining.find(item => item.id === activeEnvironmentId);
+    if (!activeEnvironment) {
+      throw new Error('删除环境后无法确定新的活动环境');
+    }
+
+    await fs.rm(resolveEnvironmentSourceRoot(workspaceFolder, environment.directory), {
+      recursive: true,
+      force: true,
+    });
+    await fs.rm(resolveEnvironmentDataRoot(workspaceFolder, environment.directory), {
+      recursive: true,
+      force: true,
+    });
+    await this.writeEnvironmentConfiguration(workspaceFolder, {
+      ...configuration,
+      activeEnvironmentId,
+      environments: remaining,
+    });
+    return {
+      deletedEnvironment: toEnvironmentProfile(workspaceFolder, environment),
+      activeEnvironment: toEnvironmentProfile(workspaceFolder, activeEnvironment),
+    };
   }
 
   async loadManifest(serverFingerprint: string, syncRoot: string): Promise<SyncManifest> {

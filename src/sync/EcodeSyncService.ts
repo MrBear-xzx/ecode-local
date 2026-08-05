@@ -518,6 +518,69 @@ export class EcodeSyncService {
     return changes;
   }
 
+  async refreshChanges(
+    onProgress: (message: string) => void,
+    cancellation?: CancellationLike,
+  ): Promise<SyncChange[]> {
+    const context = await this.loadContext();
+    if (!isManifestInitialized(context.manifest)) {
+      return this.refreshLocalChanges();
+    }
+
+    onProgress('正在读取远端状态...');
+    const remote = await this.withAuthentication(context.profile, api =>
+      this.remoteScanner.scan(api, onProgress, cancellation));
+    this.throwIfCancelled(cancellation);
+    for (const manifestPath of Object.keys(context.manifest.files)) {
+      if ([...remote.ambiguousDirectories].some(directory =>
+        isPathAtOrBelow(manifestPath, directory))) {
+        remote.presentPaths.add(manifestPath);
+      }
+    }
+
+    onProgress('正在扫描本地文件...');
+    const local = await this.localScanner.scan(context.syncRoot);
+    onProgress('正在计算本地与远端变更...');
+    const plan = buildSyncPlan(
+      context.manifest,
+      local.files,
+      remote.files,
+      [...remote.unsupported, ...local.unsupported],
+      remote.presentPaths,
+    );
+    for (const change of plan.changes) {
+      if (change.status !== 'conflict' || !change.conflictReason) {
+        continue;
+      }
+      const remoteFile = remote.files.get(change.path);
+      if (remoteFile) {
+        await this.store.saveConflict(
+          context.syncRoot,
+          toStoredConflict(remoteFile, change.conflictReason),
+        );
+      } else if (change.conflictReason === 'remoteDeletedLocalModified') {
+        await this.saveRemoteDeletionConflict(
+          context.syncRoot,
+          context.manifest,
+          change.path,
+        );
+      }
+    }
+    const changes = await this.mergeStoredConflicts(
+      context.syncRoot,
+      context.manifest,
+      local.files,
+      plan.changes,
+    );
+    this.lastRemoteFiles = remote.files;
+    this.lastPlan = {
+      ...plan,
+      changes,
+      warnings: [...plan.warnings, ...remote.errors],
+    };
+    return changes;
+  }
+
   async pull(
     onProgress: (message: string) => void,
     cancellation?: CancellationLike,

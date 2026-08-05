@@ -133,7 +133,7 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
         : `${Object.keys(element.changeSet.files).length} 个文件`;
       item.tooltip = `${element.changeSet.id}\n来源环境：${
         this.environmentName(element.changeSet.sourceEnvironmentId)
-      }\n展开查看文件；右侧按钮可应用到当前环境或取消变更集`;
+      }\n展开查看文件；右侧按钮可应用到当前环境或删除变更集`;
       item.contextValue = 'ecode.changeSet';
       item.iconPath = appliedHere
         ? themeIcon('pass-filled', 'charts.green')

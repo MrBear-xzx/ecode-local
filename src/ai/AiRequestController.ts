@@ -1,0 +1,280 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { ECODE_LOCAL_DIRECTORY } from '../domain/constants';
+import { writeJsonAtomic } from '../storage/AtomicFileStore';
+import {
+  CLI_REQUEST_DIRECTORY,
+  CLI_RESULT_DIRECTORY,
+  type AiInvocation,
+  type AiInvocationResult,
+  type AiRequest,
+  type AiResult,
+  parseAiRequest,
+} from './AiRequest';
+
+const MAX_REQUEST_BYTES = 128 * 1024;
+const REQUEST_SCAN_INTERVAL_MS = 500;
+
+export interface AiInvocationContext {
+  requestId?: string;
+  environmentDirectory?: string;
+}
+
+export type ExecuteAiInvocation = (
+  invocation: AiInvocation,
+  context: AiInvocationContext,
+) => Promise<AiInvocationResult>;
+
+export class AiRequestController implements vscode.Disposable {
+  private watcher: vscode.Disposable | undefined;
+  private requestScanTimer: NodeJS.Timeout | undefined;
+  private readonly processing = new Map<string, number>();
+  private readonly pendingTimers = new Map<string, NodeJS.Timeout>();
+  private configurationGeneration = 0;
+  private configuredWorkspaceFolder: string | undefined;
+
+  constructor(
+    private readonly output: vscode.LogOutputChannel,
+    private readonly execute: ExecuteAiInvocation,
+  ) {}
+
+  configure(workspaceFolder: string): void {
+    const workspaceKey = path.resolve(workspaceFolder).toLocaleLowerCase('en-US');
+    if (workspaceKey === this.configuredWorkspaceFolder && this.watcher) {
+      return;
+    }
+    this.configuredWorkspaceFolder = workspaceKey;
+    const generation = ++this.configurationGeneration;
+    this.watcher?.dispose();
+    this.watcher = undefined;
+    this.clearPendingTimers();
+    this.clearRequestScanTimer();
+    const requestsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      CLI_REQUEST_DIRECTORY,
+    );
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(requestsRoot, '*.json'),
+    );
+    const schedule = (uri: vscode.Uri): void => {
+      const requestFile = uri.fsPath;
+      if (pathKey(path.dirname(requestFile)) !== pathKey(requestsRoot)) {
+        return;
+      }
+      const existing = this.pendingTimers.get(requestFile);
+      if (existing) {
+        clearTimeout(existing);
+      }
+      this.pendingTimers.set(requestFile, setTimeout(() => {
+        this.pendingTimers.delete(requestFile);
+        void this.processRequestFile(workspaceFolder, requestFile, generation);
+      }, 200));
+    };
+    this.watcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidCreate(schedule),
+      watcher.onDidChange(schedule),
+    );
+    void this.processPendingRequests(workspaceFolder, generation);
+    this.scheduleRequestScan(workspaceFolder, generation);
+  }
+
+  dispose(): void {
+    this.configurationGeneration++;
+    this.configuredWorkspaceFolder = undefined;
+    this.watcher?.dispose();
+    this.watcher = undefined;
+    this.clearPendingTimers();
+    this.clearRequestScanTimer();
+  }
+
+  private clearPendingTimers(): void {
+    for (const timer of this.pendingTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingTimers.clear();
+  }
+
+  private clearRequestScanTimer(): void {
+    if (this.requestScanTimer) {
+      clearTimeout(this.requestScanTimer);
+      this.requestScanTimer = undefined;
+    }
+  }
+
+  private scheduleRequestScan(
+    workspaceFolder: string,
+    generation: number,
+  ): void {
+    if (!this.isCurrent(generation)) {
+      return;
+    }
+    this.clearRequestScanTimer();
+    this.requestScanTimer = setTimeout(() => {
+      this.requestScanTimer = undefined;
+      void this.processPendingRequests(workspaceFolder, generation)
+        .finally(() => this.scheduleRequestScan(workspaceFolder, generation));
+    }, REQUEST_SCAN_INTERVAL_MS);
+  }
+
+  private async processPendingRequests(
+    workspaceFolder: string,
+    generation: number,
+  ): Promise<void> {
+    const requestsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      CLI_REQUEST_DIRECTORY,
+    );
+    try {
+      const names = await fs.promises.readdir(requestsRoot);
+      if (!this.isCurrent(generation)) {
+        return;
+      }
+      for (const name of names.filter(item => item.endsWith('.json'))) {
+        if (!this.isCurrent(generation)) {
+          return;
+        }
+        await this.processRequestFile(
+          workspaceFolder,
+          path.join(requestsRoot, name),
+          generation,
+        );
+      }
+    } catch (error: unknown) {
+      if (this.isCurrent(generation) && !isFileSystemError(error, 'ENOENT')) {
+        this.output.warn(`Unable to scan AI requests: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  private async processRequestFile(
+    workspaceFolder: string,
+    requestFile: string,
+    generation: number,
+  ): Promise<void> {
+    const fileName = path.basename(requestFile);
+    const fallbackId = path.basename(fileName, '.json');
+    if (
+      !this.isCurrent(generation)
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(fallbackId)
+      || this.processing.get(requestFile) === generation
+    ) {
+      return;
+    }
+    const resultFile = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      CLI_RESULT_DIRECTORY,
+      `${fallbackId}.json`,
+    );
+    if (fs.existsSync(resultFile)) {
+      return;
+    }
+    this.processing.set(requestFile, generation);
+    let request: AiRequest | undefined;
+    try {
+      request = await this.readStableRequest(requestFile, fileName, generation);
+      if (!request || !this.isCurrent(generation)) {
+        return;
+      }
+      if (Date.parse(request.expiresAt) <= Date.now()) {
+        throw new Error('AI 请求已过期，未执行操作');
+      }
+      const outcome = await this.execute(request, {
+        requestId: request.id,
+        environmentDirectory: request.environmentDirectory,
+      });
+      if (!this.isCurrent(generation)) {
+        return;
+      }
+      await this.writeResult(resultFile, {
+        schemaVersion: 2,
+        id: request.id,
+        action: request.action,
+        environmentDirectory: request.environmentDirectory,
+        processedAt: new Date().toISOString(),
+        ...outcome,
+      }, generation);
+    } catch (error: unknown) {
+      if (!this.isCurrent(generation) || isFileSystemError(error, 'ENOENT')) {
+        return;
+      }
+      const message = errorMessage(error);
+      this.output.warn(`AI request ${fallbackId} rejected: ${message}`);
+      await this.writeResult(resultFile, {
+        schemaVersion: 2,
+        id: request?.id ?? fallbackId,
+        action: request?.action ?? 'getState',
+        environmentDirectory: request?.environmentDirectory,
+        processedAt: new Date().toISOString(),
+        status: 'rejected',
+        message,
+      }, generation);
+    } finally {
+      if (this.processing.get(requestFile) === generation) {
+        this.processing.delete(requestFile);
+      }
+    }
+  }
+
+  private async readStableRequest(
+    requestFile: string,
+    fileName: string,
+    generation: number,
+  ): Promise<AiRequest | undefined> {
+    let previous: string | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (!this.isCurrent(generation)) {
+        return undefined;
+      }
+      const stat = await fs.promises.stat(requestFile);
+      if (stat.size > MAX_REQUEST_BYTES) {
+        throw new Error(`AI 请求不能超过 ${MAX_REQUEST_BYTES} 字节`);
+      }
+      const current = await fs.promises.readFile(requestFile, 'utf8');
+      if (!this.isCurrent(generation)) {
+        return undefined;
+      }
+      if (current === previous) {
+        return parseAiRequest(current, fileName);
+      }
+      previous = current;
+      await delay(100);
+    }
+    return parseAiRequest(previous ?? '', fileName);
+  }
+
+  private async writeResult(
+    file: string,
+    result: AiResult,
+    generation: number,
+  ): Promise<void> {
+    if (this.isCurrent(generation)) {
+      await writeJsonAtomic(file, result);
+    }
+  }
+
+  private isCurrent(generation: number): boolean {
+    return generation === this.configurationGeneration;
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function isFileSystemError(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException).code === code;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function pathKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}

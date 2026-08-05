@@ -5,6 +5,7 @@ AGENTS.md
 tsconfig.json
 esbuild.mjs
 node_modules/**
+.ecode-local/**
 out/**
 !out/extension.js
 !out/babel.min.js
