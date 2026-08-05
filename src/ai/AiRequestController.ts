@@ -15,6 +15,8 @@ import {
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 const REQUEST_SCAN_INTERVAL_MS = 500;
+const REQUEST_HISTORY_LIMIT = 500;
+const REQUEST_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface AiInvocationContext {
   requestId?: string;
@@ -37,7 +39,16 @@ export class AiRequestController implements vscode.Disposable {
   constructor(
     private readonly output: vscode.LogOutputChannel,
     private readonly execute: ExecuteAiInvocation,
-  ) {}
+    private readonly historyLimit = REQUEST_HISTORY_LIMIT,
+    private readonly historyRetentionMs = REQUEST_HISTORY_RETENTION_MS,
+  ) {
+    if (!Number.isInteger(historyLimit) || historyLimit < 1) {
+      throw new Error('AI 请求历史保留数量必须是正整数');
+    }
+    if (!Number.isFinite(historyRetentionMs) || historyRetentionMs < 1) {
+      throw new Error('AI 请求历史保留时间必须是正数');
+    }
+  }
 
   configure(workspaceFolder: string): void {
     const workspaceKey = path.resolve(workspaceFolder).toLocaleLowerCase('en-US');
@@ -129,9 +140,20 @@ export class AiRequestController implements vscode.Disposable {
       CLI_REQUEST_DIRECTORY,
     );
     try {
-      const names = await fs.promises.readdir(requestsRoot);
+      let names = await fs.promises.readdir(requestsRoot);
       if (!this.isCurrent(generation)) {
         return;
+      }
+      try {
+        names = await this.cleanupRequestHistory(
+          workspaceFolder,
+          names,
+          generation,
+        );
+      } catch (error: unknown) {
+        if (this.isCurrent(generation)) {
+          this.output.warn(`Unable to clean AI request history: ${errorMessage(error)}`);
+        }
       }
       for (const name of names.filter(item => item.endsWith('.json'))) {
         if (!this.isCurrent(generation)) {
@@ -247,6 +269,74 @@ export class AiRequestController implements vscode.Disposable {
     return parseAiRequest(previous ?? '', fileName);
   }
 
+  private async cleanupRequestHistory(
+    workspaceFolder: string,
+    requestNames: string[],
+    generation: number,
+  ): Promise<string[]> {
+    const requestsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      CLI_REQUEST_DIRECTORY,
+    );
+    const resultsRoot = path.join(
+      workspaceFolder,
+      ECODE_LOCAL_DIRECTORY,
+      CLI_RESULT_DIRECTORY,
+    );
+    const resultNames = await readDirectoryIfExists(resultsRoot);
+    const names = [...new Set([...requestNames, ...resultNames])]
+      .filter(name => /^[A-Za-z0-9_-]{1,64}\.json$/.test(name));
+    const entries = (await Promise.all(names.map(async name => {
+      const requestFile = path.join(requestsRoot, name);
+      const [requestStat, resultStat] = await Promise.all([
+        statIfExists(requestFile),
+        statIfExists(path.join(resultsRoot, name)),
+      ]);
+      // 只有已经产生结果的请求才属于历史记录；待处理请求不能因数量或时间限制被静默删除。
+      if (!resultStat) {
+        return undefined;
+      }
+      return {
+        name,
+        requestFile,
+        timestamp: Math.max(
+          requestStat?.mtimeMs ?? 0,
+          resultStat?.mtimeMs ?? 0,
+        ),
+      };
+    }))).filter((entry): entry is {
+      name: string;
+      requestFile: string;
+      timestamp: number;
+    } => Boolean(entry));
+    if (!this.isCurrent(generation)) {
+      return requestNames;
+    }
+
+    const removable = entries.filter(entry =>
+      this.processing.get(entry.requestFile) !== generation);
+    const removeNames = new Set(
+      removable
+        .filter(entry => Date.now() - entry.timestamp > this.historyRetentionMs)
+        .map(entry => entry.name),
+    );
+    const retained = entries
+      .filter(entry => !removeNames.has(entry.name))
+      .sort((left, right) => right.timestamp - left.timestamp);
+    for (const entry of retained.slice(this.historyLimit)) {
+      if (this.processing.get(entry.requestFile) !== generation) {
+        removeNames.add(entry.name);
+      }
+    }
+
+    await Promise.all([...removeNames].flatMap(name => [
+      unlinkIfExists(path.join(requestsRoot, name)),
+      unlinkIfExists(path.join(resultsRoot, name)),
+    ]));
+    return requestNames.filter(name => !removeNames.has(name));
+  }
+
   private async writeResult(
     file: string,
     result: AiResult,
@@ -277,4 +367,36 @@ function errorMessage(error: unknown): string {
 function pathKey(filePath: string): string {
   const resolved = path.resolve(filePath);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function readDirectoryIfExists(directory: string): Promise<string[]> {
+  try {
+    return await fs.promises.readdir(directory);
+  } catch (error: unknown) {
+    if (isFileSystemError(error, 'ENOENT')) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function statIfExists(file: string): Promise<fs.Stats | undefined> {
+  try {
+    return await fs.promises.stat(file);
+  } catch (error: unknown) {
+    if (isFileSystemError(error, 'ENOENT')) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function unlinkIfExists(file: string): Promise<void> {
+  try {
+    await fs.promises.unlink(file);
+  } catch (error: unknown) {
+    if (!isFileSystemError(error, 'ENOENT')) {
+      throw error;
+    }
+  }
 }

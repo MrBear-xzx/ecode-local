@@ -39,6 +39,7 @@ export interface RemoteIndex {
   directories: Map<string, RemoteDirectoryEntry>;
   ambiguousDirectories: Set<string>;
   pathCollisions: SyncChange[];
+  unsupportedPaths: SyncChange[];
   observedFilePaths: Set<string>;
   preloadedFiles: Map<string, RemoteFileContent>;
 }
@@ -55,7 +56,10 @@ export class RemoteWorkspaceScanner {
   ): Promise<RemoteScan> {
     const index = await this.listIndex(api, cancellation, onProgress);
     const entries = index.files;
-    const unsupported: SyncChange[] = [...index.pathCollisions];
+    const unsupported: SyncChange[] = [
+      ...index.pathCollisions,
+      ...index.unsupportedPaths,
+    ];
     const errors: string[] = [];
     const total = entries.size;
     let completed = 0;
@@ -132,21 +136,20 @@ export class RemoteWorkspaceScanner {
     const traversedPathByNode = new Map<string, string>();
     const aliasedDirectoryPaths = new Set<string>();
     const traversalCollisions: SyncChange[] = [];
+    const unsupportedPaths: SyncChange[] = [];
     let pending: RemoteTreeTask[] = [];
     const system = root.system;
     if (system?.id) {
-      pending.push({
-        id: system.id,
-        path: normalizeRemotePath(system.name),
-        kind: 'type',
-      });
+      const remotePath = normalizeRemoteNodePath(system.name, '分类', unsupportedPaths);
+      if (remotePath) {
+        pending.push({ id: system.id, path: remotePath, kind: 'type' });
+      }
     }
     for (const type of root.typeList) {
-      pending.push({
-        id: type.id,
-        path: normalizeRemotePath(type.name),
-        kind: 'type',
-      });
+      const remotePath = normalizeRemoteNodePath(type.name, '分类', unsupportedPaths);
+      if (remotePath) {
+        pending.push({ id: type.id, path: remotePath, kind: 'type' });
+      }
     }
 
     let completedDirectories = 0;
@@ -202,21 +205,31 @@ export class RemoteWorkspaceScanner {
             || payload.childFolder.length > 0
             || payload.typeList.length > 0,
         );
-        this.collectFiles(payload.childFile, task.path, entries);
+        this.collectFiles(payload.childFile, task.path, entries, unsupportedPaths);
         completedDirectories++;
         onProgress?.(`正在扫描远端目录：已完成 ${completedDirectories} 个`);
-        return [
-          ...payload.childFolder.map(folder => ({
-            id: folder.id,
-            path: normalizeRemotePath(joinRemote(task.path, folder.name)),
-            kind: 'folder' as const,
-          })),
-          ...payload.typeList.map(type => ({
-            id: type.id,
-            path: normalizeRemotePath(joinRemote(task.path, type.name)),
-            kind: 'type' as const,
-          })),
-        ];
+        const childTasks: RemoteTreeTask[] = [];
+        for (const folder of payload.childFolder) {
+          const remotePath = normalizeRemoteNodePath(
+            joinRemote(task.path, folder.name),
+            '目录',
+            unsupportedPaths,
+          );
+          if (remotePath) {
+            childTasks.push({ id: folder.id, path: remotePath, kind: 'folder' });
+          }
+        }
+        for (const type of payload.typeList) {
+          const remotePath = normalizeRemoteNodePath(
+            joinRemote(task.path, type.name),
+            '分类',
+            unsupportedPaths,
+          );
+          if (remotePath) {
+            childTasks.push({ id: type.id, path: remotePath, kind: 'type' });
+          }
+        }
+        return childTasks;
       });
       pending.push(...children.flat());
     }
@@ -394,14 +407,27 @@ export class RemoteWorkspaceScanner {
       directories: directoryMap,
       ambiguousDirectories,
       pathCollisions: [...uniquePathCollisions.values()],
+      unsupportedPaths,
       observedFilePaths,
       preloadedFiles,
     };
   }
 
-  private collectFiles(nodes: TreeNode[], parentPath: string, entries: RemoteFileEntry[]): void {
+  private collectFiles(
+    nodes: TreeNode[],
+    parentPath: string,
+    entries: RemoteFileEntry[],
+    unsupported: SyncChange[],
+  ): void {
     for (const node of nodes) {
-      const remotePath = normalizeRemotePath(joinRemote(parentPath, node.name));
+      const remotePath = normalizeRemoteNodePath(
+        joinRemote(parentPath, node.name),
+        '文件',
+        unsupported,
+      );
+      if (!remotePath) {
+        continue;
+      }
       entries.push({
         id: node.id,
         path: remotePath,
@@ -445,6 +471,23 @@ export class RemoteWorkspaceScanner {
 
 function joinRemote(parent: string, name: string): string {
   return parent ? `${parent}/${name}` : name;
+}
+
+function normalizeRemoteNodePath(
+  candidate: string,
+  kind: '分类' | '目录' | '文件',
+  unsupported: SyncChange[],
+): string | undefined {
+  try {
+    return normalizeRemotePath(candidate);
+  } catch (error: unknown) {
+    unsupported.push({
+      path: candidate || '(空名称)',
+      status: 'unsupported',
+      message: `远端${kind}名称无法安全映射到本地: ${errorMessage(error)}`,
+    });
+    return undefined;
+  }
 }
 
 function remoteDirectoryNodeKey(directory: RemoteDirectoryEntry): string {

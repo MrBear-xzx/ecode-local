@@ -34,7 +34,6 @@ export function normalizeRemotePath(value: string): string {
       !segment
       || segment === '.'
       || segment === '..'
-      || WINDOWS_RESERVED.test(segment)
       || WINDOWS_INVALID.test(segment)
       || segment.endsWith('.')
       || segment.endsWith(' ')
@@ -68,7 +67,7 @@ export function validateEnvironmentDirectory(value: string): string | undefined 
   if (!/[A-Za-z0-9]/.test(directory)) {
     return '环境目录至少包含一个英文字母或数字';
   }
-  if (/^(con|prn|aux|nul)$/i.test(directory)) {
+  if (WINDOWS_RESERVED.test(directory)) {
     return `环境目录不能使用 Windows 保留名称 ${directory}`;
   }
   if ([

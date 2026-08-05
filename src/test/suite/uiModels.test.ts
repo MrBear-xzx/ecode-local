@@ -210,6 +210,18 @@ suite('Ecode UI models', () => {
       'const after = true;\n',
     );
   });
+
+  test('evicts old promotion diffs after the configured history limit', () => {
+    const provider = new PromotionDiffProvider(2);
+    const first = provider.createDiff('Type/first.js', 'first-before', 'first-after');
+    const second = provider.createDiff('Type/second.js', 'second-before', 'second-after');
+    const third = provider.createDiff('Type/third.js', 'third-before', 'third-after');
+
+    assert.strictEqual(provider.provideTextDocumentContent(first.before), '');
+    assert.strictEqual(provider.provideTextDocumentContent(first.after), '');
+    assert.strictEqual(provider.provideTextDocumentContent(second.before), 'second-before');
+    assert.strictEqual(provider.provideTextDocumentContent(third.after), 'third-after');
+  });
 });
 
 function themeIconId(item: {

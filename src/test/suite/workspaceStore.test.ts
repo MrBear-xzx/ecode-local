@@ -8,6 +8,7 @@ import type {
   SyncManifest,
 } from '../../domain/types';
 import {
+  moveEnvironmentDataAndCommit,
   updateGitIgnoreForEcodeLocal,
   WorkspaceStore,
 } from '../../storage/WorkspaceStore';
@@ -204,6 +205,40 @@ suite('Workspace store', () => {
     assert.deepStrictEqual((await store.getEnvironments()).map(item => item.id), [development.id]);
     assert.strictEqual(fs.existsSync(sourceRoot), false);
     assert.strictEqual(fs.existsSync(dataRoot), false);
+  });
+
+  test('restores staged environment data when configuration commit fails', async () => {
+    const sourceRoot = path.join(workspaceFolder, 'staged_source');
+    const dataRoot = path.join(workspaceFolder, '.ecode-local', 'staged_data');
+    const stagingRoot = path.join(
+      workspaceFolder,
+      '.ecode-local',
+      'deletion-staging',
+      'failed-transaction',
+    );
+    fs.mkdirSync(sourceRoot, { recursive: true });
+    fs.mkdirSync(dataRoot, { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'source.js'), 'const source = true;\n');
+    fs.writeFileSync(path.join(dataRoot, 'state.json'), '{}');
+
+    await assert.rejects(
+      moveEnvironmentDataAndCommit({
+        sourceRoot,
+        dataRoot,
+        stagingRoot,
+        commit: async () => {
+          throw new Error('configuration write failed');
+        },
+      }),
+      /configuration write failed/,
+    );
+
+    assert.strictEqual(
+      fs.readFileSync(path.join(sourceRoot, 'source.js'), 'utf8'),
+      'const source = true;\n',
+    );
+    assert.strictEqual(fs.readFileSync(path.join(dataRoot, 'state.json'), 'utf8'), '{}');
+    assert.strictEqual(fs.existsSync(stagingRoot), false);
   });
 
   test('refuses to delete the last environment and preserves its files', async () => {

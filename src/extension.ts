@@ -926,9 +926,14 @@ class ExtensionController {
       } else {
         await this.refreshAiSupport(false);
       }
-      vscode.window.showInformationMessage(
-        `Ecode: 环境“${environment.name}”及其本地数据已删除`,
-      );
+      const message = `Ecode: 环境“${environment.name}”及其本地数据已删除`;
+      if (result.cleanupPendingPath) {
+        vscode.window.showWarningMessage(
+          `${message}；隔离数据清理失败，请稍后手工检查 ${result.cleanupPendingPath}`,
+        );
+      } else {
+        vscode.window.showInformationMessage(message);
+      }
       return true;
     });
     return completed === true;
