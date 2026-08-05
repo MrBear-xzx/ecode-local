@@ -65,10 +65,14 @@ import {
 export const ECODE_DOC_SCHEME = 'ecode-doc';
 
 const LANGUAGE_SELECTOR: vscode.DocumentSelector = [
-  { language: 'javascript' },
-  { language: 'javascriptreact' },
-  { language: 'typescript' },
-  { language: 'typescriptreact' },
+  { language: 'javascript', scheme: 'file' },
+  { language: 'javascript', scheme: 'untitled' },
+  { language: 'javascriptreact', scheme: 'file' },
+  { language: 'javascriptreact', scheme: 'untitled' },
+  { language: 'typescript', scheme: 'file' },
+  { language: 'typescript', scheme: 'untitled' },
+  { language: 'typescriptreact', scheme: 'file' },
+  { language: 'typescriptreact', scheme: 'untitled' },
 ];
 
 export function registerEcodeLanguageFeatures(
