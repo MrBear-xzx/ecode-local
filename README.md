@@ -34,6 +34,8 @@ workspace/
 
 切换环境只切换活动源码目录及其独立状态，不复制或覆盖文件。环境配置保存在 `.ecode-local/environments.json`；密码和 Cookie 按环境 ID 保存在 VS Code `SecretStorage`，不会写入工作区或日志。`.ecode-local/` 可能包含源码快照，不应提交到版本库。
 
+删除环境会同时永久删除该环境的源码目录、`.ecode-local/<环境目录>/` 状态和本机登录凭据，不会修改远端代码、公共推送记录或变更集。为保证工作区始终可用，最后一个环境不能删除；请先新增其他环境。
+
 ## 日常使用
 
 首次使用：
@@ -48,13 +50,13 @@ workspace/
 日常同步：
 
 1. 在当前环境目录编辑源码；
-2. 等待自动刷新，或执行 `Ecode: 刷新本地变更`；
+2. 等待本地自动刷新，或执行 `Ecode: 刷新本地与远端变更` 主动检查两端状态；
 3. 检查差异并执行 `Ecode: 选择并推送`；选择文件后会直接执行，推送记录默认使用当前时间命名；
 4. 推送成功后从环境节点的“推送记录”查看文件差异、重命名或删除记录，也可对单个文件执行本地回退。
 
 推送前会检查最新远端状态、JavaScript/JSX 编译结果和 GBK 可表示性，写入后回读校验。更新请求超时或返回 5xx 时会先回读远端再判断实际结果；已落地的相同内容可在再次确认后补齐基线和推送记录，不重复上传。
 
-手动推送选择文件后不再额外弹框确认。通过 AI 请求发起的推送仍保留人工确认，避免后台请求未经确认直接修改远端。
+手动推送选择文件后不再额外弹框确认。通过 Agent CLI 发起推送时，Agent 必须先在对话中取得本次推送的明确授权并提交 `--confirmed`；VS Code 不再重复弹出确认框。
 
 Ecode 可能返回无法直接改名或删除的重名节点。相同路径且节点 ID 相同时，扩展会安全去重；节点 ID 不同时，会优先选择唯一有数据的文件或目录。若仍无法唯一判断，扩展只把具体文件或目录子树标记为“远端歧义/不支持”，保留该子树已有的本地文件并继续拉取其他安全文件；推送和变更集应用不会写入歧义路径。输出日志会记录冲突路径和脱敏后的候选节点 ID，便于排查。不同目录中的同名项不受影响。
 
@@ -85,7 +87,7 @@ GBK 不支持的字符必须改用 ASCII 转义，例如 `›`（U+203A）写成
 
 Ecode 服务端不提供事务，网络或服务端错误仍可能导致部分成功。
 
-点击变更集右侧的“取消变更集”只删除变更集记录，不删除推送或应用记录，也不回退任何本地或远端代码。
+点击变更集右侧的“删除变更集”只删除变更集记录，不删除推送或应用记录，也不回退任何本地或远端代码。
 
 ## 冲突与恢复
 
@@ -105,9 +107,22 @@ AI 知识分为：
 
 - `.ecode-local/common/ecode-ai/`：公共 API 和组件知识；
 - `.ecode-local/<环境目录>/ecode-ai/`：环境组件关系和表单元数据；
-- `AGENTS.md`：当前环境入口和安全约束。
+- `.ecode-local/common/ecode-ai/skills/ecode-local/`：AI 调用流程、action 参数与安全约束；
+- `AGENTS.md`：当前活动环境和上述 Skill 的入口。
 
-AI 只有在用户明确授权推送时才能创建 `.ecode-local/ai-requests/<id>.json`。扩展仍会校验环境和文件、弹出人工确认，并把结果写入 `.ecode-local/ai-results/<id>.json`；AI 不能绕过扩展直接调用远端接口。
+通用 Agent 按 `ecode-local` Skill 运行插件生成的 `scripts/ecode-agent.cjs`。CLI 覆盖全部功能，自动处理工作区、活动环境、内部请求和结果等待，无需依赖特定模型、VS Code AI API 或 MCP；请求 JSON 不再作为 Agent 公共接口。
+
+全新工作区激活扩展时不会生成 `.ecode-local` 或修改 `AGENTS.md`。先从 VS Code 的 Ecode 侧边栏完成首个环境配置；配置保存成功后，扩展才会生成 `.ecode-local`、`AGENTS.md` 管理区块、Skill 和 CLI。后续可由 Agent 调用 `configure` 编辑当前环境或调用 `addEnvironment` 新增环境。CLI 需要当前 Agent 环境能够执行 `node`：
+
+```text
+node .ecode-local/common/ecode-ai/skills/ecode-local/scripts/ecode-agent.cjs getState
+```
+
+接口覆盖环境、同步、冲突、推送记录、变更集、文档和 AI 支持。拉取无需确认；其他需要确认的 Agent 操作由 Agent 在对话中取得授权并提交 `--confirmed`，VS Code 不再二次确认。原有冲突、编译、GBK 和回读校验保持不变，每次远端推送仍需要单独授权。
+
+`configure`、`addEnvironment`、`searchDocumentation` 和 `openOnlineDocumentation` 需要用户在 VS Code 中填写或选择内容。CLI 提交后会立即返回 `status: "pending"` 和续查命令，不占用进程等待人工操作；原请求保留一小时，用户完成或取消后由 Agent 使用返回的 `wait --request-id <ID>` 获取最终结果，不能创建重复请求。
+
+移除 AI Coding 支持后，Ecode 侧边栏的更多操作中会显示 `Ecode: 启用 AI Coding 支持`。启用后会重新生成 Skill、CLI、知识文件和 `AGENTS.md` 管理区块。
 
 ## 常用命令
 
@@ -116,13 +131,15 @@ AI 只有在用户明确授权推送时才能创建 `.ecode-local/ai-requests/<i
 | `Ecode: 配置当前环境` | 编辑环境连接 |
 | `Ecode: 新增环境` | 新增独立环境 |
 | `Ecode: 切换环境` | 切换活动环境 |
+| `Ecode: 删除环境及本地数据` | 删除非最后一个环境的配置、源码、状态和凭据 |
 | `Ecode: 全量拉取` | 建立或刷新同步基线 |
-| `Ecode: 刷新本地变更` | 扫描当前环境 |
+| `Ecode: 刷新本地与远端变更` | 重新扫描两端并识别远端变化或冲突，不应用源码 |
 | `Ecode: 选择并推送` | 推送选中文件 |
 | `Ecode: 创建跨环境变更集` | 从推送记录创建变更集 |
 | `Ecode: 应用变更集到当前环境` | 应用最终文件快照 |
-| `Ecode: 取消变更集` | 删除变更集记录 |
+| `Ecode: 删除变更集` | 删除变更集记录 |
 | `Ecode: 刷新 AI Coding 支持` | 刷新公共和环境知识 |
+| `Ecode: 启用 AI Coding 支持` | 移除后重新生成 AI 支持内容 |
 
 ## 开发与兼容
 

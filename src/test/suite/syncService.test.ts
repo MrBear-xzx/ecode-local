@@ -403,6 +403,25 @@ suite('Ecode sync service', () => {
     assert.strictEqual(await harness.service.hasSyncBaseline(), true);
   });
 
+  test('refreshes remote state and reports a conflict without applying remote content', async () => {
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'a.js');
+    fs.writeFileSync(localPath, 'const local = true;\n');
+    files[0].content = 'const remoteAfterPull = true;\n';
+    const progress: string[] = [];
+
+    const changes = await harness.service.refreshChanges(message => progress.push(message));
+    const conflict = changes.find(change => change.path === 'Type/a.js');
+
+    assert.strictEqual(conflict?.status, 'conflict');
+    assert.strictEqual(conflict?.conflictReason, 'bothModified');
+    assert.strictEqual(conflict?.remoteHash, hashText('const remoteAfterPull = true;\n'));
+    assert.strictEqual(fs.readFileSync(localPath, 'utf8'), 'const local = true;\n');
+    assert.strictEqual(harness.store.conflicts.get('Type/a.js')?.reason, 'bothModified');
+    assert.ok(progress.some(message => message.includes('读取远端')));
+  });
+
   test('reconnects once when Ecode reports session error 002', async () => {
     expiredTreeResponses = 1;
     const harness = createHarness(root, baseUrl);

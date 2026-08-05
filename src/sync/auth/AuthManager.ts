@@ -93,6 +93,15 @@ export class AuthManager {
     return result.success ? this.client : undefined;
   }
 
+  async removeEnvironment(environmentId: string): Promise<void> {
+    await new TokenStore(this.secrets, environmentId).clear();
+    if (this.sessionIdentity === environmentId) {
+      this.client?.clearAuth();
+      this.sessionVerified = false;
+      this.sessionIdentity = '';
+    }
+  }
+
   private async login(
     serverUrl: string,
     username: string,

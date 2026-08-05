@@ -4,8 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import * as ts from 'typescript';
 import * as vscode from 'vscode';
-import { parseAiPushRequest } from '../../ai/AiPushRequest';
-import { AiPushRequestController } from '../../ai/AiPushRequestController';
+import { parseAiRequest, parseAiInvocation } from '../../ai/AiRequest';
+import { AiRequestController } from '../../ai/AiRequestController';
 import {
   generateComponentDeclarations,
   generateGlobalDeclarations,
@@ -22,8 +22,6 @@ import {
   WorkspaceComponentRegistry,
   type IndexedEcodeComponentCall,
 } from '../../language/WorkspaceComponentRegistry';
-import type { WorkspaceStore } from '../../storage/WorkspaceStore';
-import type { EcodeSyncService } from '../../sync/EcodeSyncService';
 
 suite('AI coding support', () => {
   test('normalizes documented types conservatively', () => {
@@ -79,15 +77,14 @@ suite('AI coding support', () => {
     assert.match(generated, /<!-- ecode-local:ai-start -->/);
     assert.match(generated, /泛微 E-cology 9 Ecode 前端扩展项目/);
     assert.match(generated, /不是独立的 Node\.js、React CLI 或普通 Web 项目/);
-    assert.match(generated, /运行时全局提供，无须 npm 安装或 import/);
+    assert.match(generated, /由 Ecode 运行时提供/);
     assert.match(generated, /Babel 7\.5\.5/);
-    assert.match(generated, /\.ecode-local\/common\/ecode-ai\/ecode-globals\.d\.ts/);
-    assert.match(generated, /\.ecode-local\/dev_env\/ecode-ai\/workspace-form-metadata\.md/);
-    assert.match(generated, /不要假设业务工作区使用 Git/);
-    assert.match(generated, /不要自动执行远端推送、删除或发布操作/);
-    assert.match(generated, /\.ecode-local\/ai-requests\/<id>\.json/);
-    assert.match(generated, /只有用户在当前任务中明确要求推送时/);
-    assert.match(generated, /"environmentDirectory": "dev_env"/);
+    assert.match(generated, /\.ecode-local\/common\/ecode-ai\/skills\/ecode-local\/SKILL\.md/);
+    assert.match(generated, /当前环境项目知识位于 `.ecode-local\/dev_env\/ecode-ai\/`/);
+    assert.match(generated, /所有扩展功能统一通过 Skill 提供的 `scripts\/ecode-agent\.cjs` 调用/);
+    assert.match(generated, /不直接读写 `.ecode-local\/agent-cli\/`/);
+    assert.match(generated, /不自动执行远端推送、删除、冲突处理或变更集应用/);
+    assert.match(generated, /推送必须有单独、明确的当前任务授权/);
     assert.strictEqual(updated, generated);
     assert.strictEqual(removeManagedAgentsContent(generated), original);
     assert.throws(
@@ -99,34 +96,85 @@ suite('AI coding support', () => {
     );
   });
 
-  test('validates AI push requests and binds the id to the file name', () => {
-    const request = parseAiPushRequest(JSON.stringify({
-      schemaVersion: 1,
+  test('validates AI requests and binds the id to the file name', () => {
+    const request = parseAiRequest(JSON.stringify({
+      schemaVersion: 2,
       id: 'push_001',
       action: 'push',
+      confirmed: true,
       environmentDirectory: 'dev_01',
       paths: ['Type/a.js', 'Page/b.jsx'],
       createdAt: '2026-07-30T12:00:00.000Z',
+      expiresAt: '2026-08-30T12:00:00.000Z',
     }), 'push_001.json');
 
     assert.deepStrictEqual(request.paths, ['Type/a.js', 'Page/b.jsx']);
     assert.throws(
-      () => parseAiPushRequest(JSON.stringify({
+      () => parseAiRequest(JSON.stringify({
         ...request,
         paths: ['Type/a.js', 'type/A.js'],
       }), 'push_001.json'),
       /重复路径/,
     );
     assert.throws(
-      () => parseAiPushRequest(JSON.stringify(request), 'another.json'),
+      () => parseAiRequest(JSON.stringify(request), 'another.json'),
       /文件名必须/,
     );
     assert.throws(
-      () => parseAiPushRequest(JSON.stringify({
+      () => parseAiRequest(JSON.stringify({
         ...request,
         environmentDirectory: '开发环境',
       }), 'push_001.json'),
       /只能包含英文字母/,
+    );
+    assert.throws(
+      () => parseAiRequest(JSON.stringify({
+        ...request,
+        schemaVersion: 1,
+      }), 'push_001.json'),
+      /schemaVersion 必须为 2/,
+    );
+  });
+
+  test('validates action-specific AI invocation fields', () => {
+    assert.deepStrictEqual(parseAiInvocation({
+      action: 'resolveConflict',
+      confirmed: true,
+      path: 'Type/a.js',
+      resolution: 'markMerged',
+    }), {
+      action: 'resolveConflict',
+      confirmed: true,
+      path: 'Type/a.js',
+      resolution: 'markMerged',
+    });
+    assert.throws(
+      () => parseAiInvocation({ action: 'push', confirmed: true, paths: [] }),
+      /至少包含一个/,
+    );
+    assert.throws(
+      () => parseAiInvocation({ action: 'switchEnvironment', confirmed: true }),
+      /environmentId/,
+    );
+    assert.deepStrictEqual(parseAiInvocation({
+      action: 'deleteEnvironment',
+      environmentId: 'env_test',
+      confirmed: true,
+    }), {
+      action: 'deleteEnvironment',
+      environmentId: 'env_test',
+      confirmed: true,
+    });
+    assert.deepStrictEqual(parseAiInvocation({ action: 'enableAiSupport' }), {
+      action: 'enableAiSupport',
+    });
+    assert.throws(
+      () => parseAiInvocation({ action: 'push', paths: ['Type/a.js'] }),
+      /明确授权/,
+    );
+    assert.throws(
+      () => parseAiInvocation({ action: 'pull', confirmed: true }),
+      /不接受 confirmed/,
     );
   });
 
@@ -134,41 +182,26 @@ suite('AI coding support', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-generation-'));
     const workspaceA = path.join(root, 'workspace-a');
     const workspaceB = path.join(root, 'workspace-b');
-    const requestDirectory = path.join(workspaceA, '.ecode-local', 'ai-requests');
+    const requestDirectory = path.join(workspaceA, '.ecode-local', 'agent-cli', 'requests');
     fs.mkdirSync(requestDirectory, { recursive: true });
     fs.mkdirSync(workspaceB, { recursive: true });
     fs.writeFileSync(path.join(requestDirectory, 'pending.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: 'pending',
       action: 'push',
+      confirmed: true,
       environmentDirectory: 'dev',
       paths: ['Type/a.js'],
       createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
     }), 'utf8');
-    let baselineChecks = 0;
     let executions = 0;
-    const store = {
-      getActiveEnvironment: async () => undefined,
-      getProfile: async () => undefined,
-    } as unknown as WorkspaceStore;
-    const service = {
-      hasSyncBaseline: async () => {
-        baselineChecks++;
-        return true;
-      },
-    } as unknown as EcodeSyncService;
-    const controller = new AiPushRequestController(
-      store,
-      service,
+    const controller = new AiRequestController(
       { warn: () => undefined } as unknown as vscode.LogOutputChannel,
-      () => false,
-      () => undefined,
-      () => true,
       async () => {
         executions++;
-        return undefined;
+        return { status: 'succeeded' };
       },
-      () => undefined,
     );
 
     try {
@@ -177,15 +210,117 @@ suite('AI coding support', () => {
       controller.configure(workspaceB);
       await delay(400);
 
-      assert.strictEqual(baselineChecks, 0);
       assert.strictEqual(executions, 0);
       assert.strictEqual(
-        fs.existsSync(path.join(workspaceA, '.ecode-local', 'ai-results', 'pending.json')),
+        fs.existsSync(path.join(
+          workspaceA,
+          '.ecode-local',
+          'agent-cli',
+          'results',
+          'pending.json',
+        )),
         false,
       );
     } finally {
       controller.dispose();
-      fs.rmSync(root, { recursive: true, force: true });
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    }
+  });
+
+  test('processes a generic file request and writes a v2 result', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-request-'));
+    const requestDirectory = path.join(root, '.ecode-local', 'agent-cli', 'requests');
+    const controller = new AiRequestController(
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      async invocation => ({
+        status: 'succeeded',
+        environmentDirectory: 'active_after_action',
+        data: { action: invocation.action },
+      }),
+    );
+    try {
+      controller.configure(root);
+      fs.mkdirSync(requestDirectory, { recursive: true });
+      fs.writeFileSync(path.join(requestDirectory, 'state_001.json'), JSON.stringify({
+        schemaVersion: 2,
+        id: 'state_001',
+        action: 'getState',
+        environmentDirectory: 'dev',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }), 'utf8');
+      await delay(1_200);
+      const result = JSON.parse(fs.readFileSync(path.join(
+        root,
+        '.ecode-local',
+        'agent-cli',
+        'results',
+        'state_001.json',
+      ), 'utf8')) as Record<string, unknown>;
+      assert.strictEqual(result.schemaVersion, 2);
+      assert.strictEqual(result.action, 'getState');
+      assert.strictEqual(result.status, 'succeeded');
+      assert.strictEqual(result.environmentDirectory, 'active_after_action');
+    } finally {
+      controller.dispose();
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    }
+  });
+
+  test('rejects an expired file request without executing it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-expired-'));
+    const requestDirectory = path.join(root, '.ecode-local', 'agent-cli', 'requests');
+    let executions = 0;
+    const controller = new AiRequestController(
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      async () => {
+        executions++;
+        return { status: 'succeeded' };
+      },
+    );
+    try {
+      controller.configure(root);
+      fs.mkdirSync(requestDirectory, { recursive: true });
+      fs.writeFileSync(path.join(requestDirectory, 'expired_001.json'), JSON.stringify({
+        schemaVersion: 2,
+        id: 'expired_001',
+        action: 'getState',
+        environmentDirectory: 'workspace',
+        createdAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      }), 'utf8');
+      await delay(1_200);
+      const result = JSON.parse(fs.readFileSync(path.join(
+        root,
+        '.ecode-local',
+        'agent-cli',
+        'results',
+        'expired_001.json',
+      ), 'utf8')) as Record<string, unknown>;
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(result.status, 'rejected');
+      assert.match(String(result.message), /已过期/);
+    } finally {
+      controller.dispose();
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
     }
   });
 
@@ -257,6 +392,7 @@ suite('AI coding support', () => {
       {
         info: () => undefined,
       } as never,
+      path.resolve(__dirname, '..', '..', '..'),
     );
     try {
       const result = await service.refresh({
@@ -277,6 +413,16 @@ suite('AI coding support', () => {
         true,
       );
       assert.strictEqual(
+        fs.existsSync(path.join(
+          result.commonDirectory,
+          'skills',
+          'ecode-local',
+          'scripts',
+          'ecode-agent.cjs',
+        )),
+        true,
+      );
+      assert.strictEqual(
         result.commonDirectory,
         path.join(root, '.ecode-local', 'common', 'ecode-ai'),
       );
@@ -284,6 +430,23 @@ suite('AI coding support', () => {
         fs.existsSync(path.join(result.commonDirectory, 'ecode-globals.d.ts')),
         true,
       );
+      assert.strictEqual(
+        fs.existsSync(path.join(
+          result.commonDirectory,
+          'skills',
+          'ecode-local',
+          'SKILL.md',
+        )),
+        true,
+      );
+      const generatedSkill = fs.readFileSync(path.join(
+        result.commonDirectory,
+        'skills',
+        'ecode-local',
+        'SKILL.md',
+      ), 'utf8');
+      assert.match(generatedSkill, /仅通过以下 CLI 调用扩展/);
+      assert.match(generatedSkill, /不直接读写 `.ecode-local` 内部状态或请求\/结果文件/);
       assert.match(
         fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8'),
         /\.ecode-local\/dev_env\/ecode-ai/,

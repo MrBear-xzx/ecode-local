@@ -1,5 +1,38 @@
 # 更新日志
 
+## 0.7.0 - 2026-08-05
+
+### Agent CLI
+
+- 插件全部功能统一通过通用 Agent CLI 暴露，不再提供旧请求 JSON 或 VS Code 专用 AI 命令作为公共接口。
+- 未配置环境的工作区不会生成 `.ecode-local` 或修改 `AGENTS.md`；首次从 Ecode 侧边栏成功配置环境后，自动生成中文 Skill、action 参考和 `ecode-agent.cjs`。
+- CLI 直接读取活动环境配置，不再为每个 action 额外请求 `getState`；拉取后的 Agent 状态过滤大量 `clean` 条目并保留状态计数，避免结果文件超过大小限制。
+- CLI 自动查找工作区和活动环境并输出结构化 JSON。需要 VS Code 表单或选择器的 action 提交后立即返回 `pending`，原请求保留一小时，用户完成后通过同一请求 ID 续查，不再因人工操作进入正常等待超时。
+
+### 环境与 AI 支持
+
+- 增加删除环境功能和 Agent CLI `deleteEnvironment` action；删除配置时同时清理该环境的源码目录、本地状态与 SecretStorage 凭据，并禁止删除最后一个环境。
+- 增加 `Ecode: 启用 AI Coding 支持` 入口和 `enableAiSupport` action；移除 AI 支持后可从侧边栏重新生成 Skill、CLI、知识文件和 AGENTS 管理区块。
+- 变更集界面命令统一改为“删除变更集”，Agent 成功消息不再使用“取消”文案。
+
+### 同步修复
+
+- `refreshChanges` 和 `Ecode: 刷新本地与远端变更` 现在会重新扫描远端，及时识别远端修改、删除及两端同时修改冲突，但不会应用远端源码。
+- `switchEnvironment` 结果顶层 `environmentDirectory` 改为切换后的活动环境目录。
+
+### 确认流程
+
+- 全量拉取直接执行，不再显示人工确认框。
+- Agent 调用环境切换、推送、回退、删除、冲突处理、变更集应用或 AI 支持移除前，必须在对话中取得当前任务授权并添加 `--confirmed`；VS Code 不再重复确认。
+- 缺少 `--confirmed` 的受保护 action 会在创建内部请求前被拒绝；普通 VS Code 界面操作仍保留原有确认。
+
+### 验证
+
+- `npm run lint`
+- `npm test`：189 项通过
+- `npm run package`
+- `git diff --check`
+
 ## 0.6.2 - 2026-08-03
 
 ### 修复
