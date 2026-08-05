@@ -26,30 +26,7 @@
     "ecCom"
   ],
   "activationEvents": [
-    "onView:ecode.workspace",
-    "onCommand:ecode.configure",
     "onCommand:ecode.setup",
-    "onCommand:ecode.addEnvironment",
-    "onCommand:ecode.switchEnvironment",
-    "onCommand:ecode.deleteEnvironment",
-    "onCommand:ecode.pull",
-    "onCommand:ecode.refreshChanges",
-    "onCommand:ecode.pushSelected",
-    "onCommand:ecode.rollbackPushFile",
-    "onCommand:ecode.renamePushRecord",
-    "onCommand:ecode.deletePushRecord",
-    "onCommand:ecode.openDiff",
-    "onCommand:ecode.revertChange",
-    "onCommand:ecode.resolveConflict",
-    "onCommand:ecode.createChangeSet",
-    "onCommand:ecode.applyChangeSet",
-    "onCommand:ecode.deleteChangeSet",
-    "onCommand:ecode.searchApiDocumentation",
-    "onCommand:ecode.openOnlineDocumentation",
-    "onCommand:ecode.refreshAiSupport",
-    "onCommand:ecode.enableAiSupport",
-    "onCommand:ecode.openAiGuide",
-    "onCommand:ecode.removeAiSupport",
     "onLanguage:javascript",
     "onLanguage:javascriptreact",
     "onLanguage:typescript",
@@ -182,7 +159,8 @@
       "ecode": [
         {
           "id": "ecode.workspace",
-          "name": "工作区"
+          "name": "工作区",
+          "icon": "media/ecode.svg"
         }
       ]
     },
