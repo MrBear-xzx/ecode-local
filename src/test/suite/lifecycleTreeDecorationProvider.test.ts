@@ -11,8 +11,10 @@ suite('LifecycleTreeDecorationProvider', () => {
 
     assert.strictEqual(color(provider, 'category', 'active'), 'charts.blue');
     assert.strictEqual(color(provider, 'category', 'inactive'), 'disabledForeground');
+    assert.strictEqual(color(provider, 'category', 'unknown'), 'disabledForeground');
     assert.strictEqual(color(provider, 'publishable', 'released'), 'charts.green');
     assert.strictEqual(color(provider, 'publishable', 'unreleased'), 'disabledForeground');
+    assert.strictEqual(color(provider, 'publishable', 'unknown'), 'disabledForeground');
     assert.strictEqual(color(provider, 'preload', 'preloaded'), undefined);
     assert.strictEqual(badge(provider, 'preload', 'preloaded'), 'P');
     assert.strictEqual(color(provider, 'native'), undefined);

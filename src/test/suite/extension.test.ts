@@ -265,6 +265,10 @@ suite('Ecode Extension Test Suite', () => {
           'view == ecode.workspace && viewItem == ecode.lifecycle.folder.unreleased',
         ],
         [
+          'ecode.setResourcePreloadOrder',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.folder.unknown',
+        ],
+        [
           'ecode.enableResourcePreload',
           'view == ecode.workspace && viewItem == ecode.lifecycle.file.preloadable',
         ],

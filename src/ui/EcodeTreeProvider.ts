@@ -42,6 +42,7 @@ interface LifecycleSourceTreeNode {
   released?: boolean;
   preStateOrder?: string;
   containsReleasedFolder?: boolean;
+  containsUnknownReleaseState?: boolean;
   preloadState?: PreloadState;
   canPreload?: boolean;
 }
@@ -267,14 +268,16 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
         );
       } else if (element.kind === 'folder') {
         item.description = element.rootFolder
-          ? [element.released ? '已发布' : '未发布', element.preStateOrder]
+          ? [releaseStateLabel(element.released), element.preStateOrder]
               .filter(value => value !== undefined)
               .join(' · ')
           : undefined;
         item.contextValue = element.rootFolder
-          ? element.released
+          ? element.released === true
             ? 'ecode.lifecycle.folder.released'
-            : 'ecode.lifecycle.folder.unreleased'
+            : element.released === false
+              ? 'ecode.lifecycle.folder.unreleased'
+              : 'ecode.lifecycle.folder.unknown'
           : 'ecode.lifecycle.folder';
         if (element.rootFolder) {
           item.iconPath = themeIcon(
@@ -580,7 +583,7 @@ function buildLifecycleSourceTree(
   }
   sortLifecycleSourceNodes(roots);
   for (const root of roots) {
-    markReleasedDescendants(root);
+    markReleaseDescendants(root);
   }
   return roots;
 }
@@ -604,7 +607,7 @@ function lifecycleSourceNode(
 function lifecycleTreeUri(
   localResourceUri: vscode.Uri,
   kind: 'category' | 'publishable' | 'preload' | 'native',
-  state?: 'active' | 'inactive' | 'released' | 'unreleased' | 'preloaded',
+  state?: 'active' | 'inactive' | 'unknown' | 'released' | 'unreleased' | 'preloaded',
 ): vscode.Uri {
   const query = new URLSearchParams({ kind });
   if (state) {
@@ -634,50 +637,84 @@ function sourcePathKey(value: string): string {
   return value.toLocaleLowerCase('en-US');
 }
 
-function markReleasedDescendants(node: LifecycleSourceTreeNode): boolean {
+function markReleaseDescendants(
+  node: LifecycleSourceTreeNode,
+): { released: boolean; unknown: boolean } {
   let childReleased = false;
+  let childUnknown = false;
   for (const child of node.children) {
-    childReleased = markReleasedDescendants(child) || childReleased;
+    const childState = markReleaseDescendants(child);
+    childReleased = childState.released || childReleased;
+    childUnknown = childState.unknown || childUnknown;
   }
-  const released = node.kind === 'folder' && node.released === true;
+  const publishable = node.kind === 'folder' && node.rootFolder;
+  const released = publishable && node.released === true;
+  const unknown = publishable && node.released === undefined;
   node.containsReleasedFolder = childReleased;
+  node.containsUnknownReleaseState = childUnknown;
   node.resourceUri = node.kind === 'category'
     ? lifecycleTreeUri(
         node.localResourceUri,
         'category',
-        childReleased ? 'active' : 'inactive',
+        childReleased ? 'active' : childUnknown ? 'unknown' : 'inactive',
       )
     : node.kind === 'folder' && node.rootFolder
       ? lifecycleTreeUri(
           node.localResourceUri,
           'publishable',
-          node.released ? 'released' : 'unreleased',
+          node.released === true
+            ? 'released'
+            : node.released === false
+              ? 'unreleased'
+              : 'unknown',
         )
       : node.kind === 'file' && node.preloadState === 'preloaded'
         ? lifecycleTreeUri(node.localResourceUri, 'preload', 'preloaded')
         : lifecycleTreeUri(node.localResourceUri, 'native');
-  return released || childReleased;
+  return {
+    released: released || childReleased,
+    unknown: unknown || childUnknown,
+  };
 }
 
 function lifecycleSourceTooltip(node: LifecycleSourceTreeNode): string {
   if (node.kind === 'category') {
     return `${node.remotePath}\nEcode 项目分类\n${
-      node.containsReleasedFolder ? '包含已发布文件夹' : '不包含已发布文件夹'
+      node.containsReleasedFolder
+        ? '包含已发布文件夹'
+        : node.containsUnknownReleaseState
+          ? '发布状态未完全读取'
+          : '不包含已发布文件夹'
     }`;
   }
   if (node.kind === 'folder') {
     if (!node.rootFolder) {
       return `${node.remotePath}\nEcode 内部文件夹`;
     }
-    return `${node.remotePath}\n${
-      node.released ? 'Ecode 已发布文件夹' : 'Ecode 可发布文件夹（未发布）'
-    }${node.preStateOrder !== undefined
+    return `${node.remotePath}\n${releaseStateTooltip(node.released)}${
+      node.preStateOrder !== undefined
       ? `\n前置加载顺序: ${node.preStateOrder}`
       : ''}`;
   }
   return `${node.remotePath}\n${
     node.preloadState === 'preloaded' ? 'Ecode 前置加载文件' : 'Ecode 源码文件'
   }`;
+}
+
+function releaseStateLabel(released: boolean | undefined): string {
+  return released === true
+    ? '已发布'
+    : released === false
+      ? '未发布'
+      : '发布状态未知';
+}
+
+function releaseStateTooltip(released: boolean | undefined): string {
+  return released === true
+    ? 'Ecode 已发布文件夹'
+    : released === false
+      ? 'Ecode 可发布文件夹（未发布）'
+      : 'Ecode 发布状态未知';
 }
 
 function statusLabel(status: SyncChange['status']): string {

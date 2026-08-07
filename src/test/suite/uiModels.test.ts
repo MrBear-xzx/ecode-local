@@ -208,7 +208,11 @@ suite('Ecode UI models', () => {
       lifecycleFresh: true,
       lifecycle: {
         capabilities: { systemInfo: true, releaseList: true },
-        categories: [{ id: 'type', path: 'Type' }, { id: 'empty', path: 'Unused' }],
+        categories: [
+          { id: 'type', path: 'Type' },
+          { id: 'pending', path: 'Pending' },
+          { id: 'empty', path: 'Unused' },
+        ],
         folders: [{
           id: 'released',
           path: 'Type/Released',
@@ -226,6 +230,11 @@ suite('Ecode UI models', () => {
           path: 'Type/Plain/components',
           rootFolder: false,
           released: false,
+        }, {
+          id: 'unknown-release',
+          path: 'Pending/Unknown',
+          rootFolder: true,
+          preStateOrder: '10000',
         }],
         files: [{
           id: 'app',
@@ -264,10 +273,14 @@ suite('Ecode UI models', () => {
       provider.getTreeItem(node).label === 'Type');
     const emptyCategory = sourceNodes.find(node =>
       provider.getTreeItem(node).label === 'Unused');
+    const pendingCategory = sourceNodes.find(node =>
+      provider.getTreeItem(node).label === 'Pending');
     assert.ok(category);
     assert.ok(emptyCategory);
+    assert.ok(pendingCategory);
     const categoryItem = provider.getTreeItem(category);
     const emptyCategoryItem = provider.getTreeItem(emptyCategory);
+    const pendingCategoryItem = provider.getTreeItem(pendingCategory);
     const folders = provider.getChildren(category);
     const released = folders.find(node =>
       provider.getTreeItem(node).label === 'Released');
@@ -277,6 +290,9 @@ suite('Ecode UI models', () => {
     assert.ok(plain);
     const releasedItem = provider.getTreeItem(released);
     const plainItem = provider.getTreeItem(plain);
+    const unknownReleaseItem = provider.getTreeItem(
+      provider.getChildren(pendingCategory)[0],
+    );
     const nestedItem = provider.getTreeItem(provider.getChildren(plain)[0]);
     const releasedChildren = provider.getChildren(released);
     const fileItem = provider.getTreeItem(releasedChildren.find(node =>
@@ -297,6 +313,9 @@ suite('Ecode UI models', () => {
     assert.strictEqual(themeIconId(emptyCategoryItem), 'folder-library');
     assert.strictEqual(themeIconColor(emptyCategoryItem), 'disabledForeground');
     assert.ok(emptyCategoryItem.resourceUri?.path.endsWith('Unused'));
+    assert.strictEqual(themeIconId(pendingCategoryItem), 'folder-library');
+    assert.strictEqual(themeIconColor(pendingCategoryItem), 'disabledForeground');
+    assert.match(String(pendingCategoryItem.tooltip), /发布状态未完全读取/);
     assert.strictEqual(themeIconId(releasedItem), 'package');
     assert.strictEqual(themeIconColor(releasedItem), 'charts.green');
     assert.strictEqual(releasedItem.contextValue, 'ecode.lifecycle.folder.released');
@@ -306,6 +325,15 @@ suite('Ecode UI models', () => {
     assert.strictEqual(themeIconColor(plainItem), 'disabledForeground');
     assert.strictEqual(plainItem.contextValue, 'ecode.lifecycle.folder.unreleased');
     assert.strictEqual(plainItem.description, '未发布 · 10000');
+    assert.strictEqual(themeIconId(unknownReleaseItem), 'package');
+    assert.strictEqual(themeIconColor(unknownReleaseItem), 'disabledForeground');
+    assert.strictEqual(unknownReleaseItem.contextValue, 'ecode.lifecycle.folder.unknown');
+    assert.strictEqual(unknownReleaseItem.description, '发布状态未知 · 10000');
+    assert.match(String(unknownReleaseItem.tooltip), /Ecode 发布状态未知/);
+    assert.strictEqual(
+      new URLSearchParams(unknownReleaseItem.resourceUri?.query).get('state'),
+      'unknown',
+    );
     assert.strictEqual(themeIconId(nestedItem), 'folder-opened');
     assert.strictEqual(nestedItem.description, undefined);
     assert.strictEqual(
