@@ -322,6 +322,11 @@
           "group": "inline@2"
         },
         {
+          "command": "ecode.setResourcePreloadOrder",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.folder.unknown",
+          "group": "inline@2"
+        },
+        {
           "command": "ecode.enableResourcePreload",
           "when": "view == ecode.workspace && viewItem == ecode.lifecycle.file.preloadable",
           "group": "inline@1"
