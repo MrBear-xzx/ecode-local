@@ -27,6 +27,7 @@ import { writeJsonAtomic, writeTextAtomic } from './AtomicFileStore';
 
 const MANIFEST_FILE = 'sync-manifest.json';
 const FORM_METADATA_FILE = 'form-metadata.json';
+const LIFECYCLE_SNAPSHOT_FILE = 'lifecycle-snapshot.json';
 
 export class WorkspaceStore {
   private workspaceFolder: string | undefined;
@@ -275,6 +276,35 @@ export class WorkspaceStore {
     cache.updatedAt = new Date().toISOString();
     await writeJsonAtomic(
       path.join(await this.environmentStorageRoot(cache.syncRoot), FORM_METADATA_FILE),
+      cache,
+    );
+  }
+
+  async loadLifecycleSnapshotCache(syncRoot: string): Promise<unknown | undefined> {
+    try {
+      const storageRoot = await this.environmentStorageRoot(syncRoot);
+      const raw = await fs.readFile(
+        path.join(storageRoot, LIFECYCLE_SNAPSHOT_FILE),
+        'utf8',
+      );
+      return JSON.parse(raw) as unknown;
+    } catch (error: unknown) {
+      if (isFileSystemError(error, 'ENOENT')) {
+        return undefined;
+      }
+      throw new Error(`生命周期快照缓存读取失败: ${errorMessage(error)}`);
+    }
+  }
+
+  async saveLifecycleSnapshotCache(
+    syncRoot: string,
+    cache: unknown,
+  ): Promise<void> {
+    await writeJsonAtomic(
+      path.join(
+        await this.environmentStorageRoot(syncRoot),
+        LIFECYCLE_SNAPSHOT_FILE,
+      ),
       cache,
     );
   }

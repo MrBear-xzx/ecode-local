@@ -1,4 +1,4 @@
 interface:
   display_name: "Ecode Local"
-  short_description: "通过 CLI 调用 Ecode 全部功能"
+  short_description: "通过 CLI 安全操作 Ecode 工作区"
   default_prompt: "使用 $ecode-local CLI 查询活动 Ecode 环境，并安全执行用户要求的操作。"

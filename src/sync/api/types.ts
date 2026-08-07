@@ -18,6 +18,12 @@ export interface TreeNode {
   attribute: string;
   hasChild?: boolean;
   parentId?: string;
+  appId?: string;
+  fileType?: string;
+  preloadState?: string;
+  preStateOrder?: string;
+  isRootFolder?: boolean;
+  released?: boolean;
 }
 
 export interface TreePayload {

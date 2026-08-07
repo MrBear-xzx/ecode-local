@@ -140,6 +140,12 @@ export function generateAiGuide(): string {
       + '由 CLI 处理内部通信并输出结构化结果。',
     '扩展统一执行环境和路径校验、Agent CLI 授权校验、远端冲突检查、编译/GBK 校验、'
       + '推送后回读验证与历史记录维护。AI 不得直接调用 E-cology 接口或绕过这些保护。',
+    '生命周期操作前先调用 `getLifecycleState` 并使用返回的精确路径；每项写操作都需要当前任务明确授权，且不会自动触发其他操作。',
+    '生命周期语义：只有根文件夹可发布；普通发布代码构建到 `cloudstore/release/{appId}`，默认通过 `ecodeSDK` 按需加载；'
+      + 'JS/CSS 前置代码早于系统和组件执行并合并到全局 `init.js/init.css`。'
+      + '根文件夹前置加载顺序越小越先执行，默认 `10000`，相同值的稳定次序及负数/零兼容性没有官方保证。'
+      + '发布、文件前置状态和顺序彼此独立，Agent 不得自动补做另一项。'
+      + '`config.js`、`config_default.js`、`configLoad.js` 和 `configLoad_default.js` 有发布后的特殊默认生效及优先级规则，不能当作普通文件批量切换。',
     '',
     '## 常见示例',
     '',

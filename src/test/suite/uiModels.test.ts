@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import type * as vscode from 'vscode';
 import type {
   ChangeSet,
   EnvironmentProfile,
@@ -129,7 +130,23 @@ suite('Ecode UI models', () => {
     assert.strictEqual(sourceDirectory?.description, 'integration_env/');
     assert.strictEqual(provider.getTreeItem(activeRoot!).description, '当前环境');
     assert.strictEqual(themeIconId(provider.getTreeItem(activeRoot!)), 'server-environment');
-    assert.strictEqual(themeIconId(sourceDirectory!), 'folder');
+    assert.ok(sourceDirectory?.resourceUri?.fsPath.endsWith('integration_env'));
+    assert.strictEqual(themeIconId(sourceDirectory!), 'root-folder');
+    assert.strictEqual(themeIconColor(sourceDirectory!), undefined);
+    provider.setLifecycleLoading(true);
+    const loadingSourceDirectory = provider.getChildren(activeRoot!)
+      .map(item => provider.getTreeItem(item))
+      .find(item => item.label === '源码目录');
+    assert.strictEqual(themeIconId(loadingSourceDirectory!), 'sync~spin');
+    assert.strictEqual(themeIconColor(loadingSourceDirectory!), 'charts.blue');
+    assert.match(String(loadingSourceDirectory?.tooltip), /正在刷新/);
+    provider.setLifecycleLoading(false);
+    const readySourceDirectory = provider.getChildren(activeRoot!)
+      .map(item => provider.getTreeItem(item))
+      .find(item => item.label === '源码目录');
+    assert.strictEqual(themeIconId(readySourceDirectory!), 'root-folder');
+    assert.ok(!environmentChildren.some(item =>
+      provider.getTreeItem(item).label === 'Ecode 源码结构'));
     assert.strictEqual(themeIconId(provider.getTreeItem(syncGroup!)), 'sync');
     assert.strictEqual(themeIconId(provider.getTreeItem(changesGroup!)), 'source-control');
     assert.strictEqual(themeIconId(provider.getTreeItem(conflict!)), 'warning');
@@ -172,6 +189,198 @@ suite('Ecode UI models', () => {
 
     assert.strictEqual(item?.description, '请先执行全量拉取');
     assert.strictEqual(item?.command?.command, 'ecode.pull');
+  });
+
+  test('uses native source icons except for publishable release packages', () => {
+    const provider = new EcodeTreeProvider();
+    const environment: EnvironmentProfile = {
+      version: 2,
+      id: 'icons',
+      name: '图标环境',
+      directory: 'icons_env',
+      serverUrl: 'http://localhost:8099',
+      username: 'tester',
+      workspaceFolder: 'D:\\workspace',
+    };
+    provider.update([{
+      environment,
+      active: true,
+      lifecycleFresh: true,
+      lifecycle: {
+        capabilities: { systemInfo: true, releaseList: true },
+        categories: [{ id: 'type', path: 'Type' }, { id: 'empty', path: 'Unused' }],
+        folders: [{
+          id: 'released',
+          path: 'Type/Released',
+          rootFolder: true,
+          released: true,
+          preStateOrder: '10000',
+        }, {
+          id: 'plain',
+          path: 'Type/Plain',
+          rootFolder: true,
+          released: false,
+          preStateOrder: '10000',
+        }, {
+          id: 'nested',
+          path: 'Type/Plain/components',
+          rootFolder: false,
+          released: false,
+        }],
+        files: [{
+          id: 'app',
+          path: 'Type/Released/app.js',
+          fileType: 'js',
+          preloadState: 'preloaded',
+          canPreload: true,
+        }, {
+          id: 'normal',
+          path: 'Type/Released/normal.js',
+          fileType: 'js',
+          preloadState: 'normal',
+          canPreload: true,
+        }, {
+          id: 'postloaded',
+          path: 'Type/Released/postloaded.js',
+          fileType: 'js',
+          preloadState: 'postloaded',
+          canPreload: true,
+        }, {
+          id: 'unknown',
+          path: 'Type/Released/unknown.js',
+          fileType: 'js',
+          preloadState: 'unknown',
+          canPreload: true,
+        }],
+      },
+    }]);
+
+    const environmentNode = provider.getChildren()[0];
+    const sourceDirectory = provider.getChildren(environmentNode)
+      .find(node => provider.getTreeItem(node).label === '源码目录');
+    assert.ok(sourceDirectory);
+    const sourceNodes = provider.getChildren(sourceDirectory);
+    const category = sourceNodes.find(node =>
+      provider.getTreeItem(node).label === 'Type');
+    const emptyCategory = sourceNodes.find(node =>
+      provider.getTreeItem(node).label === 'Unused');
+    assert.ok(category);
+    assert.ok(emptyCategory);
+    const categoryItem = provider.getTreeItem(category);
+    const emptyCategoryItem = provider.getTreeItem(emptyCategory);
+    const folders = provider.getChildren(category);
+    const released = folders.find(node =>
+      provider.getTreeItem(node).label === 'Released');
+    const plain = folders.find(node =>
+      provider.getTreeItem(node).label === 'Plain');
+    assert.ok(released);
+    assert.ok(plain);
+    const releasedItem = provider.getTreeItem(released);
+    const plainItem = provider.getTreeItem(plain);
+    const nestedItem = provider.getTreeItem(provider.getChildren(plain)[0]);
+    const releasedChildren = provider.getChildren(released);
+    const fileItem = provider.getTreeItem(releasedChildren.find(node =>
+      provider.getTreeItem(node).label === 'app.js')!);
+    const normalFileItem = provider.getTreeItem(releasedChildren.find(node =>
+      provider.getTreeItem(node).label === 'normal.js')!);
+    const postloadedFileItem = provider.getTreeItem(releasedChildren.find(node =>
+      provider.getTreeItem(node).label === 'postloaded.js')!);
+    const unknownFileItem = provider.getTreeItem(releasedChildren.find(node =>
+      provider.getTreeItem(node).label === 'unknown.js')!);
+
+    assert.strictEqual(themeIconId(categoryItem), 'folder-library');
+    assert.strictEqual(themeIconColor(categoryItem), 'charts.blue');
+    assert.strictEqual(categoryItem.resourceUri?.scheme, 'ecode-lifecycle-tree');
+    assert.ok(categoryItem.resourceUri?.path.endsWith('Type'));
+    assert.strictEqual(categoryItem.contextValue, 'ecode.lifecycle.category');
+    assert.strictEqual(categoryItem.description, undefined);
+    assert.strictEqual(themeIconId(emptyCategoryItem), 'folder-library');
+    assert.strictEqual(themeIconColor(emptyCategoryItem), 'disabledForeground');
+    assert.ok(emptyCategoryItem.resourceUri?.path.endsWith('Unused'));
+    assert.strictEqual(themeIconId(releasedItem), 'package');
+    assert.strictEqual(themeIconColor(releasedItem), 'charts.green');
+    assert.strictEqual(releasedItem.contextValue, 'ecode.lifecycle.folder.released');
+    assert.strictEqual(releasedItem.description, '已发布 · 10000');
+    assert.match(String(releasedItem.tooltip), /前置加载顺序: 10000/);
+    assert.strictEqual(themeIconId(plainItem), 'package');
+    assert.strictEqual(themeIconColor(plainItem), 'disabledForeground');
+    assert.strictEqual(plainItem.contextValue, 'ecode.lifecycle.folder.unreleased');
+    assert.strictEqual(plainItem.description, '未发布 · 10000');
+    assert.strictEqual(themeIconId(nestedItem), 'folder-opened');
+    assert.strictEqual(nestedItem.description, undefined);
+    assert.strictEqual(
+      nestedItem.tooltip,
+      'Type/Plain/components\nEcode 内部文件夹',
+    );
+    assert.ok(nestedItem.resourceUri?.path.endsWith('components'));
+    assert.strictEqual(nestedItem.contextValue, 'ecode.lifecycle.folder');
+    assert.strictEqual(themeIconId(fileItem), undefined);
+    assert.ok(fileItem.resourceUri?.path.endsWith('app.js'));
+    assert.strictEqual(
+      new URLSearchParams(fileItem.resourceUri?.query).get('kind'),
+      'preload',
+    );
+    assert.strictEqual(
+      new URLSearchParams(fileItem.resourceUri?.query).get('state'),
+      'preloaded',
+    );
+    assert.strictEqual(fileItem.description, '前置加载');
+    assert.strictEqual(fileItem.contextValue, 'ecode.lifecycle.file.preloaded');
+    assert.strictEqual(normalFileItem.contextValue, 'ecode.lifecycle.file.preloadable');
+    assert.strictEqual(postloadedFileItem.contextValue, 'ecode.lifecycle.file');
+    assert.strictEqual(unknownFileItem.contextValue, 'ecode.lifecycle.file');
+    assert.strictEqual(fileItem.command?.command, 'vscode.open');
+    assert.strictEqual((fileItem.command?.arguments?.[0] as vscode.Uri).scheme, 'file');
+  });
+
+  test('renders a cached source tree immediately and schedules one live refresh', () => {
+    const provider = new EcodeTreeProvider();
+    let refreshes = 0;
+    provider.setLifecycleRefreshHandler(() => refreshes++);
+    const environment: EnvironmentProfile = {
+      version: 2,
+      id: 'cached',
+      name: '缓存环境',
+      directory: 'cached_env',
+      serverUrl: 'http://localhost:8099',
+      username: 'tester',
+      workspaceFolder: 'D:\\workspace',
+    };
+    const lifecycle = {
+      capabilities: { systemInfo: true, releaseList: true },
+      categories: [{ id: 'type', path: 'Type' }],
+      folders: [],
+      files: [],
+    };
+    provider.update([{
+      environment,
+      active: true,
+      lifecycle,
+      lifecycleFresh: false,
+    }]);
+
+    const environmentNode = provider.getChildren()[0];
+    const cachedSource = provider.getChildren(environmentNode)
+      .find(node => provider.getTreeItem(node).label === '源码目录');
+    assert.ok(cachedSource);
+    assert.strictEqual(
+      provider.getTreeItem(provider.getChildren(cachedSource)[0]).label,
+      'Type',
+    );
+    assert.strictEqual(refreshes, 1);
+
+    provider.update([{
+      environment,
+      active: true,
+      lifecycle,
+      lifecycleFresh: true,
+    }]);
+    const freshEnvironment = provider.getChildren()[0];
+    const freshSource = provider.getChildren(freshEnvironment)
+      .find(node => provider.getTreeItem(node).label === '源码目录');
+    assert.ok(freshSource);
+    provider.getChildren(freshSource);
+    assert.strictEqual(refreshes, 1);
   });
 
   test('serves baseline and remote content through read-only virtual documents', async () => {
@@ -228,4 +437,10 @@ function themeIconId(item: {
   iconPath?: unknown;
 }): string | undefined {
   return (item.iconPath as { id?: string } | undefined)?.id;
+}
+
+function themeIconColor(item: {
+  iconPath?: unknown;
+}): string | undefined {
+  return (item.iconPath as { color?: { id?: string } } | undefined)?.color?.id;
 }

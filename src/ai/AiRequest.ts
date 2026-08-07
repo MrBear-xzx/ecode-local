@@ -3,12 +3,14 @@ import {
   normalizeRemotePath,
   validateEnvironmentDirectory,
 } from '../domain/paths';
+import { normalizePreStateOrder } from '../domain/lifecycle';
 
 export const CLI_REQUEST_DIRECTORY = 'agent-cli/requests';
 export const CLI_RESULT_DIRECTORY = 'agent-cli/results';
 
 export const AI_INSPECT_ACTIONS = [
   'getState',
+  'getLifecycleState',
   'refreshChanges',
   'listPushRecords',
   'listChangeSets',
@@ -22,22 +24,17 @@ export const AI_EXECUTE_ACTIONS = [
   'deleteEnvironment',
   'pull',
   'push',
+  'setPreload',
+  'setPreloadOrder',
+  'setFolderRelease',
   'rollbackPushFile',
   'renamePushRecord',
   'deletePushRecord',
-  'openDiff',
-  'openPromotionDiff',
   'revertChange',
   'resolveConflict',
   'createChangeSet',
   'applyChangeSet',
   'deleteChangeSet',
-  'searchDocumentation',
-  'openOnlineDocumentation',
-  'refreshAiSupport',
-  'enableAiSupport',
-  'openAiGuide',
-  'removeAiSupport',
 ] as const;
 
 export type AiInspectAction = typeof AI_INSPECT_ACTIONS[number];
@@ -48,13 +45,15 @@ export const AI_CONFIRMATION_ACTIONS = [
   'switchEnvironment',
   'deleteEnvironment',
   'push',
+  'setPreload',
+  'setPreloadOrder',
+  'setFolderRelease',
   'rollbackPushFile',
   'deletePushRecord',
   'revertChange',
   'resolveConflict',
   'applyChangeSet',
   'deleteChangeSet',
-  'removeAiSupport',
 ] as const satisfies readonly AiAction[];
 
 export type ConflictResolution =
@@ -69,13 +68,13 @@ export interface AiInvocation {
   environmentId?: string;
   paths?: string[];
   path?: string;
+  enabled?: boolean;
+  preStateOrder?: string;
   pushRecordId?: string;
   pushRecordIds?: string[];
   changeSetId?: string;
   name?: string;
   resolution?: ConflictResolution;
-  recordType?: 'pushRecord' | 'changeSet';
-  query?: string;
 }
 
 export interface AiRequest extends AiInvocation {
@@ -158,6 +157,17 @@ export function parseAiInvocation(value: unknown): AiInvocation {
     case 'push':
       invocation.paths = parsePaths(value.paths);
       break;
+    case 'setPreload':
+    case 'setFolderRelease':
+      invocation.path = parseRemotePath(value.path, 'path');
+      invocation.enabled = requireBoolean(value.enabled, 'enabled');
+      break;
+    case 'setPreloadOrder':
+      invocation.path = parseRemotePath(value.path, 'path');
+      invocation.preStateOrder = normalizePreStateOrder(
+        requireString(value.preStateOrder, 'preStateOrder', 100),
+      );
+      break;
     case 'rollbackPushFile':
       invocation.pushRecordId = requireIdentifier(value.pushRecordId, 'pushRecordId');
       invocation.path = parseRemotePath(value.path, 'path');
@@ -169,21 +179,7 @@ export function parseAiInvocation(value: unknown): AiInvocation {
     case 'deletePushRecord':
       invocation.pushRecordId = requireIdentifier(value.pushRecordId, 'pushRecordId');
       break;
-    case 'openDiff':
     case 'revertChange':
-      invocation.path = parseRemotePath(value.path, 'path');
-      break;
-    case 'openPromotionDiff':
-      invocation.recordType = requireEnum<'pushRecord' | 'changeSet'>(
-        value.recordType,
-        'recordType',
-        ['pushRecord', 'changeSet'],
-      );
-      if (invocation.recordType === 'pushRecord') {
-        invocation.pushRecordId = requireIdentifier(value.pushRecordId, 'pushRecordId');
-      } else {
-        invocation.changeSetId = requireIdentifier(value.changeSetId, 'changeSetId');
-      }
       invocation.path = parseRemotePath(value.path, 'path');
       break;
     case 'resolveConflict':
@@ -201,9 +197,6 @@ export function parseAiInvocation(value: unknown): AiInvocation {
     case 'applyChangeSet':
     case 'deleteChangeSet':
       invocation.changeSetId = requireIdentifier(value.changeSetId, 'changeSetId');
-      break;
-    case 'searchDocumentation':
-      invocation.query = optionalString(value.query, 'query', 200);
       break;
     default:
       break;
@@ -280,14 +273,6 @@ function requireIdentifier(value: unknown, field: string, maxLength = 128): stri
   return identifier;
 }
 
-function optionalString(
-  value: unknown,
-  field: string,
-  maxLength: number,
-): string | undefined {
-  return value === undefined ? undefined : requireString(value, field, maxLength);
-}
-
 function requireString(value: unknown, field: string, maxLength: number): string {
   if (typeof value !== 'string' || !value.trim()) {
     throw new Error(`AI 请求 ${field} 必须是非空字符串`);
@@ -308,6 +293,13 @@ function requireEnum<T extends string>(
     throw new Error(`AI 请求 ${field} 必须是 ${allowed.join('、')} 之一`);
   }
   return value as T;
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`AI 请求 ${field} 必须是布尔值`);
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

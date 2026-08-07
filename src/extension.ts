@@ -12,11 +12,16 @@ import {
 } from './ai/AiRequestController';
 import { AiSupportService } from './ai/AiSupportService';
 import {
+  normalizeRemotePath,
   resolveEnvironmentSourceRoot,
   resolveSafeLocalPath,
   validateEnvironmentDirectory,
 } from './domain/paths';
 import { serverFingerprint } from './domain/text';
+import {
+  lifecycleConnectionIdentity,
+  normalizePreStateOrder,
+} from './domain/lifecycle';
 import type {
   ChangeSet,
   DeploymentFileResult,
@@ -35,11 +40,19 @@ import { WorkspaceStore } from './storage/WorkspaceStore';
 import { PromotionStore } from './storage/PromotionStore';
 import { detectLegacyProjects } from './storage/LegacyProjectGuard';
 import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
+import {
+  EcodeLifecycleService,
+  type LifecycleFile,
+  type LifecycleFolder,
+  type LifecycleSnapshot,
+} from './sync/EcodeLifecycleService';
 import { AuthManager } from './sync/auth/AuthManager';
 import {
   EcodeTreeProvider,
   type EnvironmentTreeState,
 } from './ui/EcodeTreeProvider';
+import { LifecycleTreeDecorationProvider } from './ui/LifecycleTreeDecorationProvider';
+import { WorkspaceChangeDecorationProvider } from './ui/WorkspaceChangeDecorationProvider';
 import {
   PROMOTION_DIFF_SCHEME,
   PromotionDiffProvider,
@@ -79,7 +92,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const store = new WorkspaceStore(initialWorkspace);
   const auth = new AuthManager(context);
   const service = new EcodeSyncService(store, auth, output);
+  const lifecycle = new EcodeLifecycleService(store, auth, output);
   const tree = new EcodeTreeProvider();
+  const lifecycleTreeDecorations = new LifecycleTreeDecorationProvider();
+  const workspaceChangeDecorations = new WorkspaceChangeDecorationProvider();
   const promotionDiff = new PromotionDiffProvider();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const componentRegistry = new WorkspaceComponentRegistry();
@@ -96,6 +112,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     store,
     auth,
     service,
+    lifecycle,
+    workspaceChangeDecorations,
     tree,
     status,
     componentRegistry,
@@ -103,14 +121,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     aiSupport,
     promotionDiff,
   );
+  tree.setLifecycleRefreshHandler(() =>
+    controller.scheduleLifecycleDecorationRefresh());
 
   context.subscriptions.push(
     output,
     status,
     componentRegistry,
     formMetadataRegistry,
+    workspaceChangeDecorations,
     controller,
     vscode.window.registerTreeDataProvider('ecode.workspace', tree),
+    vscode.window.registerFileDecorationProvider(lifecycleTreeDecorations),
+    vscode.window.registerFileDecorationProvider(workspaceChangeDecorations),
     vscode.workspace.registerTextDocumentContentProvider(
       BASELINE_SCHEME,
       new VirtualDocumentProvider(BASELINE_SCHEME, service),
@@ -184,11 +207,18 @@ class ExtensionController {
   private aiRefreshTimer: NodeJS.Timeout | undefined;
   private lastAiSupportError: string | undefined;
   private activeAiInvocations = 0;
+  private lifecycleDecorationRefresh: Promise<void> | undefined;
+  private lifecycleSnapshot: LifecycleSnapshot | undefined;
+  private lifecycleSnapshotSourceRoot: string | undefined;
+  private lifecycleSnapshotIdentity: string | undefined;
+  private lifecycleSnapshotFresh = false;
 
   constructor(
     private readonly store: WorkspaceStore,
     private readonly auth: AuthManager,
     private readonly service: EcodeSyncService,
+    private readonly lifecycle: EcodeLifecycleService,
+    private readonly workspaceChangeDecorations: WorkspaceChangeDecorationProvider,
     private readonly tree: EcodeTreeProvider,
     private readonly status: vscode.StatusBarItem,
     private readonly componentRegistry: WorkspaceComponentRegistry,
@@ -216,6 +246,18 @@ class ExtensionController {
       vscode.commands.registerCommand('ecode.refreshChanges', () => this.refreshChanges()),
       vscode.commands.registerCommand('ecode.pushSelected', () =>
         this.runCommandSafely(() => this.pushSelected())),
+      vscode.commands.registerCommand('ecode.publishResourceFolder', (argument?: unknown) =>
+        this.setResourceFolderRelease(argument, true)),
+      vscode.commands.registerCommand('ecode.unpublishResourceFolder', (argument?: unknown) =>
+        this.setResourceFolderRelease(argument, false)),
+      vscode.commands.registerCommand('ecode.setResourcePreloadOrder', (argument?: unknown) =>
+        this.setResourcePreloadOrder(argument)),
+      vscode.commands.registerCommand('ecode.enableResourcePreload', (argument?: unknown) =>
+        this.setResourcePreload(argument, true)),
+      vscode.commands.registerCommand('ecode.disableResourcePreload', (argument?: unknown) =>
+        this.setResourcePreload(argument, false)),
+      vscode.commands.registerCommand('ecode.refreshLifecycleDecorations', () =>
+        this.refreshLifecycleDecorations(true)),
       vscode.commands.registerCommand(
         'ecode.rollbackPushFile',
         (argument: unknown, remotePath?: string) =>
@@ -270,7 +312,7 @@ class ExtensionController {
       const activeEnvironment = await this.store.getActiveEnvironment();
       if (
         invocationContext.environmentDirectory
-        && !['getState', 'getKnowledge', 'configure', 'addEnvironment', 'enableAiSupport']
+        && !['getState', 'getKnowledge', 'configure', 'addEnvironment']
           .includes(invocation.action)
         && activeEnvironment?.directory !== invocationContext.environmentDirectory
       ) {
@@ -289,9 +331,6 @@ class ExtensionController {
           'listPushRecords',
           'listChangeSets',
           'getKnowledge',
-          'openAiGuide',
-          'searchDocumentation',
-          'openOnlineDocumentation',
         ].includes(invocation.action)
       ) {
         return { status: 'failed', message: '已有同步操作正在执行，请稍后使用新请求重试' };
@@ -300,6 +339,8 @@ class ExtensionController {
       switch (invocation.action) {
         case 'getState':
           return { status: 'succeeded', data: await this.getAiState() };
+        case 'getLifecycleState':
+          return { status: 'succeeded', data: await this.readLifecycleSnapshot() };
         case 'refreshChanges':
           return {
             status: 'succeeded',
@@ -356,6 +397,39 @@ class ExtensionController {
           );
         case 'push':
           return this.pushFromAi(invocation.paths!);
+        case 'setPreload':
+          return this.runVerifiedLifecycleMutation(
+            '正在更新前置加载状态...',
+            invocation.enabled! ? '设置前置加载' : '取消前置加载',
+            () => this.lifecycle.setFilePreloadedByPath(
+              invocation.path!,
+              invocation.enabled!,
+            ),
+            result => this.recordLifecyclePreload(result.path, result.enabled),
+          );
+        case 'setFolderRelease':
+          return this.runVerifiedLifecycleMutation(
+            '正在更新文件夹发布状态...',
+            invocation.enabled! ? '发布文件夹' : '取消发布',
+            () => this.lifecycle.setFolderReleasedByPath(
+              invocation.path!,
+              invocation.enabled!,
+            ),
+            result => this.recordLifecycleRelease(result.path, result.enabled),
+          );
+        case 'setPreloadOrder':
+          return this.runVerifiedLifecycleMutation(
+            '正在更新前置加载顺序...',
+            '设置前置加载顺序',
+            () => this.lifecycle.setPreStateOrderByPath(
+              invocation.path!,
+              invocation.preStateOrder!,
+            ),
+            result => this.recordLifecyclePreStateOrder(
+              result.path,
+              result.preStateOrder,
+            ),
+          );
         case 'rollbackPushFile': {
           const record = await this.requirePushRecord(invocation.pushRecordId!);
           return confirmedOperationResult(
@@ -379,18 +453,6 @@ class ExtensionController {
             '推送记录已删除',
             '用户未确认删除推送记录',
           );
-        }
-        case 'openDiff': {
-          const change = await this.requireChange(invocation.path!);
-          await this.openDiff(change);
-          return { status: 'succeeded', message: '已打开差异视图' };
-        }
-        case 'openPromotionDiff': {
-          const candidate = invocation.recordType === 'pushRecord'
-            ? await this.requirePushRecord(invocation.pushRecordId!)
-            : await this.requireChangeSet(invocation.changeSetId!);
-          await this.openPromotionDiff(candidate, invocation.path!);
-          return { status: 'succeeded', message: '已打开记录差异视图' };
         }
         case 'revertChange': {
           const change = await this.requireChange(invocation.path!);
@@ -430,29 +492,6 @@ class ExtensionController {
             ),
             '变更集已删除',
             '用户未确认删除变更集',
-          );
-        case 'searchDocumentation':
-          await vscode.commands.executeCommand('ecode.searchApiDocumentation', invocation.query);
-          return { status: 'succeeded', message: '已打开开发文档搜索' };
-        case 'openOnlineDocumentation':
-          await vscode.commands.executeCommand('ecode.openOnlineDocumentation');
-          return { status: 'succeeded', message: '已打开在线文档选择器' };
-        case 'refreshAiSupport':
-          return await this.refreshAiSupport(true)
-            ? { status: 'succeeded', data: await this.getAiKnowledge() }
-            : { status: 'failed', message: 'AI Coding 支持未刷新' };
-        case 'enableAiSupport':
-          return await this.enableAiSupport()
-            ? { status: 'succeeded', data: await this.getAiKnowledge() }
-            : { status: 'failed', message: 'AI Coding 支持未启用' };
-        case 'openAiGuide':
-          await this.openAiGuide();
-          return { status: 'succeeded', message: '已打开 AI Coding 指南' };
-        case 'removeAiSupport':
-          return confirmedOperationResult(
-            await this.removeAiSupport('agent'),
-            'AI Coding 支持已移除',
-            '用户未确认移除 AI Coding 支持',
           );
       }
     } catch (error: unknown) {
@@ -1783,24 +1822,20 @@ class ExtensionController {
     }
   }
 
-  private async removeAiSupport(
-    confirmationSource: ConfirmationSource = 'vscode',
-  ): Promise<boolean> {
+  private async removeAiSupport(): Promise<boolean> {
     const profile = await this.store.getProfile();
     if (!profile) {
       vscode.window.showErrorMessage('Ecode: 当前没有有效连接配置');
       return false;
     }
-    if (confirmationSource === 'vscode') {
-      const confirmation = await vscode.window.showWarningMessage(
-        '将删除公共知识目录、当前环境的 AI 项目知识及 AGENTS.md 的 Ecode 管理区块。'
-          + '同步状态、变更集和其他环境数据不会被删除。',
-        { modal: true },
-        '移除 AI 支持',
-      );
-      if (confirmation !== '移除 AI 支持') {
-        return false;
-      }
+    const confirmation = await vscode.window.showWarningMessage(
+      '将删除公共知识目录、当前环境的 AI 项目知识及 AGENTS.md 的 Ecode 管理区块。'
+        + '同步状态、变更集和其他环境数据不会被删除。',
+      { modal: true },
+      '移除 AI 支持',
+    );
+    if (confirmation !== '移除 AI 支持') {
+      return false;
     }
     await vscode.workspace
       .getConfiguration('ecode', vscode.Uri.file(profile.workspaceFolder))
@@ -1828,6 +1863,311 @@ class ExtensionController {
     }
   }
 
+  scheduleLifecycleDecorationRefresh(): void {
+    if (this.busy) {
+      return;
+    }
+    void this.refreshLifecycleDecorations(false);
+  }
+
+  private async refreshLifecycleDecorations(showMessage: boolean): Promise<void> {
+    if (this.lifecycleDecorationRefresh) {
+      await this.lifecycleDecorationRefresh;
+      return;
+    }
+    if (this.busy) {
+      if (showMessage) {
+        vscode.window.showWarningMessage('Ecode: 已有同步操作正在执行，请稍后刷新状态标记');
+      }
+      return;
+    }
+    const profile = await this.store.getProfile();
+    if (!profile) {
+      if (showMessage) {
+        vscode.window.showErrorMessage('Ecode: 请先配置环境');
+      }
+      return;
+    }
+    const refresh = (async (): Promise<void> => {
+      this.tree.setLifecycleLoading(true);
+      try {
+        await this.readLifecycleSnapshot();
+        await this.updateViews();
+        if (showMessage) {
+          vscode.window.showInformationMessage(
+            'Ecode: 目录类型与生命周期状态标记已刷新',
+          );
+        }
+      } catch (error: unknown) {
+        const message = errorMessage(error);
+        if (showMessage) {
+          vscode.window.showErrorMessage(`Ecode: 刷新状态标记失败: ${message}`);
+        } else {
+          output.warn(`Unable to refresh lifecycle decorations: ${message}`);
+        }
+      } finally {
+        this.tree.setLifecycleLoading(false);
+      }
+    })();
+    this.lifecycleDecorationRefresh = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.lifecycleDecorationRefresh === refresh) {
+        this.lifecycleDecorationRefresh = undefined;
+      }
+    }
+  }
+
+  private async readLifecycleSnapshot(): Promise<LifecycleSnapshot> {
+    const requestedProfile = await this.store.getProfile();
+    const snapshot = await this.lifecycle.getSnapshot();
+    const profile = await this.store.getProfile();
+    if (requestedProfile && profile) {
+      const requestedSourceRoot = resolveEnvironmentSourceRoot(
+        requestedProfile.workspaceFolder,
+        requestedProfile.environmentDirectory,
+      );
+      const sourceRoot = resolveEnvironmentSourceRoot(
+        profile.workspaceFolder,
+        profile.environmentDirectory,
+      );
+      const requestedIdentity = lifecycleConnectionIdentity(
+        requestedProfile.environmentId,
+        requestedSourceRoot,
+        requestedProfile.serverUrl,
+        requestedProfile.username,
+      );
+      const identity = lifecycleConnectionIdentity(
+        profile.environmentId,
+        sourceRoot,
+        profile.serverUrl,
+        profile.username,
+      );
+      if (requestedIdentity === identity) {
+        this.lifecycleSnapshot = snapshot;
+        this.lifecycleSnapshotSourceRoot = sourceRoot;
+        this.lifecycleSnapshotIdentity = identity;
+        this.lifecycleSnapshotFresh = true;
+      }
+    }
+    return snapshot;
+  }
+
+  private async requireLifecycleSnapshot(): Promise<LifecycleSnapshot> {
+    const profile = await this.store.getProfile();
+    if (!profile) {
+      throw new Error('请先配置 Ecode 环境');
+    }
+    const sourceRoot = resolveEnvironmentSourceRoot(
+      profile.workspaceFolder,
+      profile.environmentDirectory,
+    );
+    const identity = lifecycleConnectionIdentity(
+      profile.environmentId,
+      sourceRoot,
+      profile.serverUrl,
+      profile.username,
+    );
+    if (
+      this.lifecycleSnapshot
+      && this.lifecycleSnapshotFresh
+      && sameLocalPath(this.lifecycleSnapshotSourceRoot, sourceRoot)
+      && this.lifecycleSnapshotIdentity === identity
+    ) {
+      return this.lifecycleSnapshot;
+    }
+    return this.readLifecycleSnapshot();
+  }
+
+  private recordLifecyclePreload(
+    remotePath: string,
+    enabled: boolean,
+  ): void {
+    const file = this.lifecycleSnapshot?.files.find(item =>
+      sameRemotePath(item.path, remotePath));
+    if (file) {
+      file.preloadState = enabled ? 'preloaded' : 'normal';
+      this.tree.refresh();
+    }
+  }
+
+  private recordLifecycleRelease(
+    remotePath: string,
+    enabled: boolean,
+  ): void {
+    const folder = this.lifecycleSnapshot?.folders.find(item =>
+      sameRemotePath(item.path, remotePath));
+    if (folder) {
+      folder.released = enabled;
+      this.tree.refresh();
+    }
+  }
+
+  private recordLifecyclePreStateOrder(
+    remotePath: string,
+    preStateOrder: string,
+  ): void {
+    const folder = this.lifecycleSnapshot?.folders.find(item =>
+      sameRemotePath(item.path, remotePath));
+    if (folder) {
+      folder.preStateOrder = preStateOrder;
+      this.tree.refresh();
+    }
+  }
+
+  private async setResourcePreload(
+    argument: unknown,
+    enabled: boolean,
+  ): Promise<void> {
+    if (this.lifecycleDecorationRefresh) {
+      await this.lifecycleDecorationRefresh;
+    }
+    await this.runExclusive('正在更新前置加载状态...', async () => {
+      const remotePath = requireLifecycleTreePath(argument, 'file');
+      const file = requireLifecyclePath(
+        (await this.requireLifecycleSnapshot()).files,
+        remotePath,
+        '前置加载文件',
+      );
+      await this.confirmAndSetFilePreload(file, enabled);
+    });
+  }
+
+  private async setResourceFolderRelease(
+    argument: unknown,
+    enabled: boolean,
+  ): Promise<void> {
+    if (this.lifecycleDecorationRefresh) {
+      await this.lifecycleDecorationRefresh;
+    }
+    await this.runExclusive('正在更新文件夹发布状态...', async () => {
+      const remotePath = requireLifecycleTreePath(argument, 'folder');
+      const folder = requireLifecyclePath(
+        (await this.requireLifecycleSnapshot()).folders,
+        remotePath,
+        '发布文件夹',
+      );
+      await this.confirmAndSetFolderRelease(folder, enabled);
+    });
+  }
+
+  private async setResourcePreloadOrder(
+    argument: unknown,
+  ): Promise<void> {
+    if (this.lifecycleDecorationRefresh) {
+      await this.lifecycleDecorationRefresh;
+    }
+    await this.runExclusive('正在更新前置加载顺序...', async () => {
+      const remotePath = requireLifecycleTreePath(argument, 'folder');
+      const folder = requireLifecyclePath(
+        (await this.requireLifecycleSnapshot()).folders,
+        remotePath,
+        '前置加载顺序文件夹',
+      );
+      if (!folder.rootFolder) {
+        throw new Error(`仅分类下的根文件夹支持设置前置加载顺序: ${folder.path}`);
+      }
+      const input = await vscode.window.showInputBox({
+        title: 'Ecode: 修改前置加载顺序',
+        prompt: folder.path,
+        value: folder.preStateOrder ?? '10000',
+        placeHolder: '整数或最多两位小数',
+        validateInput: value => {
+          try {
+            normalizePreStateOrder(value);
+            return undefined;
+          } catch (error: unknown) {
+            return errorMessage(error);
+          }
+        },
+      });
+      if (input === undefined) {
+        return;
+      }
+      const preStateOrder = normalizePreStateOrder(input);
+      if (
+        folder.preStateOrder !== undefined
+        && Number(folder.preStateOrder) === Number(preStateOrder)
+      ) {
+        vscode.window.showInformationMessage(
+          `Ecode: 前置加载顺序未变化 · ${folder.path}`,
+        );
+        return;
+      }
+      const confirmed = await vscode.window.showWarningMessage(
+        '确认修改前置加载顺序？',
+        {
+          modal: true,
+          detail: `${folder.path}\n${folder.preStateOrder ?? '未设置'} → ${preStateOrder}`,
+        },
+        '修改顺序',
+      );
+      if (confirmed !== '修改顺序') {
+        return;
+      }
+      const result = await this.lifecycle.setPreStateOrder(folder.id, preStateOrder);
+      assertLifecycleVerification(result.verified, '设置前置加载顺序');
+      this.recordLifecyclePreStateOrder(folder.path, preStateOrder);
+      vscode.window.showInformationMessage(
+        `Ecode: 已修改前置加载顺序 · ${folder.path} · ${preStateOrder}`,
+      );
+    });
+  }
+
+  private async confirmAndSetFilePreload(
+    file: LifecycleFile,
+    enabled: boolean,
+  ): Promise<void> {
+    if (!file.canPreload) {
+      throw new Error('仅 JS/CSS 文件支持前置加载');
+    }
+    const requiredState = enabled ? 'normal' : 'preloaded';
+    if (file.preloadState !== requiredState) {
+      throw new Error(`文件当前前置状态为 ${file.preloadState}，请刷新后重试`);
+    }
+    const verb = enabled ? '设置前置加载' : '取消前置加载';
+    const confirmed = await vscode.window.showWarningMessage(
+      `确认对文件执行“${verb}”？`,
+      { modal: true, detail: file.path },
+      verb,
+    );
+    if (confirmed !== verb) {
+      return;
+    }
+    const result = await this.lifecycle.setFilePreloadedByPath(file.path, enabled);
+    assertLifecycleVerification(result.verified, verb);
+    this.recordLifecyclePreload(file.path, enabled);
+    vscode.window.showInformationMessage(`Ecode: 已${verb} · ${file.path}`);
+  }
+
+  private async confirmAndSetFolderRelease(
+    folder: LifecycleFolder,
+    enabled: boolean,
+  ): Promise<void> {
+    if (!folder.rootFolder) {
+      throw new Error(`仅支持发布分类下的根文件夹: ${folder.path}`);
+    }
+    const verb = enabled ? '发布文件夹' : '取消发布';
+    const confirmed = await vscode.window.showWarningMessage(
+      `确认${verb}？`,
+      {
+        modal: true,
+        detail: `${folder.path}\n该操作只改变 Ecode 发布状态，不会推送本地文件。`,
+      },
+      verb,
+    );
+    if (confirmed !== verb) {
+      return;
+    }
+    const result = enabled
+      ? await this.lifecycle.publishFolder(folder.id, folder.appId)
+      : await this.lifecycle.unpublishFolder(folder.id, folder.appId);
+    assertLifecycleVerification(result.verified, verb);
+    this.recordLifecycleRelease(folder.path, enabled);
+    vscode.window.showInformationMessage(`Ecode: 已${verb} · ${folder.path}`);
+  }
+
   private async requireProfile(): Promise<ConnectionProfile | undefined> {
     const profile = await this.store.getProfile();
     if (!profile) {
@@ -1840,6 +2180,21 @@ class ExtensionController {
 
   private promotionStore(workspaceFolder: string): PromotionStore {
     return new PromotionStore(workspaceFolder);
+  }
+
+  private async runVerifiedLifecycleMutation<T extends { verified?: boolean }>(
+    busyLabel: string,
+    operationLabel: string,
+    operation: () => Promise<T>,
+    record?: (result: T) => void,
+  ): Promise<AiInvocationResult> {
+    const data = await this.runExclusive(busyLabel, async () => {
+      const result = await operation();
+      assertLifecycleVerification(result.verified, operationLabel);
+      record?.(result);
+      return result;
+    });
+    return { status: 'succeeded', data };
   }
 
   private async runExclusive<T>(
@@ -1943,6 +2298,39 @@ class ExtensionController {
     const profile = await this.store.getProfile();
     const activeEnvironment = await this.store.getActiveEnvironment();
     const environments = await this.store.getEnvironments();
+    const lifecycleSourceRoot = profile
+      ? resolveEnvironmentSourceRoot(
+          profile.workspaceFolder,
+          profile.environmentDirectory,
+        )
+      : undefined;
+    const lifecycleIdentity = profile && lifecycleSourceRoot
+      ? lifecycleConnectionIdentity(
+          profile.environmentId,
+          lifecycleSourceRoot,
+          profile.serverUrl,
+          profile.username,
+        )
+      : undefined;
+    if (
+      !sameLocalPath(this.lifecycleSnapshotSourceRoot, lifecycleSourceRoot)
+      || this.lifecycleSnapshotIdentity !== lifecycleIdentity
+    ) {
+      this.lifecycleSnapshot = undefined;
+      this.lifecycleSnapshotSourceRoot = lifecycleSourceRoot;
+      this.lifecycleSnapshotIdentity = lifecycleIdentity;
+      this.lifecycleSnapshotFresh = false;
+      if (profile && lifecycleSourceRoot) {
+        const cached = await this.lifecycle.getCachedSnapshot();
+        if (
+          sameLocalPath(this.lifecycleSnapshotSourceRoot, lifecycleSourceRoot)
+          && this.lifecycleSnapshotIdentity === lifecycleIdentity
+        ) {
+          this.lifecycleSnapshot = cached?.snapshot;
+        }
+      }
+    }
+    this.workspaceChangeDecorations.update(lifecycleSourceRoot, this.changes);
     await vscode.commands.executeCommand(
       'setContext',
       'ecode.aiSupportEnabled',
@@ -1999,6 +2387,19 @@ class ExtensionController {
     }
     const environmentStates: EnvironmentTreeState[] = environments.map(environment => {
       const active = environment.id === activeEnvironment?.id;
+      const environmentSourceRoot = resolveEnvironmentSourceRoot(
+        environment.workspaceFolder,
+        environment.directory,
+      );
+      const environmentLifecycleIdentity = lifecycleConnectionIdentity(
+        environment.id,
+        environmentSourceRoot,
+        environment.serverUrl,
+        environment.username,
+      );
+      const hasCurrentLifecycle = active
+        && sameLocalPath(this.lifecycleSnapshotSourceRoot, environmentSourceRoot)
+        && this.lifecycleSnapshotIdentity === environmentLifecycleIdentity;
       return {
         environment,
         active,
@@ -2007,6 +2408,12 @@ class ExtensionController {
         pushRecords: pushRecords.filter(record =>
           record.environmentId === environment.id),
         busyMessage: active ? busyMessage : undefined,
+        lifecycle: hasCurrentLifecycle && this.lifecycleSnapshot
+          ? this.lifecycleSnapshot
+          : undefined,
+        lifecycleFresh: hasCurrentLifecycle
+          && this.lifecycleSnapshotFresh
+          && Boolean(this.lifecycleSnapshot),
       };
     });
     this.tree.update(
@@ -2179,6 +2586,70 @@ function formatPromotionFailures(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function requireLifecycleTreePath(
+  argument: unknown,
+  expected: 'file' | 'folder',
+): string {
+  if (
+    !argument
+    || typeof argument !== 'object'
+    || !('type' in argument)
+    || argument.type !== 'lifecycleSource'
+    || !('kind' in argument)
+    || argument.kind !== expected
+    || !('remotePath' in argument)
+    || typeof argument.remotePath !== 'string'
+  ) {
+    throw new Error(
+      expected === 'folder'
+        ? '请在 Ecode 侧边栏源码目录中选择根文件夹'
+        : '请在 Ecode 侧边栏源码目录中选择文件',
+    );
+  }
+  return normalizeRemotePath(argument.remotePath);
+}
+
+function requireLifecyclePath<T extends { path: string }>(
+  items: readonly T[],
+  remotePath: string,
+  targetLabel: string,
+): T {
+  const key = normalizeRemotePath(remotePath).toLocaleLowerCase('en-US');
+  const matches = items.filter(item =>
+    item.path.toLocaleLowerCase('en-US') === key);
+  if (matches.length === 0) {
+    throw new Error(`找不到${targetLabel}: ${remotePath}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`${targetLabel}路径不唯一，无法安全操作: ${remotePath}`);
+  }
+  return matches[0];
+}
+
+function sameLocalPath(
+  left: string | undefined,
+  right: string | undefined,
+): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+  return path.resolve(left).toLocaleLowerCase('en-US')
+    === path.resolve(right).toLocaleLowerCase('en-US');
+}
+
+function sameRemotePath(left: string, right: string): boolean {
+  return left.toLocaleLowerCase('en-US') === right.toLocaleLowerCase('en-US');
+}
+
+function assertLifecycleVerification(
+  verified: boolean | undefined,
+  operation: string,
+): void {
+  if (verified === false) {
+    throw new Error(`${operation}接口返回成功，但远端状态复核未通过`);
+  }
 }
 
 function confirmedOperationResult(

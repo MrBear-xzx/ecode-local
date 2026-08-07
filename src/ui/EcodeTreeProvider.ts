@@ -1,4 +1,6 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
+import { resolveSafeLocalPath } from '../domain/paths';
 import type {
   ChangeSet,
   ChangeSetFile,
@@ -7,6 +9,11 @@ import type {
   PushRecord,
   SyncChange,
 } from '../domain/types';
+import type {
+  LifecycleSnapshot,
+  PreloadState,
+} from '../sync/EcodeLifecycleService';
+import { LIFECYCLE_TREE_SCHEME } from './LifecycleTreeDecorationProvider';
 
 interface TreeIcon {
   id: string;
@@ -20,10 +27,37 @@ export interface EnvironmentTreeState {
   changes?: SyncChange[];
   pushRecords?: PushRecord[];
   busyMessage?: string;
+  lifecycle?: LifecycleSnapshot;
+  lifecycleFresh?: boolean;
+}
+
+interface LifecycleSourceTreeNode {
+  type: 'lifecycleSource';
+  kind: 'category' | 'folder' | 'file';
+  remotePath: string;
+  resourceUri: vscode.Uri;
+  localResourceUri: vscode.Uri;
+  children: LifecycleSourceTreeNode[];
+  rootFolder?: boolean;
+  released?: boolean;
+  preStateOrder?: string;
+  containsReleasedFolder?: boolean;
+  preloadState?: PreloadState;
+  canPreload?: boolean;
+}
+
+interface SourceDirectoryTreeNode {
+  type: 'sourceDirectory';
+  directory: string;
+  resourceUri: vscode.Uri;
+  active: boolean;
+  lifecycleLoaded: boolean;
+  children: EcodeTreeNode[];
 }
 
 type EcodeTreeNode =
   | { type: 'environment'; state: EnvironmentTreeState }
+  | SourceDirectoryTreeNode
   | {
       type: 'message';
       label: string;
@@ -43,6 +77,7 @@ type EcodeTreeNode =
   | { type: 'pushRecordFile'; record: PushRecord; file: ChangeSetFile }
   | { type: 'changeSet'; changeSet: ChangeSet }
   | { type: 'changeSetFile'; changeSet: ChangeSet; file: ChangeSetFile }
+  | LifecycleSourceTreeNode
   | { type: 'change'; change: SyncChange };
 
 export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode> {
@@ -52,6 +87,24 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
   private environments: EnvironmentTreeState[] = [];
   private changeSets: ChangeSet[] = [];
   private deployments: DeploymentRecord[] = [];
+  private lifecycleRefreshHandler: (() => void) | undefined;
+  private lifecycleLoading = false;
+
+  setLifecycleRefreshHandler(handler: () => void): void {
+    this.lifecycleRefreshHandler = handler;
+  }
+
+  setLifecycleLoading(loading: boolean): void {
+    if (this.lifecycleLoading === loading) {
+      return;
+    }
+    this.lifecycleLoading = loading;
+    this.changed.fire(undefined);
+  }
+
+  refresh(): void {
+    this.changed.fire(undefined);
+  }
 
   update(
     environments: EnvironmentTreeState[],
@@ -100,6 +153,24 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
       );
       item.contextValue = 'ecode.group';
       item.iconPath = themeIcon(element.icon.id, element.icon.color);
+      return item;
+    }
+
+    if (element.type === 'sourceDirectory') {
+      const item = new vscode.TreeItem(
+        '源码目录',
+        vscode.TreeItemCollapsibleState.Collapsed,
+      );
+      item.description = `${element.directory}/`;
+      item.tooltip = element.resourceUri.fsPath;
+      item.resourceUri = element.resourceUri;
+      item.contextValue = 'ecode.sourceDirectory';
+      if (element.active && this.lifecycleLoading) {
+        item.iconPath = themeIcon('sync~spin', 'charts.blue');
+        item.tooltip = `${element.resourceUri.fsPath}\n正在刷新 Ecode 源码结构与生命周期状态`;
+      } else {
+        item.iconPath = themeIcon('root-folder');
+      }
       return item;
     }
 
@@ -176,6 +247,61 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
       return item;
     }
 
+    if (element.type === 'lifecycleSource') {
+      const collapsible = element.kind === 'file'
+        ? vscode.TreeItemCollapsibleState.None
+        : element.children.length > 0
+          ? vscode.TreeItemCollapsibleState.Collapsed
+          : vscode.TreeItemCollapsibleState.None;
+      const item = new vscode.TreeItem(
+        path.posix.basename(element.remotePath),
+        collapsible,
+      );
+      item.resourceUri = element.resourceUri;
+      item.tooltip = lifecycleSourceTooltip(element);
+      if (element.kind === 'category') {
+        item.contextValue = 'ecode.lifecycle.category';
+        item.iconPath = themeIcon(
+          'folder-library',
+          element.containsReleasedFolder ? 'charts.blue' : 'disabledForeground',
+        );
+      } else if (element.kind === 'folder') {
+        item.description = element.rootFolder
+          ? [element.released ? '已发布' : '未发布', element.preStateOrder]
+              .filter(value => value !== undefined)
+              .join(' · ')
+          : undefined;
+        item.contextValue = element.rootFolder
+          ? element.released
+            ? 'ecode.lifecycle.folder.released'
+            : 'ecode.lifecycle.folder.unreleased'
+          : 'ecode.lifecycle.folder';
+        if (element.rootFolder) {
+          item.iconPath = themeIcon(
+            'package',
+            element.released ? 'charts.green' : 'disabledForeground',
+          );
+        } else {
+          item.iconPath = themeIcon('folder-opened');
+        }
+      } else {
+        item.description = element.preloadState === 'preloaded'
+          ? '前置加载'
+          : undefined;
+        item.contextValue = element.canPreload && element.preloadState === 'preloaded'
+          ? 'ecode.lifecycle.file.preloaded'
+          : element.canPreload && element.preloadState === 'normal'
+            ? 'ecode.lifecycle.file.preloadable'
+            : 'ecode.lifecycle.file';
+        item.command = {
+          command: 'vscode.open',
+          title: '打开文件',
+          arguments: [element.localResourceUri],
+        };
+      }
+      return item;
+    }
+
     const { change } = element;
     const item = new vscode.TreeItem(change.path);
     item.description = statusLabel(change.status);
@@ -204,6 +330,12 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
     if (element?.type === 'group') {
       return element.children;
     }
+    if (element?.type === 'sourceDirectory') {
+      if (element.active && !element.lifecycleLoaded) {
+        this.lifecycleRefreshHandler?.();
+      }
+      return element.children;
+    }
     if (element?.type === 'pushRecord') {
       return element.record.files.map(file => ({
         type: 'pushRecordFile',
@@ -219,6 +351,9 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
           changeSet: element.changeSet,
           file,
         }));
+    }
+    if (element?.type === 'lifecycleSource') {
+      return element.children;
     }
     if (element) {
       return [];
@@ -319,15 +454,40 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
           type: 'message',
           label: '暂无推送记录',
           icon: { id: 'history', color: 'disabledForeground' },
+      }];
+
+    const sourceChildren: EcodeTreeNode[] = active
+      ? state.lifecycle
+        ? buildLifecycleSourceTree(
+            state.lifecycle,
+            path.resolve(environment.workspaceFolder, environment.directory),
+          )
+        : [{
+            type: 'message',
+            label: '读取 Ecode 源码结构',
+            command: {
+              command: 'ecode.refreshLifecycleDecorations',
+              title: '读取 Ecode 源码结构',
+            },
+            icon: { id: 'refresh', color: 'charts.blue' },
+          }]
+      : [{
+          type: 'message',
+          label: '切换到此环境后查看源码结构',
+          icon: { id: 'arrow-both' },
         }];
 
     return [
       {
-        type: 'message',
-        label: '源码目录',
-        description: `${environment.directory}/`,
-        tooltip: environment.workspaceFolder,
-        icon: { id: 'folder', color: 'charts.blue' },
+        type: 'sourceDirectory',
+        directory: environment.directory,
+        resourceUri: vscode.Uri.file(path.resolve(
+          environment.workspaceFolder,
+          environment.directory,
+        )),
+        active,
+        lifecycleLoaded: Boolean(state.lifecycle && state.lifecycleFresh),
+        children: sourceChildren,
       },
       {
         type: 'group',
@@ -376,6 +536,148 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
   private activeEnvironmentId(): string | undefined {
     return this.environments.find(state => state.active)?.environment.id;
   }
+}
+
+function buildLifecycleSourceTree(
+  snapshot: LifecycleSnapshot,
+  sourceRoot: string,
+): LifecycleSourceTreeNode[] {
+  const nodes = new Map<string, LifecycleSourceTreeNode>();
+  for (const category of snapshot.categories) {
+    nodes.set(sourcePathKey(category.path), lifecycleSourceNode(
+      'category',
+      category.path,
+      sourceRoot,
+    ));
+  }
+  for (const folder of snapshot.folders) {
+    nodes.set(sourcePathKey(folder.path), {
+      ...lifecycleSourceNode('folder', folder.path, sourceRoot),
+      rootFolder: folder.rootFolder,
+      released: folder.released,
+      preStateOrder: folder.preStateOrder,
+    });
+  }
+  for (const file of snapshot.files) {
+    nodes.set(sourcePathKey(file.path), {
+      ...lifecycleSourceNode('file', file.path, sourceRoot),
+      preloadState: file.preloadState,
+      canPreload: file.canPreload,
+    });
+  }
+
+  const roots: LifecycleSourceTreeNode[] = [];
+  for (const node of nodes.values()) {
+    const parentPath = path.posix.dirname(node.remotePath);
+    const parent = parentPath === '.'
+      ? undefined
+      : nodes.get(sourcePathKey(parentPath));
+    if (parent && parent.kind !== 'file') {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  sortLifecycleSourceNodes(roots);
+  for (const root of roots) {
+    markReleasedDescendants(root);
+  }
+  return roots;
+}
+
+function lifecycleSourceNode(
+  kind: LifecycleSourceTreeNode['kind'],
+  remotePath: string,
+  sourceRoot: string,
+): LifecycleSourceTreeNode {
+  const localResourceUri = vscode.Uri.file(resolveSafeLocalPath(sourceRoot, remotePath));
+  return {
+    type: 'lifecycleSource',
+    kind,
+    remotePath,
+    resourceUri: lifecycleTreeUri(localResourceUri, 'native'),
+    localResourceUri,
+    children: [],
+  };
+}
+
+function lifecycleTreeUri(
+  localResourceUri: vscode.Uri,
+  kind: 'category' | 'publishable' | 'preload' | 'native',
+  state?: 'active' | 'inactive' | 'released' | 'unreleased' | 'preloaded',
+): vscode.Uri {
+  const query = new URLSearchParams({ kind });
+  if (state) {
+    query.set('state', state);
+  }
+  return localResourceUri.with({
+    scheme: LIFECYCLE_TREE_SCHEME,
+    query: query.toString(),
+  });
+}
+
+function sortLifecycleSourceNodes(nodes: LifecycleSourceTreeNode[]): void {
+  nodes.sort((left, right) => {
+    const kindOrder = lifecycleKindOrder(left.kind) - lifecycleKindOrder(right.kind);
+    return kindOrder || left.remotePath.localeCompare(right.remotePath);
+  });
+  for (const node of nodes) {
+    sortLifecycleSourceNodes(node.children);
+  }
+}
+
+function lifecycleKindOrder(kind: LifecycleSourceTreeNode['kind']): number {
+  return kind === 'category' ? 0 : kind === 'folder' ? 1 : 2;
+}
+
+function sourcePathKey(value: string): string {
+  return value.toLocaleLowerCase('en-US');
+}
+
+function markReleasedDescendants(node: LifecycleSourceTreeNode): boolean {
+  let childReleased = false;
+  for (const child of node.children) {
+    childReleased = markReleasedDescendants(child) || childReleased;
+  }
+  const released = node.kind === 'folder' && node.released === true;
+  node.containsReleasedFolder = childReleased;
+  node.resourceUri = node.kind === 'category'
+    ? lifecycleTreeUri(
+        node.localResourceUri,
+        'category',
+        childReleased ? 'active' : 'inactive',
+      )
+    : node.kind === 'folder' && node.rootFolder
+      ? lifecycleTreeUri(
+          node.localResourceUri,
+          'publishable',
+          node.released ? 'released' : 'unreleased',
+        )
+      : node.kind === 'file' && node.preloadState === 'preloaded'
+        ? lifecycleTreeUri(node.localResourceUri, 'preload', 'preloaded')
+        : lifecycleTreeUri(node.localResourceUri, 'native');
+  return released || childReleased;
+}
+
+function lifecycleSourceTooltip(node: LifecycleSourceTreeNode): string {
+  if (node.kind === 'category') {
+    return `${node.remotePath}\nEcode 项目分类\n${
+      node.containsReleasedFolder ? '包含已发布文件夹' : '不包含已发布文件夹'
+    }`;
+  }
+  if (node.kind === 'folder') {
+    if (!node.rootFolder) {
+      return `${node.remotePath}\nEcode 内部文件夹`;
+    }
+    return `${node.remotePath}\n${
+      node.released ? 'Ecode 已发布文件夹' : 'Ecode 可发布文件夹（未发布）'
+    }${node.preStateOrder !== undefined
+      ? `\n前置加载顺序: ${node.preStateOrder}`
+      : ''}`;
+  }
+  return `${node.remotePath}\n${
+    node.preloadState === 'preloaded' ? 'Ecode 前置加载文件' : 'Ecode 源码文件'
+  }`;
 }
 
 function statusLabel(status: SyncChange['status']): string {

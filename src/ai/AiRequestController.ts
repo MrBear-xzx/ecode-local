@@ -4,8 +4,11 @@ import * as vscode from 'vscode';
 import { ECODE_LOCAL_DIRECTORY } from '../domain/constants';
 import { writeJsonAtomic } from '../storage/AtomicFileStore';
 import {
+  AI_EXECUTE_ACTIONS,
+  AI_INSPECT_ACTIONS,
   CLI_REQUEST_DIRECTORY,
   CLI_RESULT_DIRECTORY,
+  type AiAction,
   type AiInvocation,
   type AiInvocationResult,
   type AiRequest,
@@ -17,6 +20,25 @@ const MAX_REQUEST_BYTES = 128 * 1024;
 const REQUEST_SCAN_INTERVAL_MS = 500;
 const REQUEST_HISTORY_LIMIT = 500;
 const REQUEST_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SUPPORTED_ACTIONS = new Set<string>([
+  ...AI_INSPECT_ACTIONS,
+  ...AI_EXECUTE_ACTIONS,
+]);
+
+interface RejectedRequestMetadata {
+  action?: AiAction;
+  environmentDirectory?: string;
+}
+
+class InvalidAiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly metadata: RejectedRequestMetadata,
+  ) {
+    super(message);
+    this.name = 'InvalidAiRequestError';
+  }
+}
 
 export interface AiInvocationContext {
   requestId?: string;
@@ -225,12 +247,15 @@ export class AiRequestController implements vscode.Disposable {
         return;
       }
       const message = errorMessage(error);
+      const metadata = error instanceof InvalidAiRequestError
+        ? error.metadata
+        : undefined;
       this.output.warn(`AI request ${fallbackId} rejected: ${message}`);
       await this.writeResult(resultFile, {
         schemaVersion: 2,
         id: request?.id ?? fallbackId,
-        action: request?.action ?? 'getState',
-        environmentDirectory: request?.environmentDirectory,
+        action: request?.action ?? metadata?.action ?? 'getState',
+        environmentDirectory: request?.environmentDirectory ?? metadata?.environmentDirectory,
         processedAt: new Date().toISOString(),
         status: 'rejected',
         message,
@@ -261,12 +286,12 @@ export class AiRequestController implements vscode.Disposable {
         return undefined;
       }
       if (current === previous) {
-        return parseAiRequest(current, fileName);
+        return parseStableAiRequest(current, fileName);
       }
       previous = current;
       await delay(100);
     }
-    return parseAiRequest(previous ?? '', fileName);
+    return parseStableAiRequest(previous ?? '', fileName);
   }
 
   private async cleanupRequestHistory(
@@ -350,6 +375,37 @@ export class AiRequestController implements vscode.Disposable {
   private isCurrent(generation: number): boolean {
     return generation === this.configurationGeneration;
   }
+}
+
+function parseStableAiRequest(raw: string, fileName: string): AiRequest {
+  try {
+    return parseAiRequest(raw, fileName);
+  } catch (error: unknown) {
+    throw new InvalidAiRequestError(
+      errorMessage(error),
+      rejectedRequestMetadata(raw),
+    );
+  }
+}
+
+function rejectedRequestMetadata(raw: string): RejectedRequestMetadata {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const record = value as Record<string, unknown>;
+  const action = typeof record.action === 'string' && SUPPORTED_ACTIONS.has(record.action)
+    ? record.action as AiAction
+    : undefined;
+  const environmentDirectory = typeof record.environmentDirectory === 'string'
+    ? record.environmentDirectory
+    : undefined;
+  return { action, environmentDirectory };
 }
 
 function delay(milliseconds: number): Promise<void> {

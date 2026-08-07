@@ -19,6 +19,9 @@ interface FileRequest {
   confirmed?: boolean;
   environmentId?: string;
   paths?: string[];
+  path?: string;
+  enabled?: boolean;
+  preStateOrder?: string;
 }
 
 suite('Ecode Agent CLI', () => {
@@ -40,16 +43,23 @@ suite('Ecode Agent CLI', () => {
     assert.strictEqual(result.code, 0);
     assert.match(result.stdout, /Ecode Local 通用 Agent CLI/);
     for (const action of [
-      'getState', 'refreshChanges', 'listPushRecords', 'listChangeSets',
+      'getState', 'getLifecycleState', 'refreshChanges', 'listPushRecords', 'listChangeSets',
       'getKnowledge', 'configure', 'addEnvironment', 'switchEnvironment',
       'deleteEnvironment',
-      'pull', 'push', 'rollbackPushFile', 'renamePushRecord',
-      'deletePushRecord', 'openDiff', 'openPromotionDiff', 'revertChange',
+      'pull', 'push', 'setPreload', 'setPreloadOrder', 'setFolderRelease',
+      'rollbackPushFile', 'renamePushRecord',
+      'deletePushRecord', 'revertChange',
       'resolveConflict', 'createChangeSet', 'applyChangeSet',
-      'deleteChangeSet', 'searchDocumentation', 'openOnlineDocumentation',
-      'refreshAiSupport', 'enableAiSupport', 'openAiGuide', 'removeAiSupport',
+      'deleteChangeSet',
     ]) {
       assert.match(result.stdout, new RegExp(action));
+    }
+    for (const removedAction of [
+      'openDiff', 'openPromotionDiff', 'searchDocumentation',
+      'openOnlineDocumentation', 'refreshAiSupport', 'enableAiSupport',
+      'openAiGuide', 'removeAiSupport',
+    ]) {
+      assert.doesNotMatch(result.stdout, new RegExp(removedAction));
     }
   });
 
@@ -101,7 +111,8 @@ suite('Ecode Agent CLI', () => {
       assert.strictEqual(pushRequest.confirmed, true);
       assert.deepStrictEqual(pushRequest.paths, ['Type/a.js', 'Page/b.jsx']);
       assert.strictEqual(
-        fs.readdirSync(path.join(root, '.ecode-local', 'agent-cli', 'requests')).length,
+        fs.readdirSync(path.join(root, '.ecode-local', 'agent-cli', 'requests'))
+          .filter(name => name.endsWith('.json')).length,
         1,
       );
       writeResult(root, pushRequest, 'cancelled', undefined, '用户取消推送');
@@ -130,6 +141,82 @@ suite('Ecode Agent CLI', () => {
         fs.existsSync(path.join(root, '.ecode-local', 'agent-cli', 'requests')),
         false,
       );
+    } finally {
+      process_.child.kill();
+      await removeTestDirectory(root);
+    }
+  });
+
+  test('creates a confirmed lifecycle request with a strict boolean value', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-cli-lifecycle-'));
+    initializeConfiguredWorkspace(root);
+    const process_ = startCli(cli, [
+      'setFolderRelease',
+      '--workspace', root,
+      '--path', 'Project/app',
+      '--enabled', 'false',
+      '--confirmed',
+      '--timeout', '5',
+    ], root);
+    try {
+      const request = await waitForRequest(root, item => item.action === 'setFolderRelease');
+      assert.strictEqual(request.environmentDirectory, 'dev_env');
+      assert.strictEqual(request.path, 'Project/app');
+      assert.strictEqual(request.enabled, false);
+      assert.strictEqual(request.confirmed, true);
+      writeResult(root, request, 'succeeded', { verified: true });
+      const result = await process_.completion;
+      assert.strictEqual(result.code, 0);
+      assert.strictEqual(JSON.parse(result.stdout).status, 'succeeded');
+    } finally {
+      process_.child.kill();
+      await removeTestDirectory(root);
+    }
+  });
+
+  test('rejects invalid lifecycle booleans before creating a request', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-cli-lifecycle-invalid-'));
+    initializeConfiguredWorkspace(root);
+    const process_ = startCli(cli, [
+      'setPreload',
+      '--workspace', root,
+      '--path', 'Project/app/entry.js',
+      '--enabled', 'yes',
+      '--confirmed',
+    ], root);
+    try {
+      const result = await process_.completion;
+      assert.strictEqual(result.code, 64);
+      assert.match(result.stderr, /--enabled 必须是 true 或 false/);
+      assert.strictEqual(
+        fs.existsSync(path.join(root, '.ecode-local', 'agent-cli', 'requests')),
+        false,
+      );
+    } finally {
+      process_.child.kill();
+      await removeTestDirectory(root);
+    }
+  });
+
+  test('creates a confirmed preload-order request with a normalized number', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-cli-preload-order-'));
+    initializeConfiguredWorkspace(root);
+    const process_ = startCli(cli, [
+      'setPreloadOrder',
+      '--workspace', root,
+      '--path', 'Project/app',
+      '--order', '5.50',
+      '--confirmed',
+      '--timeout', '5',
+    ], root);
+    try {
+      const request = await waitForRequest(root, item => item.action === 'setPreloadOrder');
+      assert.strictEqual(request.path, 'Project/app');
+      assert.strictEqual(request.preStateOrder, '5.5');
+      assert.strictEqual(request.confirmed, true);
+      writeResult(root, request, 'succeeded', { verified: true });
+      const result = await process_.completion;
+      assert.strictEqual(result.code, 0);
     } finally {
       process_.child.kill();
       await removeTestDirectory(root);
@@ -318,7 +405,7 @@ async function removeTestDirectory(root: string): Promise<void> {
       return;
     } catch (error: unknown) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (!['EPERM', 'ENOTEMPTY'].includes(code ?? '') || attempt === 9) {
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code ?? '') || attempt === 9) {
         throw error;
       }
       await new Promise(resolve => setTimeout(resolve, 50));

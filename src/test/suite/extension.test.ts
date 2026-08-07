@@ -47,6 +47,14 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.pull'));
     assert.ok(commands.includes('ecode.refreshChanges'));
     assert.ok(commands.includes('ecode.pushSelected'));
+    assert.ok(!commands.includes('ecode.managePreload'));
+    assert.ok(!commands.includes('ecode.manageRelease'));
+    assert.ok(commands.includes('ecode.setResourcePreloadOrder'));
+    assert.ok(commands.includes('ecode.publishResourceFolder'));
+    assert.ok(commands.includes('ecode.unpublishResourceFolder'));
+    assert.ok(commands.includes('ecode.enableResourcePreload'));
+    assert.ok(commands.includes('ecode.disableResourcePreload'));
+    assert.ok(commands.includes('ecode.refreshLifecycleDecorations'));
     assert.ok(commands.includes('ecode.renamePushRecord'));
     assert.ok(commands.includes('ecode.deletePushRecord'));
     assert.ok(commands.includes('ecode.rollbackPushFile'));
@@ -199,8 +207,73 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(overflow.includes('ecode.searchApiDocumentation'));
     assert.ok(overflow.includes('ecode.openOnlineDocumentation'));
     assert.ok(overflow.includes('ecode.openAiGuide'));
-    assert.ok(overflow.includes('ecode.refreshAiSupport'));
+    assert.ok(!overflow.includes('ecode.refreshAiSupport'));
     assert.ok(overflow.includes('ecode.removeAiSupport'));
+  });
+
+  test('Ecode Explorer menu does not expose lifecycle actions', () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    const menus = ext?.packageJSON.contributes?.menus?.['explorer/context'];
+    assert.strictEqual(menus, undefined);
+  });
+
+  test('Ecode command palette hides commands that require a tree or file argument', () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    const menus = ext?.packageJSON.contributes?.menus?.commandPalette as
+      | Array<{ command: string; when?: string }>
+      | undefined;
+    assert.ok(menus);
+    const hidden = new Map(menus.map(item => [item.command, item.when]));
+    for (const command of [
+      'ecode.openDiff',
+      'ecode.publishResourceFolder',
+      'ecode.unpublishResourceFolder',
+      'ecode.setResourcePreloadOrder',
+      'ecode.enableResourcePreload',
+      'ecode.disableResourcePreload',
+    ]) {
+      assert.strictEqual(hidden.get(command), 'false');
+    }
+  });
+
+  test('Ecode source tree exposes only state-appropriate lifecycle actions', () => {
+    const ext = vscode.extensions.getExtension('ecode-local.ecode-vscode');
+    const menus = ext?.packageJSON.contributes?.menus?.['view/item/context'] as
+      | Array<{ command: string; when?: string }>
+      | undefined;
+    assert.ok(menus);
+    const lifecycleMenus = menus.filter(item =>
+      item.when?.includes('ecode.lifecycle.'));
+
+    assert.deepStrictEqual(
+      lifecycleMenus.map(item => [item.command, item.when]),
+      [
+        [
+          'ecode.publishResourceFolder',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.folder.unreleased',
+        ],
+        [
+          'ecode.unpublishResourceFolder',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.folder.released',
+        ],
+        [
+          'ecode.setResourcePreloadOrder',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.folder.released',
+        ],
+        [
+          'ecode.setResourcePreloadOrder',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.folder.unreleased',
+        ],
+        [
+          'ecode.enableResourcePreload',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.file.preloadable',
+        ],
+        [
+          'ecode.disableResourcePreload',
+          'view == ecode.workspace && viewItem == ecode.lifecycle.file.preloaded',
+        ],
+      ],
+    );
   });
 
   test('Ecode language intelligence provides completion, hover, and definition', async () => {
