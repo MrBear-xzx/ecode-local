@@ -16,9 +16,28 @@ suite('File API', () => {
       if (request.url?.startsWith('/api/ecode/type/tree')) {
         response.end(JSON.stringify({
           status: true,
-          typeList: [{ id: 1, name: 'Type', attribute: 'type', hasChild: 'true' }],
-          childFolder: [],
-          childFile: [],
+          typeList: [{
+            id: 1,
+            name: 'Type',
+            attribute: 'type',
+            hasChild: 'true',
+            appId: 9,
+          }],
+          childFolder: [{
+            id: 2,
+            name: 'app',
+            attribute: 'folder',
+            isRootFolder: '1',
+            releaseStatus: 'released',
+            preStateOrder: 10000,
+          }],
+          childFile: [{
+            id: 3,
+            name: 'app.js',
+            attribute: 'file',
+            fileExtension: 'js',
+            state: 'pre-state',
+          }],
         }));
       } else if (request.url?.startsWith('/api/cloudstore/ecode/one')) {
         const id = new URL(request.url, 'http://localhost').searchParams.get('id');
@@ -139,6 +158,12 @@ suite('File API', () => {
     assert.strictEqual(tree.status, true);
     assert.strictEqual(tree.data?.typeList[0].id, '1');
     assert.strictEqual(tree.data?.typeList[0].hasChild, true);
+    assert.strictEqual(tree.data?.typeList[0].appId, '9');
+    assert.strictEqual(tree.data?.childFolder[0].isRootFolder, true);
+    assert.strictEqual(tree.data?.childFolder[0].released, true);
+    assert.strictEqual(tree.data?.childFolder[0].preStateOrder, '10000');
+    assert.strictEqual(tree.data?.childFile[0].fileType, 'js');
+    assert.strictEqual(tree.data?.childFile[0].preloadState, 'pre-state');
     assert.strictEqual(content.status, true);
     assert.strictEqual(content.data, 'const value = 1;\n');
   });

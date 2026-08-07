@@ -13,18 +13,16 @@ const INTERACTIVE_REQUEST_TTL_MS = 60 * 60 * 1000;
 const INTERACTIVE_ACTIONS = new Set([
   'configure',
   'addEnvironment',
-  'searchDocumentation',
-  'openOnlineDocumentation',
 ]);
 const WORKSPACE_ACTIONS = new Set([
   'getState',
   'getKnowledge',
   'configure',
   'addEnvironment',
-  'enableAiSupport',
 ]);
 const ACTIONS = new Set([
   'getState',
+  'getLifecycleState',
   'refreshChanges',
   'listPushRecords',
   'listChangeSets',
@@ -35,46 +33,43 @@ const ACTIONS = new Set([
   'deleteEnvironment',
   'pull',
   'push',
+  'setPreload',
+  'setPreloadOrder',
+  'setFolderRelease',
   'rollbackPushFile',
   'renamePushRecord',
   'deletePushRecord',
-  'openDiff',
-  'openPromotionDiff',
   'revertChange',
   'resolveConflict',
   'createChangeSet',
   'applyChangeSet',
   'deleteChangeSet',
-  'searchDocumentation',
-  'openOnlineDocumentation',
-  'refreshAiSupport',
-  'enableAiSupport',
-  'openAiGuide',
-  'removeAiSupport',
 ]);
 const CONFIRMATION_ACTIONS = new Set([
   'switchEnvironment',
   'deleteEnvironment',
   'push',
+  'setPreload',
+  'setPreloadOrder',
+  'setFolderRelease',
   'rollbackPushFile',
   'deletePushRecord',
   'revertChange',
   'resolveConflict',
   'applyChangeSet',
   'deleteChangeSet',
-  'removeAiSupport',
 ]);
 const OPTION_KEYS = new Map([
   ['--workspace', 'workspace'],
   ['--environment-directory', 'environmentDirectory'],
   ['--environment-id', 'environmentId'],
   ['--path', 'path'],
+  ['--enabled', 'enabled'],
+  ['--order', 'preStateOrder'],
   ['--push-record-id', 'pushRecordId'],
   ['--change-set-id', 'changeSetId'],
   ['--name', 'name'],
   ['--resolution', 'resolution'],
-  ['--record-type', 'recordType'],
-  ['--query', 'query'],
   ['--request-id', 'requestId'],
   ['--timeout', 'timeout'],
   ['--confirmed', 'confirmed'],
@@ -173,6 +168,20 @@ function buildInvocation(action, values) {
     case 'push':
       invocation.paths = many(values, used, 'path', '--path');
       break;
+    case 'setPreload':
+    case 'setFolderRelease':
+      invocation.path = one(values, used, 'path', '--path');
+      invocation.enabled = parseBooleanOption(
+        one(values, used, 'enabled', '--enabled'),
+        '--enabled',
+      );
+      break;
+    case 'setPreloadOrder':
+      invocation.path = one(values, used, 'path', '--path');
+      invocation.preStateOrder = parsePreStateOrderOption(
+        one(values, used, 'preStateOrder', '--order'),
+      );
+      break;
     case 'rollbackPushFile':
       invocation.pushRecordId = one(values, used, 'pushRecordId', '--push-record-id');
       invocation.path = one(values, used, 'path', '--path');
@@ -184,20 +193,8 @@ function buildInvocation(action, values) {
     case 'deletePushRecord':
       invocation.pushRecordId = one(values, used, 'pushRecordId', '--push-record-id');
       break;
-    case 'openDiff':
     case 'revertChange':
       invocation.path = one(values, used, 'path', '--path');
-      break;
-    case 'openPromotionDiff':
-      invocation.recordType = one(values, used, 'recordType', '--record-type');
-      invocation.path = one(values, used, 'path', '--path');
-      if (invocation.recordType === 'pushRecord') {
-        invocation.pushRecordId = one(values, used, 'pushRecordId', '--push-record-id');
-      } else if (invocation.recordType === 'changeSet') {
-        invocation.changeSetId = one(values, used, 'changeSetId', '--change-set-id');
-      } else {
-        throw new CliError('--record-type 必须是 pushRecord 或 changeSet', 64);
-      }
       break;
     case 'resolveConflict':
       invocation.path = one(values, used, 'path', '--path');
@@ -210,9 +207,6 @@ function buildInvocation(action, values) {
     case 'applyChangeSet':
     case 'deleteChangeSet':
       invocation.changeSetId = one(values, used, 'changeSetId', '--change-set-id');
-      break;
-    case 'searchDocumentation':
-      invocation.query = optionalOne(values, used, 'query', '--query');
       break;
     default:
       break;
@@ -250,18 +244,6 @@ function one(values, used, key, option) {
   return items[0];
 }
 
-function optionalOne(values, used, key, option) {
-  used.add(key);
-  const items = values[key];
-  if (!items) {
-    return undefined;
-  }
-  if (items.length !== 1) {
-    throw new CliError(`${option} 最多提供一次`, 64);
-  }
-  return items[0];
-}
-
 function many(values, used, key, option) {
   used.add(key);
   const items = values[key];
@@ -269,6 +251,28 @@ function many(values, used, key, option) {
     throw new CliError(`${option} 至少提供一次`, 64);
   }
   return items;
+}
+
+function parseBooleanOption(value, option) {
+  if (value === 'true') {
+    return true;
+  }
+  if (value === 'false') {
+    return false;
+  }
+  throw new CliError(`${option} 必须是 true 或 false`, 64);
+}
+
+function parsePreStateOrderOption(value) {
+  const trimmed = value.trim();
+  if (!/^-?\d+(?:\.\d{1,2})?$/.test(trimmed)) {
+    throw new CliError('--order 必须是整数或最多两位小数', 64);
+  }
+  const numeric = Number(trimmed);
+  if (!Number.isFinite(numeric) || Math.abs(numeric) > Number.MAX_SAFE_INTEGER / 100) {
+    throw new CliError('--order 数值过大', 64);
+  }
+  return Object.is(numeric, -0) ? '0' : String(numeric);
 }
 
 function resolveActiveEnvironment(configuration) {
@@ -296,6 +300,10 @@ async function invoke(
   validateIdentifier(id, 'request ID');
   const requestFile = path.join(requestRoot, `${id}.json`);
   const resultFile = path.join(resultRoot, `${id}.json`);
+  const temporaryRequestFile = path.join(
+    requestRoot,
+    `.${id}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`,
+  );
   const request = {
     schemaVersion: SCHEMA_VERSION,
     id,
@@ -308,15 +316,18 @@ async function invoke(
     )).toISOString(),
   };
   try {
-    await fs.promises.writeFile(requestFile, `${JSON.stringify(request, null, 2)}\n`, {
+    await fs.promises.writeFile(temporaryRequestFile, `${JSON.stringify(request, null, 2)}\n`, {
       encoding: 'utf8',
       flag: 'wx',
     });
+    await fs.promises.link(temporaryRequestFile, requestFile);
   } catch (error) {
     if (error?.code === 'EEXIST') {
       throw new CliError(`请求 ID 已存在：${id}`, 64);
     }
     throw error;
+  } finally {
+    await fs.promises.rm(temporaryRequestFile, { force: true });
   }
   if (!waitForCompletion) {
     return {
@@ -531,26 +542,26 @@ function helpText() {
     + `  ${[...CONFIRMATION_ACTIONS].join('、')} 必须先取得用户明确授权，再添加 --confirmed。\n`
     + `  pull 不需要确认，也不接受 --confirmed。VS Code 不会为 Agent CLI 重复弹出确认框。\n\n`
     + `交互式 action：\n`
-    + `  configure、addEnvironment、searchDocumentation、openOnlineDocumentation 提交后立即返回 pending；\n`
+    + `  configure、addEnvironment 提交后立即返回 pending；\n`
     + `  原请求保留一小时，用户在 VS Code 中完成或取消后使用 wait 续查，禁止创建重复请求。\n\n`
     + `续查超时请求：\n  node ecode-agent.cjs wait --request-id <ID> [--timeout <秒>]\n\n`
     + `Action 参数：\n`
     + `  switchEnvironment|deleteEnvironment --environment-id <ID>\n`
     + `  push --path <路径> [--path <路径> ...]\n`
+    + `  setPreload|setFolderRelease --path <路径> --enabled <true|false>\n`
+    + `  setPreloadOrder --path <根文件夹路径> --order <整数或最多两位小数>\n`
     + `  rollbackPushFile --push-record-id <ID> --path <路径>\n`
     + `  renamePushRecord --push-record-id <ID> --name <名称>\n`
     + `  deletePushRecord --push-record-id <ID>\n`
-    + `  openDiff|revertChange --path <路径>\n`
-    + `  openPromotionDiff --record-type <pushRecord|changeSet> --push-record-id/--change-set-id <ID> --path <路径>\n`
+    + `  revertChange --path <路径>\n`
     + `  resolveConflict --path <路径> --resolution <值>\n`
     + `  createChangeSet --push-record-id <ID> [--push-record-id <ID> ...] --name <名称>\n`
-    + `  applyChangeSet|deleteChangeSet --change-set-id <ID>\n`
-    + `  searchDocumentation [--query <关键词>]\n\n`
+    + `  applyChangeSet|deleteChangeSet --change-set-id <ID>\n\n`
     + `无专用参数的 action：\n  ${[...ACTIONS].filter(action => ![
       'switchEnvironment', 'deleteEnvironment', 'push', 'rollbackPushFile', 'renamePushRecord',
-      'deletePushRecord', 'openDiff', 'openPromotionDiff', 'revertChange',
+      'setPreload', 'setPreloadOrder', 'setFolderRelease',
+      'deletePushRecord', 'revertChange',
       'resolveConflict', 'createChangeSet', 'applyChangeSet', 'deleteChangeSet',
-      'searchDocumentation',
     ].includes(action)).join('、')}\n`;
 }
 

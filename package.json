@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -69,6 +69,36 @@
         "command": "ecode.pushSelected",
         "title": "Ecode: 选择并推送",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "ecode.publishResourceFolder",
+        "title": "Ecode: 发布此文件夹",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "ecode.unpublishResourceFolder",
+        "title": "Ecode: 取消发布此文件夹",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "ecode.setResourcePreloadOrder",
+        "title": "Ecode: 修改此前置加载顺序",
+        "icon": "$(list-ordered)"
+      },
+      {
+        "command": "ecode.enableResourcePreload",
+        "title": "Ecode: 将此文件设为前置加载",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "ecode.disableResourcePreload",
+        "title": "Ecode: 取消此前置加载",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "ecode.refreshLifecycleDecorations",
+        "title": "Ecode: 刷新源码结构与生命周期状态",
+        "icon": "$(refresh)"
       },
       {
         "command": "ecode.rollbackPushFile",
@@ -167,6 +197,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "ecode.openDiff",
+          "when": "false"
+        },
+        {
           "command": "ecode.rollbackPushFile",
           "when": "false"
         },
@@ -176,6 +210,26 @@
         },
         {
           "command": "ecode.deletePushRecord",
+          "when": "false"
+        },
+        {
+          "command": "ecode.publishResourceFolder",
+          "when": "false"
+        },
+        {
+          "command": "ecode.unpublishResourceFolder",
+          "when": "false"
+        },
+        {
+          "command": "ecode.setResourcePreloadOrder",
+          "when": "false"
+        },
+        {
+          "command": "ecode.enableResourcePreload",
+          "when": "false"
+        },
+        {
+          "command": "ecode.disableResourcePreload",
           "when": "false"
         }
       ],
@@ -236,11 +290,6 @@
           "group": "3_documentation@3"
         },
         {
-          "command": "ecode.refreshAiSupport",
-          "when": "view == ecode.workspace && ecode.aiSupportEnabled",
-          "group": "4_ai@1"
-        },
-        {
           "command": "ecode.enableAiSupport",
           "when": "view == ecode.workspace && !ecode.aiSupportEnabled",
           "group": "4_ai@1"
@@ -252,6 +301,36 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "ecode.publishResourceFolder",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.folder.unreleased",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.unpublishResourceFolder",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.folder.released",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.setResourcePreloadOrder",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.folder.released",
+          "group": "inline@2"
+        },
+        {
+          "command": "ecode.setResourcePreloadOrder",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.folder.unreleased",
+          "group": "inline@2"
+        },
+        {
+          "command": "ecode.enableResourcePreload",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.file.preloadable",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.disableResourcePreload",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycle.file.preloaded",
+          "group": "inline@1"
+        },
         {
           "command": "ecode.deleteEnvironment",
           "when": "view == ecode.workspace && viewItem =~ /ecode.environment/",

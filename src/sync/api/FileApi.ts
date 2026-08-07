@@ -202,6 +202,12 @@ function asTreeNode(value: unknown): TreeNode | undefined {
   const record = asRecord(value);
   const id = stringValue(record.id);
   const name = stringValue(record.name);
+  const releaseStatus = firstRecordString(
+    record,
+    'releaseStatus',
+    'releasedStatus',
+    'status',
+  );
   return id && name
     ? {
         id,
@@ -209,6 +215,32 @@ function asTreeNode(value: unknown): TreeNode | undefined {
         attribute: stringValue(record.attribute) ?? '',
         hasChild: booleanValue(record.hasChild),
         parentId: stringValue(record.parentId),
+        appId: firstRecordString(record, 'appId', 'appid'),
+        fileType: firstRecordString(
+          record,
+          'fileExtension',
+          'fileType',
+          'suffix',
+          'type',
+        ),
+        preloadState: firstRecordString(
+          record,
+          'state',
+          'preloadState',
+          'preloadType',
+          'preState',
+          'markType',
+          'markFileType',
+          'loadState',
+          'loadType',
+        ),
+        preStateOrder: firstRecordString(record, 'preStateOrder'),
+        isRootFolder: optionalBooleanValue(
+          firstRecordValue(record, 'isRootFolder', 'rootFolder'),
+        ),
+        released: optionalBooleanValue(
+          firstRecordValue(record, 'released', 'isReleased', 'isRelease'),
+        ) ?? (releaseStatus?.toLowerCase() === 'released' ? true : undefined),
       }
     : undefined;
 }
@@ -227,6 +259,39 @@ function stringValue(value: unknown): string | undefined {
 
 function booleanValue(value: unknown): boolean {
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function optionalBooleanValue(value: unknown): boolean | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  if (value === false || value === 0 || value === '0' || value === 'false') {
+    return false;
+  }
+  return booleanValue(value) ? true : undefined;
+}
+
+function firstRecordString(
+  record: Record<string, unknown>,
+  ...names: string[]
+): string | undefined {
+  return stringValue(firstRecordValue(record, ...names));
+}
+
+function firstRecordValue(
+  record: Record<string, unknown>,
+  ...names: string[]
+): unknown {
+  const normalized = new Map(
+    Object.entries(record).map(([key, value]) => [key.toLowerCase(), value]),
+  );
+  for (const name of names) {
+    const value = normalized.get(name.toLowerCase());
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function normalizeWorkflowFormContext(

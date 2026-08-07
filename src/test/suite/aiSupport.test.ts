@@ -83,7 +83,7 @@ suite('AI coding support', () => {
     assert.match(generated, /当前环境项目知识位于 `.ecode-local\/dev_env\/ecode-ai\/`/);
     assert.match(generated, /所有扩展功能统一通过 Skill 提供的 `scripts\/ecode-agent\.cjs` 调用/);
     assert.match(generated, /不直接读写 `.ecode-local\/agent-cli\/`/);
-    assert.match(generated, /不自动执行远端推送、删除、冲突处理或变更集应用/);
+    assert.match(generated, /不自动执行远端推送、删除、冲突处理、生命周期状态变更或变更集应用/);
     assert.match(generated, /推送必须有单独、明确的当前任务授权/);
     assert.strictEqual(updated, generated);
     assert.strictEqual(removeManagedAgentsContent(generated), original);
@@ -165,9 +165,53 @@ suite('AI coding support', () => {
       environmentId: 'env_test',
       confirmed: true,
     });
-    assert.deepStrictEqual(parseAiInvocation({ action: 'enableAiSupport' }), {
-      action: 'enableAiSupport',
+    assert.throws(
+      () => parseAiInvocation({ action: 'enableAiSupport' }),
+      /action 不受支持/,
+    );
+    assert.deepStrictEqual(parseAiInvocation({ action: 'getLifecycleState' }), {
+      action: 'getLifecycleState',
     });
+    assert.deepStrictEqual(parseAiInvocation({
+      action: 'setPreload',
+      path: 'Project/app/entry.js',
+      enabled: true,
+      confirmed: true,
+    }), {
+      action: 'setPreload',
+      path: 'Project/app/entry.js',
+      enabled: true,
+      confirmed: true,
+    });
+    assert.deepStrictEqual(parseAiInvocation({
+      action: 'setPreloadOrder',
+      path: 'Project/app',
+      preStateOrder: '5.50',
+      confirmed: true,
+    }), {
+      action: 'setPreloadOrder',
+      path: 'Project/app',
+      preStateOrder: '5.5',
+      confirmed: true,
+    });
+    assert.throws(
+      () => parseAiInvocation({
+        action: 'setPreloadOrder',
+        path: 'Project/app',
+        preStateOrder: '5.555',
+        confirmed: true,
+      }),
+      /最多两位小数/,
+    );
+    assert.throws(
+      () => parseAiInvocation({
+        action: 'setFolderRelease',
+        path: 'Project/app',
+        enabled: 'true',
+        confirmed: true,
+      }),
+      /enabled 必须是布尔值/,
+    );
     assert.throws(
       () => parseAiInvocation({ action: 'push', paths: ['Type/a.js'] }),
       /明确授权/,
@@ -312,6 +356,56 @@ suite('AI coding support', () => {
       assert.strictEqual(executions, 0);
       assert.strictEqual(result.status, 'rejected');
       assert.match(String(result.message), /已过期/);
+    } finally {
+      controller.dispose();
+      await delay(100);
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    }
+  });
+
+  test('preserves action metadata when rejecting invalid request arguments', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-ai-invalid-'));
+    const requestDirectory = path.join(root, '.ecode-local', 'agent-cli', 'requests');
+    let executions = 0;
+    const controller = new AiRequestController(
+      { warn: () => undefined } as unknown as vscode.LogOutputChannel,
+      async () => {
+        executions++;
+        return { status: 'succeeded' };
+      },
+    );
+    try {
+      controller.configure(root);
+      fs.mkdirSync(requestDirectory, { recursive: true });
+      fs.writeFileSync(path.join(requestDirectory, 'invalid_001.json'), JSON.stringify({
+        schemaVersion: 2,
+        id: 'invalid_001',
+        action: 'setPreload',
+        environmentDirectory: 'dev',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        confirmed: true,
+        path: '../outside.js',
+        enabled: true,
+      }), 'utf8');
+      await delay(1_200);
+      const result = JSON.parse(fs.readFileSync(path.join(
+        root,
+        '.ecode-local',
+        'agent-cli',
+        'results',
+        'invalid_001.json',
+      ), 'utf8')) as Record<string, unknown>;
+      assert.strictEqual(executions, 0);
+      assert.strictEqual(result.action, 'setPreload');
+      assert.strictEqual(result.environmentDirectory, 'dev');
+      assert.strictEqual(result.status, 'rejected');
+      assert.match(String(result.message), /相对路径|不安全|路径/);
     } finally {
       controller.dispose();
       await delay(100);
@@ -549,6 +643,30 @@ suite('AI coding support', () => {
       ), 'utf8');
       assert.match(generatedSkill, /仅通过以下 CLI 调用扩展/);
       assert.match(generatedSkill, /不直接读写 `.ecode-local` 内部状态或请求\/结果文件/);
+      assert.match(generatedSkill, /生命周期状态变更前先调用 `getLifecycleState`/);
+      assert.match(generatedSkill, /顺序越小越先执行，默认 `10000`/);
+      const generatedGuide = fs.readFileSync(path.join(
+        result.commonDirectory,
+        'ecode-ai-guide.md',
+      ), 'utf8');
+      assert.match(generatedGuide, /普通发布代码构建到 `cloudstore\/release\/\{appId\}`/);
+      assert.match(generatedGuide, /JS\/CSS 前置代码早于系统和组件执行/);
+      const generatedActions = fs.readFileSync(path.join(
+        result.commonDirectory,
+        'skills',
+        'ecode-local',
+        'references',
+        'actions.md',
+      ), 'utf8');
+      assert.match(generatedActions, /setPreload/);
+      assert.match(generatedActions, /setPreloadOrder/);
+      assert.match(generatedActions, /setFolderRelease/);
+      assert.doesNotMatch(generatedActions, /openOnlineDocumentation/);
+      assert.match(generatedActions, /数值越小越先执行，默认值为 `10000`/);
+      assert.match(generatedActions, /`data\.verified`/);
+      assert.match(generatedActions, /`config_default\.js`/);
+      assert.match(generatedActions, /选择唯一的最长匹配/);
+      assert.match(generatedActions, /已通过独立实时查询确认/);
       assert.match(
         fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8'),
         /\.ecode-local\/dev_env\/ecode-ai/,

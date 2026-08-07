@@ -266,7 +266,8 @@ export function updateManagedAgentsContent(
     '',
     '### AI 工作入口',
     '',
-    '- 处理 Ecode 环境、同步、冲突、推送记录、变更集、API/组件知识或 AI 支持时，'
+    '- 处理 Ecode 环境、同步、冲突、前置加载、文件夹发布、推送记录、'
+      + '变更集、API/组件知识或 AI 支持时，'
       + '必须先阅读 `.ecode-local/common/ecode-ai/skills/ecode-local/SKILL.md`。',
     '- 所有扩展功能统一通过 Skill 提供的 `scripts/ecode-agent.cjs` 调用。',
     `- 当前活动环境源码目录是 \`${environmentDirectory}/\`。`,
@@ -279,7 +280,8 @@ export function updateManagedAgentsContent(
     '- 不直接读写 `.ecode-local/agent-cli/` 或其他内部状态；由 CLI 负责通信。',
     '- 用户要求只读时仍可运行 CLI，但只能调用只读 action。',
     '- 不把 `.ecode-local/`、`AGENTS.md` 或工作区其他文件推送到 Ecode。',
-    '- 不自动执行远端推送、删除、冲突处理或变更集应用；每次操作都需要当前任务授权。',
+    '- 不自动执行远端推送、删除、冲突处理、生命周期状态变更或变更集应用；'
+      + '每次操作都需要当前任务授权。',
     '- 推送必须有单独、明确的当前任务授权；代码修改或测试通过不等于推送授权。',
     '- 需要确认的 CLI action 必须先取得当前任务授权，再添加 `--confirmed`；VS Code 不会重复确认。',
     '- 拉取无需确认；不绕过远端冲突检查、编译/GBK 校验和写后回读验证。',
