@@ -374,10 +374,20 @@ export class EcodeLifecycleService {
     let directoryRequests = 1;
     let pending: TreeTask[] = [];
     if (root.system) {
-      pending.push(treeTask(root.system, root.system.name, 'type'));
+      const remotePath = normalizeLifecycleNodePath(
+        root.system.name,
+        '分类',
+        this.logger,
+      );
+      if (remotePath) {
+        pending.push(treeTask(root.system, remotePath, 'type'));
+      }
     }
     for (const type of root.typeList) {
-      pending.push(treeTask(type, type.name, 'type'));
+      const remotePath = normalizeLifecycleNodePath(type.name, '分类', this.logger);
+      if (remotePath) {
+        pending.push(treeTask(type, remotePath, 'type'));
+      }
     }
 
     const visited = new Set<string>();
@@ -416,9 +426,16 @@ export class EcodeLifecycleService {
         }),
       );
       for (const { task, payload } of payloads) {
-        collectFiles(payload, task.path, files);
+        collectFiles(payload, task.path, files, this.logger);
         for (const folder of payload.childFolder) {
-          const folderPath = joinRemote(task.path, folder.name);
+          const folderPath = normalizeLifecycleNodePath(
+            joinRemote(task.path, folder.name),
+            '文件夹',
+            this.logger,
+          );
+          if (!folderPath) {
+            continue;
+          }
           folders.push({
             id: folder.id,
             path: folderPath,
@@ -430,7 +447,14 @@ export class EcodeLifecycleService {
           pending.push(treeTask(folder, folderPath, 'folder'));
         }
         for (const type of payload.typeList) {
-          pending.push(treeTask(type, joinRemote(task.path, type.name), 'type'));
+          const typePath = normalizeLifecycleNodePath(
+            joinRemote(task.path, type.name),
+            '分类',
+            this.logger,
+          );
+          if (typePath) {
+            pending.push(treeTask(type, typePath, 'type'));
+          }
         }
       }
     }
@@ -551,14 +575,23 @@ function collectFiles(
   payload: TreePayload,
   parentPath: string,
   target: LifecycleFile[],
+  logger?: LifecycleLogger,
 ): void {
   for (const node of payload.childFile) {
+    const remotePath = normalizeLifecycleNodePath(
+      joinRemote(parentPath, node.name),
+      '文件',
+      logger,
+    );
+    if (!remotePath) {
+      continue;
+    }
     const extension = normalizeFileType(node.fileType)
       ?? path.posix.extname(node.name).slice(1).toLowerCase();
     const canPreload = extension === 'js' || extension === 'css';
     target.push({
       id: node.id,
-      path: joinRemote(parentPath, node.name),
+      path: remotePath,
       fileType: extension,
       preloadState: canPreload && !node.preloadState?.trim()
         ? 'normal'
@@ -593,7 +626,23 @@ function normalizePreloadState(value: string | undefined): PreloadState {
 }
 
 function joinRemote(parent: string, name: string): string {
-  return path.posix.join(parent.replace(/\\/g, '/'), name.replace(/\\/g, '/'));
+  return parent ? `${parent}/${name}` : name;
+}
+
+function normalizeLifecycleNodePath(
+  candidate: string,
+  kind: '分类' | '文件夹' | '文件',
+  logger?: LifecycleLogger,
+): string | undefined {
+  try {
+    return normalizeRemotePath(candidate);
+  } catch (error: unknown) {
+    logger?.warn(
+      `远端${kind}名称无法安全映射到本地，已忽略: ${candidate || '(空名称)'}; `
+      + errorMessage(error),
+    );
+    return undefined;
+  }
 }
 
 function uniqueById<T extends { id: string }>(items: T[]): T[] {
@@ -720,16 +769,16 @@ function isOptionalSystemInfo(value: unknown): boolean {
 
 function isLifecycleCategory(value: unknown): boolean {
   const record = asRecord(value);
-    return requiredString(record.id)
-      && requiredString(record.path)
-      && optionalString(record.appId)
-      && optionalString(record.preStateOrder);
+  return requiredString(record.id)
+    && isSafeRemotePath(record.path)
+    && optionalString(record.appId)
+    && optionalString(record.preStateOrder);
 }
 
 function isLifecycleFile(value: unknown): boolean {
   const record = asRecord(value);
   return requiredString(record.id)
-    && requiredString(record.path)
+    && isSafeRemotePath(record.path)
     && typeof record.fileType === 'string'
     && ['preloaded', 'postloaded', 'normal', 'unknown'].includes(
       String(record.preloadState),
@@ -740,7 +789,7 @@ function isLifecycleFile(value: unknown): boolean {
 function isLifecycleFolder(value: unknown): boolean {
   const record = asRecord(value);
   return requiredString(record.id)
-    && requiredString(record.path)
+    && isSafeRemotePath(record.path)
     && optionalString(record.appId)
     && typeof record.rootFolder === 'boolean'
     && optionalBoolean(record.released)
@@ -755,6 +804,17 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function requiredString(value: unknown): boolean {
   return typeof value === 'string' && value.length > 0;
+}
+
+function isSafeRemotePath(value: unknown): boolean {
+  if (!requiredString(value)) {
+    return false;
+  }
+  try {
+    return normalizeRemotePath(value as string) === value;
+  } catch {
+    return false;
+  }
 }
 
 function optionalString(value: unknown): boolean {

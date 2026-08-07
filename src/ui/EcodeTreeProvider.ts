@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { resolveSafeLocalPath } from '../domain/paths';
 import type {
   ChangeSet,
   ChangeSetFile,
@@ -589,10 +590,7 @@ function lifecycleSourceNode(
   remotePath: string,
   sourceRoot: string,
 ): LifecycleSourceTreeNode {
-  const localResourceUri = vscode.Uri.file(path.join(
-    sourceRoot,
-    ...remotePath.split('/'),
-  ));
+  const localResourceUri = vscode.Uri.file(resolveSafeLocalPath(sourceRoot, remotePath));
   return {
     type: 'lifecycleSource',
     kind,

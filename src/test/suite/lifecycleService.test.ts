@@ -26,6 +26,7 @@ suite('Ecode lifecycle service', () => {
   let maxActiveInitialReads: number;
   let activeFolderReads: number;
   let maxActiveFolderReads: number;
+  let unsafeTreeNames: boolean;
   const posted: Array<{ path: string; form: URLSearchParams }> = [];
 
   setup(async () => {
@@ -42,6 +43,7 @@ suite('Ecode lifecycle service', () => {
     maxActiveInitialReads = 0;
     activeFolderReads = 0;
     maxActiveFolderReads = 0;
+    unsafeTreeNames = false;
     posted.length = 0;
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
@@ -111,14 +113,23 @@ suite('Ecode lifecycle service', () => {
                   isRootFolder: true,
                   isReleased: treeReportsReleased ? true : undefined,
                   preStateOrder,
-                }],
+                }, ...(unsafeTreeNames ? [{
+                  id: 'unsafe-folder',
+                  name: '../outside',
+                  attribute: 'folder',
+                }] : [])],
             childFile: [{
               id: 'file-js',
               name: 'entry.js',
               attribute: 'file',
               fileExtension: 'js',
               state: preloadState,
-            }],
+            }, ...(unsafeTreeNames ? [{
+              id: 'unsafe-file',
+              name: '../secret.js',
+              attribute: 'file',
+              fileExtension: 'js',
+            }] : [])],
             typeList: [],
           }));
           return;
@@ -161,7 +172,11 @@ suite('Ecode lifecycle service', () => {
             name: 'Project',
             attribute: 'type',
             appId: 'app-1',
-          }],
+          }, ...(unsafeTreeNames ? [{
+            id: 'unsafe-type',
+            name: '../Unsafe',
+            attribute: 'type',
+          }] : [])],
           childFolder: [],
           childFile: [],
         };
@@ -234,6 +249,22 @@ suite('Ecode lifecycle service', () => {
       '10000',
     );
     assert.strictEqual(snapshot.folders.find(item => item.id === 'folder-nested')?.rootFolder, false);
+  });
+
+  test('isolates unsafe remote lifecycle names before mapping local resources', async () => {
+    unsafeTreeNames = true;
+    const messages: string[] = [];
+    const service = createService(baseUrl, {
+      info: message => messages.push(message),
+      warn: message => messages.push(message),
+    });
+
+    const snapshot = await service.getSnapshot();
+
+    assert.ok(snapshot.categories.every(item => item.id !== 'unsafe-type'));
+    assert.ok(snapshot.folders.every(item => item.id !== 'unsafe-folder'));
+    assert.ok(snapshot.files.every(item => item.id !== 'unsafe-file'));
+    assert.ok(messages.some(message => message.includes('无法安全映射到本地')));
   });
 
   test('reads initial endpoints in parallel and limits tree traversal to four requests', async () => {
