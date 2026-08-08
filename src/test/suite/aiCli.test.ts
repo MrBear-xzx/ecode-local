@@ -22,6 +22,8 @@ interface FileRequest {
   path?: string;
   enabled?: boolean;
   preStateOrder?: string;
+  pushRecordIds?: string[];
+  lifecycleRecordIds?: string[];
 }
 
 suite('Ecode Agent CLI', () => {
@@ -43,12 +45,13 @@ suite('Ecode Agent CLI', () => {
     assert.strictEqual(result.code, 0);
     assert.match(result.stdout, /Ecode Local 通用 Agent CLI/);
     for (const action of [
-      'getState', 'getLifecycleState', 'refreshChanges', 'listPushRecords', 'listChangeSets',
+      'getState', 'getLifecycleState', 'refreshChanges', 'listPushRecords',
+      'listLifecycleRecords', 'listChangeSets',
       'getKnowledge', 'configure', 'addEnvironment', 'switchEnvironment',
       'deleteEnvironment',
       'pull', 'push', 'setPreload', 'setPreloadOrder', 'setFolderRelease',
       'rollbackPushFile', 'renamePushRecord',
-      'deletePushRecord', 'revertChange',
+      'deletePushRecord', 'deleteLifecycleRecord', 'revertChange',
       'resolveConflict', 'createChangeSet', 'applyChangeSet',
       'deleteChangeSet',
     ]) {
@@ -217,6 +220,32 @@ suite('Ecode Agent CLI', () => {
       writeResult(root, request, 'succeeded', { verified: true });
       const result = await process_.completion;
       assert.strictEqual(result.code, 0);
+    } finally {
+      process_.child.kill();
+      await removeTestDirectory(root);
+    }
+  });
+
+  test('creates a lifecycle-only change set request', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-cli-change-set-'));
+    initializeConfiguredWorkspace(root);
+    const process_ = startCli(cli, [
+      'createChangeSet',
+      '--workspace', root,
+      '--lifecycle-record-id', 'LIFECYCLE-first',
+      '--lifecycle-record-id', 'LIFECYCLE-second',
+      '--name', '生命周期发布',
+      '--timeout', '5',
+    ], root);
+    try {
+      const request = await waitForRequest(root, item => item.action === 'createChangeSet');
+      assert.deepStrictEqual(request.pushRecordIds, []);
+      assert.deepStrictEqual(request.lifecycleRecordIds, [
+        'LIFECYCLE-first',
+        'LIFECYCLE-second',
+      ]);
+      writeResult(root, request, 'succeeded', { id: 'CS-lifecycle' });
+      assert.strictEqual((await process_.completion).code, 0);
     } finally {
       process_.child.kill();
       await removeTestDirectory(root);

@@ -3,6 +3,7 @@ import type * as vscode from 'vscode';
 import type {
   ChangeSet,
   EnvironmentProfile,
+  LifecycleChangeRecord,
   PushRecord,
   SyncChange,
 } from '../../domain/types';
@@ -57,7 +58,7 @@ suite('Ecode UI models', () => {
       }],
     };
     const changeSet: ChangeSet = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: 'CS-20260730121000-test',
       name: '采购校验',
       sourceEnvironmentId: environment.id,
@@ -66,6 +67,22 @@ suite('Ecode UI models', () => {
       files: {
         'Type/a.js': pushRecord.files[0],
       },
+      lifecycleChanges: {
+        'filePreload:type/a.js': {
+          kind: 'filePreload',
+          path: 'Type/a.js',
+          before: false,
+          after: true,
+          verifiedAt: '2026-07-30T12:05:00.000Z',
+        },
+      },
+    };
+    const lifecycleRecord: LifecycleChangeRecord = {
+      schemaVersion: 1,
+      id: 'LIFECYCLE-test',
+      environmentId: environment.id,
+      createdAt: '2026-07-30T12:05:00.000Z',
+      change: changeSet.lifecycleChanges!['filePreload:type/a.js'],
     };
 
     provider.update([{
@@ -74,6 +91,7 @@ suite('Ecode UI models', () => {
       lastSync: '2026/7/23 17:00:00',
       changes,
       pushRecords: [pushRecord],
+      lifecycleRecords: [lifecycleRecord],
     }, {
       environment: inactiveEnvironment,
       active: false,
@@ -106,6 +124,14 @@ suite('Ecode UI models', () => {
     const pushNode = pushGroup
       ? provider.getChildren(pushGroup)[0]
       : undefined;
+    const lifecycleGroup = environmentChildren.find(item =>
+      provider.getTreeItem(item).label === '生命周期记录 (1)');
+    const lifecycleGroupItem = lifecycleGroup
+      ? provider.getTreeItem(lifecycleGroup)
+      : undefined;
+    const lifecycleItem = lifecycleGroup
+      ? provider.getTreeItem(provider.getChildren(lifecycleGroup)[0])
+      : undefined;
     const pushItem = pushNode ? provider.getTreeItem(pushNode) : undefined;
     const pushFile = pushNode
       ? provider.getTreeItem(provider.getChildren(pushNode)[0])
@@ -119,6 +145,9 @@ suite('Ecode UI models', () => {
       : undefined;
     const changeSetFile = changeSetNode
       ? provider.getTreeItem(provider.getChildren(changeSetNode)[0])
+      : undefined;
+    const changeSetLifecycle = changeSetNode
+      ? provider.getTreeItem(provider.getChildren(changeSetNode)[1])
       : undefined;
 
     assert.deepStrictEqual(labels, [
@@ -157,9 +186,16 @@ suite('Ecode UI models', () => {
     assert.strictEqual(pushItem?.contextValue, 'ecode.pushRecord');
     assert.strictEqual(pushFile?.command?.command, 'ecode.openPromotionDiff');
     assert.strictEqual(pushFile?.contextValue, 'ecode.pushRecordFile');
+    assert.strictEqual(lifecycleItem?.contextValue, 'ecode.lifecycleRecord');
+    assert.strictEqual(lifecycleGroupItem?.contextValue, 'ecode.lifecycleRecordsGroup.active');
+    assert.strictEqual(lifecycleItem?.label, 'Type/a.js');
+    assert.strictEqual(lifecycleItem?.description, '设置前置加载');
+    assert.match(String(lifecycleItem?.tooltip), /停用 → 启用/);
     assert.strictEqual(changeSetItem?.contextValue, 'ecode.changeSet');
+    assert.match(String(changeSetItem?.tooltip), /变更：1 个文件 · 1 项生命周期/);
     assert.strictEqual(changeSetFile?.command?.command, 'ecode.openPromotionDiff');
     assert.strictEqual(changeSetFile?.contextValue, 'ecode.changeSetFile');
+    assert.strictEqual(changeSetLifecycle?.contextValue, 'ecode.changeSetLifecycle');
   });
 
   test('shows baseline initialization instead of reporting local changes', () => {
@@ -186,9 +222,13 @@ suite('Ecode UI models', () => {
       ? provider.getChildren(syncGroup).map(node => provider.getTreeItem(node))
         .find(treeItem => treeItem.label === '当前环境尚未建立同步基线')
       : undefined;
+    const lifecycleGroup = provider.getChildren(environmentNode)
+      .map(node => provider.getTreeItem(node))
+      .find(treeItem => treeItem.label === '生命周期记录 (0)');
 
     assert.strictEqual(item?.description, '请先执行全量拉取');
     assert.strictEqual(item?.command?.command, 'ecode.pull');
+    assert.strictEqual(lifecycleGroup?.contextValue, 'ecode.lifecycleRecordsGroup');
   });
 
   test('uses native source icons except for publishable release packages', () => {

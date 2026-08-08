@@ -90,6 +90,83 @@ suite('Promotion store', () => {
     assert.deepStrictEqual(await store.listDeployments(), [record]);
   });
 
+  test('records and filters verified lifecycle changes', async () => {
+    const record = await store.recordLifecycleChange('environment-a', {
+      kind: 'filePreload',
+      path: 'Type/app/a.js',
+      before: false,
+      after: true,
+      verifiedAt: new Date(0).toISOString(),
+    });
+
+    assert.strictEqual(record.change.verifiedAt, record.createdAt);
+    assert.deepStrictEqual(
+      (await store.listLifecycleRecords('environment-a')).map(item => item.id),
+      [record.id],
+    );
+    assert.deepStrictEqual(await store.listLifecycleRecords('environment-b'), []);
+
+    await store.deleteLifecycleRecord(record.id);
+    assert.deepStrictEqual(await store.listLifecycleRecords(), []);
+  });
+
+  test('folds lifecycle records to a final net state', async () => {
+    const changeSet = await store.createChangeSet('生命周期', 'environment-a');
+    await store.recordLifecycleChanges(changeSet.id, [{
+      kind: 'folderRelease',
+      path: 'Type/app',
+      before: false,
+      after: true,
+      verifiedAt: new Date(0).toISOString(),
+    }]);
+    const reverted = await store.recordLifecycleChanges(changeSet.id, [{
+      kind: 'folderRelease',
+      path: 'type/APP',
+      before: true,
+      after: false,
+      verifiedAt: new Date(1).toISOString(),
+    }]);
+
+    assert.deepStrictEqual(reverted.lifecycleChanges, {});
+  });
+
+  test('rejects a preload state for a file deleted by the same change set', async () => {
+    const changeSet = await store.createChangeSet('非法组合', 'environment-a');
+    await store.recordVerifiedCandidates(changeSet.id, [{
+      path: 'Type/app/a.js',
+      operation: 'delete',
+      baseHash: hashText('old'),
+      baseContent: 'old',
+    }]);
+
+    await assert.rejects(
+      store.recordLifecycleChanges(changeSet.id, [{
+        kind: 'filePreload',
+        path: 'Type/app/a.js',
+        before: true,
+        after: false,
+        verifiedAt: new Date(0).toISOString(),
+      }]),
+      /将被删除的文件不能设置前置状态/,
+    );
+  });
+
+  test('loads legacy change sets as code-only records', async () => {
+    const directory = path.join(root, '.ecode-local', 'promotion', 'change-sets');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'CS-legacy.json'), JSON.stringify({
+      schemaVersion: 1,
+      id: 'CS-legacy',
+      name: '旧记录',
+      sourceEnvironmentId: 'environment-a',
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+      files: {},
+    }));
+
+    assert.deepStrictEqual((await store.getChangeSet('CS-legacy'))?.lifecycleChanges, {});
+  });
+
   test('persists immutable successful push snapshots for later promotion', async () => {
     const before = 'const value = 1;\n';
     const after = 'const value = 2;\n';

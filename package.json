@@ -2,7 +2,7 @@
   "name": "ecode-vscode",
   "displayName": "Ecode Local",
   "description": "泛微 Ecode 本地开发扩展：安全同步、冲突保护、API/组件智能与选择性发布",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publisher": "ecode-local",
   "license": "MIT",
   "repository": {
@@ -116,6 +116,16 @@
         "icon": "$(trash)"
       },
       {
+        "command": "ecode.deleteLifecycleRecord",
+        "title": "Ecode: 删除生命周期记录",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ecode.deleteLifecycleRecords",
+        "title": "Ecode: 批量删除生命周期记录",
+        "icon": "$(trash)"
+      },
+      {
         "command": "ecode.openDiff",
         "title": "Ecode: 查看差异",
         "icon": "$(diff)"
@@ -210,6 +220,10 @@
         },
         {
           "command": "ecode.deletePushRecord",
+          "when": "false"
+        },
+        {
+          "command": "ecode.deleteLifecycleRecord",
           "when": "false"
         },
         {
@@ -370,6 +384,16 @@
           "command": "ecode.deletePushRecord",
           "when": "view == ecode.workspace && viewItem == ecode.pushRecord",
           "group": "inline@2"
+        },
+        {
+          "command": "ecode.deleteLifecycleRecord",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycleRecord",
+          "group": "inline@1"
+        },
+        {
+          "command": "ecode.deleteLifecycleRecords",
+          "when": "view == ecode.workspace && viewItem == ecode.lifecycleRecordsGroup.active",
+          "group": "inline@1"
         },
         {
           "command": "ecode.applyChangeSet",
