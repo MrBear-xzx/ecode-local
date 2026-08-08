@@ -157,14 +157,52 @@ export interface ChangeSetFile {
   verifiedAt: string;
 }
 
-export interface ChangeSet {
+export interface FilePreloadLifecycleChange {
+  kind: 'filePreload';
+  path: string;
+  before: boolean;
+  after: boolean;
+  verifiedAt: string;
+}
+
+export interface FolderReleaseLifecycleChange {
+  kind: 'folderRelease';
+  path: string;
+  before: boolean;
+  after: boolean;
+  verifiedAt: string;
+}
+
+export interface PreloadOrderLifecycleChange {
+  kind: 'preloadOrder';
+  path: string;
+  before: string;
+  after: string;
+  verifiedAt: string;
+}
+
+export type LifecycleChange =
+  | FilePreloadLifecycleChange
+  | FolderReleaseLifecycleChange
+  | PreloadOrderLifecycleChange;
+
+export interface LifecycleChangeRecord {
   schemaVersion: 1;
+  id: string;
+  environmentId: string;
+  createdAt: string;
+  change: LifecycleChange;
+}
+
+export interface ChangeSet {
+  schemaVersion: 1 | 2;
   id: string;
   name: string;
   sourceEnvironmentId: string;
   createdAt: string;
   updatedAt: string;
   files: Record<string, ChangeSetFile>;
+  lifecycleChanges?: Record<string, LifecycleChange>;
 }
 
 export interface PushRecord {
@@ -184,6 +222,20 @@ export type DeploymentFileStatus =
   | 'conflict'
   | 'failed';
 
+export type DeploymentLifecycleStatus =
+  | 'succeeded'
+  | 'failed'
+  | 'skipped';
+
+export interface DeploymentLifecycleResult {
+  kind: LifecycleChange['kind'];
+  path: string;
+  status: DeploymentLifecycleStatus;
+  changed?: boolean;
+  previous?: boolean | string;
+  message?: string;
+}
+
 export interface DeploymentFileResult {
   path: string;
   operation: PromotionOperation;
@@ -195,7 +247,7 @@ export interface DeploymentFileResult {
 }
 
 export interface DeploymentRecord {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   id: string;
   changeSetId: string;
   targetEnvironmentId: string;
@@ -203,6 +255,7 @@ export interface DeploymentRecord {
   completedAt: string;
   status: 'succeeded' | 'partial' | 'conflict' | 'failed';
   files: DeploymentFileResult[];
+  lifecycle?: DeploymentLifecycleResult[];
 }
 
 export interface ReleaseArtifact {

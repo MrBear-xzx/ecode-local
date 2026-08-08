@@ -113,7 +113,7 @@ export function generateAiGuide(): string {
     '- 每个环境使用独立的工作区源码目录，远端拉取和推送只作用于当前活动环境目录。',
     '- `.ecode-local/common/ecode-ai/` 是公共知识目录，不属于 Ecode 源码，禁止同步到远端。',
     '- `.ecode-local/<环境目录>/` 保存该环境的同步状态、恢复资料和项目知识。',
-    '- `.ecode-local/promotion/` 保存推送记录、跨环境变更集、源码快照与应用记录。',
+    '- `.ecode-local/promotion/` 保存推送记录、已验证生命周期记录、跨环境变更集、源码快照与应用记录。',
     '- 不要假设 Ecode 全局对象来自 npm 包；`WfForm`、`ModeForm`、`ModeList`、`ecodeSDK`、`ecCom` 和 `antd` 由平台运行时提供。',
     '- 平台 JavaScript 编译环境以 Babel 7.5.5 兼容能力为准，生成代码时避免依赖过新的语法和运行时 API。',
     '',

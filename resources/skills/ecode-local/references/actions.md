@@ -12,7 +12,7 @@ CLI 自动使用活动环境。可选通用参数：`--workspace <目录>`、`--
 
 以下 action 必须先在当前任务中取得用户对具体操作和目标的明确授权，再添加无值标记 `--confirmed`：
 
-`switchEnvironment`、`deleteEnvironment`、`push`、`setPreload`、`setPreloadOrder`、`setFolderRelease`、`rollbackPushFile`、`deletePushRecord`、`revertChange`、`resolveConflict`、`applyChangeSet`、`deleteChangeSet`。
+`switchEnvironment`、`deleteEnvironment`、`push`、`setPreload`、`setPreloadOrder`、`setFolderRelease`、`rollbackPushFile`、`deletePushRecord`、`deleteLifecycleRecord`、`revertChange`、`resolveConflict`、`applyChangeSet`、`deleteChangeSet`。
 
 VS Code 不会为 Agent CLI 重复弹出确认框。没有明确授权时先询问用户，不得预先添加、默认添加或复用 `--confirmed`。`pull` 无需确认且不接受该标记。
 
@@ -32,6 +32,7 @@ node .ecode-local/common/ecode-ai/skills/ecode-local/scripts/ecode-agent.cjs wai
 | `getLifecycleState` | — | 系统信息、接口能力、项目分类、文件前置加载状态和根文件夹发布状态 |
 | `refreshChanges` | — | 重新扫描本地与远端并返回变更；只记录冲突，不应用源码 |
 | `listPushRecords` | — | 活动环境推送记录 |
+| `listLifecycleRecords` | — | 活动环境中回读验证成功的生命周期变更记录 |
 | `listChangeSets` | — | 工作区变更集 |
 | `getKnowledge` | — | 指南、Skill 和 CLI 路径 |
 
@@ -91,7 +92,7 @@ node .ecode-local/common/ecode-ai/skills/ecode-local/scripts/ecode-agent.cjs set
 
 取消操作将相应命令的 `--enabled` 改为 `false`。
 
-成功结构为 `{"status":"succeeded","data":{"verified":true,...}}`。只有外层 `status: "succeeded"` 且 `data.verified === true` 才表示扩展已回读确认；其他状态立即停止后续写入，超时只用原请求 ID 续查。若缺少 `data.verified`，先报告未验证，再调用 `getLifecycleState`：精确路径的实时字段符合预期时可报告“已通过独立实时查询确认”，否则停止。
+成功结构为 `{"status":"succeeded","data":{"verified":true,"changed":true|false,...}}`。检查 `data.verified`：只有外层 `status: "succeeded"` 且该字段为 `true` 才表示扩展已回读确认；`changed: true` 时会生成生命周期记录，已经收敛则返回 `changed: false` 且不重复记录。无法回读确认会返回失败并且不生成记录，状态可能已经写入时应重新查询后再决定下一步；后续实时字段符合预期时可报告“已通过独立实时查询确认”，但不会补生成生命周期记录。
 
 ## 变更与冲突
 
@@ -109,8 +110,9 @@ node .ecode-local/common/ecode-ai/skills/ecode-local/scripts/ecode-agent.cjs set
 | `rollbackPushFile` | `--push-record-id <ID> --path <路径> --confirmed` | 授权后仅回退本地文件 |
 | `renamePushRecord` | `--push-record-id <ID> --name <名称>` | 修改记录名称 |
 | `deletePushRecord` | `--push-record-id <ID> --confirmed` | 授权后删除记录 |
-| `createChangeSet` | 一个或多个 `--push-record-id <ID>`、`--name <名称>` | 合并选定推送记录 |
-| `applyChangeSet` | `--change-set-id <ID> --confirmed` | 授权后应用到活动环境 |
+| `deleteLifecycleRecord` | `--lifecycle-record-id <ID> --confirmed` | 授权后只删除生命周期历史记录，不修改远端状态 |
+| `createChangeSet` | 一个或多个 `--push-record-id <ID>` 和/或 `--lifecycle-record-id <ID>`、`--name <名称>` | 合并所选记录，允许纯生命周期变更集 |
+| `applyChangeSet` | `--change-set-id <ID> --confirmed` | 授权后先应用代码，再对齐变更集中明确包含的生命周期状态 |
 | `deleteChangeSet` | `--change-set-id <ID> --confirmed` | 授权后删除记录 |
 
 文档搜索、在线文档、差异视图和 AI Coding 支持管理只面向 VS Code 用户，不属于 Agent CLI。Agent 应读取生成知识或直接检查工作区文件，不模拟这些界面操作。

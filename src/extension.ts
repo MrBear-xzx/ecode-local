@@ -19,15 +19,20 @@ import {
 } from './domain/paths';
 import { serverFingerprint } from './domain/text';
 import {
+  lifecycleChangeLabel,
+  lifecycleChangeTransition,
   lifecycleConnectionIdentity,
   normalizePreStateOrder,
 } from './domain/lifecycle';
 import type {
   ChangeSet,
   DeploymentFileResult,
+  DeploymentLifecycleResult,
   DeploymentRecord,
   ConnectionProfile,
   EnvironmentProfile,
+  LifecycleChange,
+  LifecycleChangeRecord,
   PromotionCandidate,
   PushRecord,
   SyncChange,
@@ -40,6 +45,7 @@ import { WorkspaceStore } from './storage/WorkspaceStore';
 import { PromotionStore } from './storage/PromotionStore';
 import { detectLegacyProjects } from './storage/LegacyProjectGuard';
 import { EcodeSyncService, SyncCancelledError } from './sync/EcodeSyncService';
+import { deployLifecycleChanges } from './sync/LifecycleChangeDeployer';
 import {
   EcodeLifecycleService,
   type LifecycleFile,
@@ -268,6 +274,10 @@ class ExtensionController {
         this.runCommandSafely(() => this.renamePushRecord(argument))),
       vscode.commands.registerCommand('ecode.deletePushRecord', (argument?: unknown) =>
         this.runCommandSafely(() => this.deletePushRecord(argument))),
+      vscode.commands.registerCommand('ecode.deleteLifecycleRecord', (argument?: unknown) =>
+        this.runCommandSafely(() => this.deleteLifecycleRecord(argument))),
+      vscode.commands.registerCommand('ecode.deleteLifecycleRecords', () =>
+        this.runCommandSafely(() => this.deleteLifecycleRecords())),
       vscode.commands.registerCommand(
         'ecode.openPromotionDiff',
         (candidate: PushRecord | ChangeSet, remotePath: string) =>
@@ -329,6 +339,7 @@ class ExtensionController {
         && ![
           'getState',
           'listPushRecords',
+          'listLifecycleRecords',
           'listChangeSets',
           'getKnowledge',
         ].includes(invocation.action)
@@ -362,6 +373,14 @@ class ExtensionController {
             data: activeEnvironment
               ? await this.promotionStore(activeEnvironment.workspaceFolder)
                 .listPushRecords(activeEnvironment.id)
+              : [],
+          };
+        case 'listLifecycleRecords':
+          return {
+            status: 'succeeded',
+            data: activeEnvironment
+              ? await this.promotionStore(activeEnvironment.workspaceFolder)
+                .listLifecycleRecords(activeEnvironment.id)
               : [],
           };
         case 'listChangeSets':
@@ -405,7 +424,12 @@ class ExtensionController {
               invocation.path!,
               invocation.enabled!,
             ),
-            result => this.recordLifecyclePreload(result.path, result.enabled),
+            result => this.recordLifecyclePreload(
+              result.path,
+              result.enabled,
+              result.previous,
+              result.changed,
+            ),
           );
         case 'setFolderRelease':
           return this.runVerifiedLifecycleMutation(
@@ -415,7 +439,12 @@ class ExtensionController {
               invocation.path!,
               invocation.enabled!,
             ),
-            result => this.recordLifecycleRelease(result.path, result.enabled),
+            result => this.recordLifecycleRelease(
+              result.path,
+              result.enabled,
+              result.previous,
+              result.changed,
+            ),
           );
         case 'setPreloadOrder':
           return this.runVerifiedLifecycleMutation(
@@ -428,6 +457,8 @@ class ExtensionController {
             result => this.recordLifecyclePreStateOrder(
               result.path,
               result.preStateOrder,
+              result.previousPreStateOrder,
+              result.changed,
             ),
           );
         case 'rollbackPushFile': {
@@ -454,6 +485,14 @@ class ExtensionController {
             '用户未确认删除推送记录',
           );
         }
+        case 'deleteLifecycleRecord': {
+          const record = await this.requireLifecycleRecord(invocation.lifecycleRecordId!);
+          return confirmedOperationResult(
+            await this.deleteLifecycleRecord(record, 'agent'),
+            '生命周期记录已删除',
+            '用户未确认删除生命周期记录',
+          );
+        }
         case 'revertChange': {
           const change = await this.requireChange(invocation.path!);
           return confirmedOperationResult(
@@ -473,6 +512,7 @@ class ExtensionController {
         case 'createChangeSet': {
           const changeSet = await this.createChangeSetFromIds(
             invocation.pushRecordIds!,
+            invocation.lifecycleRecordIds!,
             invocation.name!,
           );
           return { status: 'succeeded', data: changeSet };
@@ -653,6 +693,19 @@ class ExtensionController {
     return record;
   }
 
+  private async requireLifecycleRecord(id: string): Promise<LifecycleChangeRecord> {
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const record = (await this.promotionStore(environment.workspaceFolder)
+      .listLifecycleRecords(environment.id)).find(item => item.id === id);
+    if (!record) {
+      throw new Error(`生命周期记录不存在：${id}`);
+    }
+    return record;
+  }
+
   private async requireChangeSet(id: string): Promise<ChangeSet> {
     const environment = await this.store.getActiveEnvironment();
     if (!environment) {
@@ -676,6 +729,7 @@ class ExtensionController {
 
   private async createChangeSetFromIds(
     pushRecordIds: string[],
+    lifecycleRecordIds: string[],
     name: string,
   ): Promise<ChangeSet> {
     const source = await this.store.getActiveEnvironment();
@@ -686,21 +740,51 @@ class ExtensionController {
       throw new Error('当前源环境尚未建立同步基线，请先执行全量拉取');
     }
     const promotionStore = this.promotionStore(source.workspaceFolder);
-    const available = await promotionStore.listPushRecords(source.id);
+    const [availablePushes, availableLifecycle] = await Promise.all([
+      promotionStore.listPushRecords(source.id),
+      promotionStore.listLifecycleRecords(source.id),
+    ]);
     const selected = pushRecordIds.map(id => {
-      const record = available.find(item => item.id === id);
+      const record = availablePushes.find(item => item.id === id);
       if (!record) {
         throw new Error(`当前环境中不存在推送记录：${id}`);
       }
       return record;
     }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const selectedLifecycle = lifecycleRecordIds.map(id => {
+      const record = availableLifecycle.find(item => item.id === id);
+      if (!record) {
+        throw new Error(`当前环境中不存在生命周期记录：${id}`);
+      }
+      return record;
+    }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    if (selected.length === 0 && selectedLifecycle.length === 0) {
+      throw new Error('至少选择一条推送记录或生命周期记录');
+    }
     const changeSet = await promotionStore.createChangeSet(name, source.id);
     let updated = changeSet;
-    for (const record of selected) {
-      updated = await promotionStore.recordVerifiedCandidates(
-        changeSet.id,
-        await promotionStore.materializePushRecord(record),
-      );
+    try {
+      for (const record of selected) {
+        updated = await promotionStore.recordVerifiedCandidates(
+          changeSet.id,
+          await promotionStore.materializePushRecord(record),
+        );
+      }
+      if (selectedLifecycle.length > 0) {
+        updated = await promotionStore.recordLifecycleChanges(
+          changeSet.id,
+          selectedLifecycle.map(record => record.change),
+        );
+      }
+      if (
+        Object.keys(updated.files).length === 0
+        && Object.keys(updated.lifecycleChanges ?? {}).length === 0
+      ) {
+        throw new Error('所选记录折叠后没有可应用的净变化');
+      }
+    } catch (error: unknown) {
+      await promotionStore.deleteChangeSet(changeSet.id);
+      throw error;
     }
     await this.updateViews();
     return updated;
@@ -1124,21 +1208,41 @@ class ExtensionController {
       throw new Error('当前源环境尚未建立同步基线，请先执行全量拉取');
     }
     const promotionStore = this.promotionStore(source.workspaceFolder);
-    const pushRecords = await promotionStore.listPushRecords(source.id);
-    if (pushRecords.length === 0) {
-      throw new Error('当前环境还没有成功推送记录，请先完成一次推送');
+    const [pushRecords, lifecycleRecords] = await Promise.all([
+      promotionStore.listPushRecords(source.id),
+      promotionStore.listLifecycleRecords(source.id),
+    ]);
+    if (pushRecords.length === 0 && lifecycleRecords.length === 0) {
+      throw new Error('当前环境还没有可用的推送记录或生命周期记录');
     }
-    const selectedRecords = await vscode.window.showQuickPick(
-      pushRecords.map(record => ({
+    type PromotionQuickPickItem = vscode.QuickPickItem & {
+      pushRecord?: PushRecord;
+      lifecycleRecord?: LifecycleChangeRecord;
+    };
+    const items: PromotionQuickPickItem[] = [];
+    if (pushRecords.length > 0) {
+      items.push({ label: '推送记录', kind: vscode.QuickPickItemKind.Separator });
+      items.push(...pushRecords.map(record => ({
         label: record.name,
         description: `${new Date(record.createdAt).toLocaleString()} · ${record.files.length} 个文件`,
         detail: `${record.id}${record.status === 'partial' ? ' · 部分成功' : ''}`,
-        record,
-        picked: false,
-      })),
+        pushRecord: record,
+      })));
+    }
+    if (lifecycleRecords.length > 0) {
+      items.push({ label: '生命周期记录', kind: vscode.QuickPickItemKind.Separator });
+      items.push(...lifecycleRecords.map(record => ({
+        label: lifecycleChangeLabel(record.change),
+        description: new Date(record.createdAt).toLocaleString(),
+        detail: `${record.id} · ${record.change.path}`,
+        lifecycleRecord: record,
+      })));
+    }
+    const selectedRecords = await vscode.window.showQuickPick(
+      items,
       {
-        title: '选择组成跨环境变更集的历史推送',
-        placeHolder: '可选择一次或多次推送；同一文件按时间折叠为最终净变化',
+        title: '选择组成跨环境变更集的记录',
+        placeHolder: '可混合选择推送和生命周期记录；同一目标按时间折叠为最终净变化',
         canPickMany: true,
         ignoreFocusOut: true,
       },
@@ -1161,20 +1265,41 @@ class ExtensionController {
       source.id,
     );
     const chronologicalRecords = selectedRecords
-      .map(item => item.record)
+      .flatMap(item => item.pushRecord ? [item.pushRecord] : [])
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const chronologicalLifecycle = selectedRecords
+      .flatMap(item => item.lifecycleRecord ? [item.lifecycleRecord] : [])
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     let updatedChangeSet = changeSet;
-    for (const record of chronologicalRecords) {
-      updatedChangeSet = await promotionStore.recordVerifiedCandidates(
-        changeSet.id,
-        await promotionStore.materializePushRecord(record),
-      );
+    try {
+      for (const record of chronologicalRecords) {
+        updatedChangeSet = await promotionStore.recordVerifiedCandidates(
+          changeSet.id,
+          await promotionStore.materializePushRecord(record),
+        );
+      }
+      if (chronologicalLifecycle.length > 0) {
+        updatedChangeSet = await promotionStore.recordLifecycleChanges(
+          changeSet.id,
+          chronologicalLifecycle.map(record => record.change),
+        );
+      }
+      if (
+        Object.keys(updatedChangeSet.files).length === 0
+        && Object.keys(updatedChangeSet.lifecycleChanges ?? {}).length === 0
+      ) {
+        throw new Error('所选记录折叠后没有可应用的净变化');
+      }
+    } catch (error: unknown) {
+      await promotionStore.deleteChangeSet(changeSet.id);
+      throw error;
     }
     await this.updateViews();
     vscode.window.showInformationMessage(
-      `Ecode: 已从 ${selectedRecords.length} 次历史推送创建 `
+      `Ecode: 已从 ${selectedRecords.length} 条历史记录创建 `
         + `变更集“${changeSet.name}”，包含 `
-        + `${Object.keys(updatedChangeSet.files).length} 个文件；`
+        + `${Object.keys(updatedChangeSet.files).length} 个文件、`
+        + `${Object.keys(updatedChangeSet.lifecycleChanges ?? {}).length} 项生命周期配置；`
         + '切换到任意已建立基线的环境即可直接应用',
     );
   }
@@ -1285,6 +1410,97 @@ class ExtensionController {
     return true;
   }
 
+  private async deleteLifecycleRecord(
+    argument?: unknown,
+    confirmationSource: ConfirmationSource = 'vscode',
+  ): Promise<boolean> {
+    const record = lifecycleRecordFromCommandArgument(argument);
+    if (!record) {
+      throw new Error('未找到要删除的生命周期记录');
+    }
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment || record.environmentId !== environment.id) {
+      throw new Error('请先切换到该生命周期记录所属环境');
+    }
+    if (confirmationSource === 'vscode') {
+      const confirmation = await vscode.window.showWarningMessage(
+        `确认删除生命周期记录“${lifecycleChangeLabel(record.change)}”？`
+          + '这只会删除历史记录，不会修改远端状态或已有变更集。',
+        { modal: true },
+        '确认删除',
+      );
+      if (confirmation !== '确认删除') {
+        return false;
+      }
+    }
+    await this.promotionStore(environment.workspaceFolder)
+      .deleteLifecycleRecord(record.id);
+    await this.updateViews();
+    vscode.window.showInformationMessage('Ecode: 生命周期记录已删除；远端状态未修改');
+    return true;
+  }
+
+  private async deleteLifecycleRecords(): Promise<void> {
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境');
+    }
+    const promotionStore = this.promotionStore(environment.workspaceFolder);
+    const records = await promotionStore.listLifecycleRecords(environment.id);
+    if (records.length === 0) {
+      vscode.window.showInformationMessage('Ecode: 当前环境没有生命周期记录');
+      return;
+    }
+    const selected = await vscode.window.showQuickPick(
+      records.map(record => ({
+        label: record.change.path,
+        description: lifecycleChangeLabel(record.change),
+        detail: `${lifecycleChangeTransition(record.change)} · ${
+          new Date(record.createdAt).toLocaleString()
+        }`,
+        record,
+      })),
+      {
+        canPickMany: true,
+        placeHolder: '勾选要删除的生命周期记录；删除历史不会修改远端状态或已有变更集',
+      },
+    );
+    if (!selected || selected.length === 0) {
+      return;
+    }
+    const preview = selected.slice(0, 10)
+      .map(item => `${item.label} · ${item.description}`)
+      .join('\n');
+    const remaining = selected.length > 10
+      ? `\n另有 ${selected.length - 10} 条记录`
+      : '';
+    const confirmation = await vscode.window.showWarningMessage(
+      `确认删除选中的 ${selected.length} 条生命周期记录？`,
+      {
+        modal: true,
+        detail: `${preview}${remaining}\n\n只会删除历史记录，不会修改远端状态或已有变更集。`,
+      },
+      '确认删除',
+    );
+    if (confirmation !== '确认删除') {
+      return;
+    }
+    let deleted = 0;
+    try {
+      for (const item of selected) {
+        await promotionStore.deleteLifecycleRecord(item.record.id);
+        deleted++;
+      }
+    } catch (error: unknown) {
+      await this.updateViews();
+      throw new Error(`已删除 ${deleted} 条记录，后续删除失败：${errorMessage(error)}`);
+    }
+    await this.updateViews();
+    vscode.window.showInformationMessage(
+      `Ecode: 已删除 ${deleted} 条生命周期记录；远端状态未修改`,
+    );
+  }
+
   private async openPromotionDiff(
     candidate: PushRecord | ChangeSet,
     remotePath: string,
@@ -1332,8 +1548,9 @@ class ExtensionController {
       return false;
     }
     const artifacts = await promotionStore.materializeChangeSet(changeSet);
-    if (artifacts.length === 0) {
-      throw new Error('变更集中没有可应用的文件');
+    const lifecycleChanges = Object.values(changeSet.lifecycleChanges ?? {});
+    if (artifacts.length === 0 && lifecycleChanges.length === 0) {
+      throw new Error('变更集中没有可应用的文件或生命周期配置');
     }
     const profile = toConnectionProfile(target);
     if (!await this.service.hasSyncBaseline(profile)) {
@@ -1341,11 +1558,13 @@ class ExtensionController {
         `当前环境“${target.name}”尚未建立同步基线，请先执行全量拉取`,
       );
     }
-    const preflight = await this.service.verifyRelease(profile, artifacts);
+    const preflight = artifacts.length > 0
+      ? await this.service.verifyRelease(profile, artifacts)
+      : { success: true, files: [] };
     if (!preflight.success) {
       const now = new Date().toISOString();
       await promotionStore.saveDeployment({
-        schemaVersion: 1,
+        schemaVersion: 2,
         id: `DEP-${randomUUID()}`,
         changeSetId: changeSet.id,
         targetEnvironmentId: target.id,
@@ -1353,6 +1572,12 @@ class ExtensionController {
         completedAt: now,
         status: 'conflict',
         files: preflight.files,
+        lifecycle: lifecycleChanges.map(change => ({
+          kind: change.kind,
+          path: change.path,
+          status: 'skipped',
+          message: '代码预检未通过，未执行生命周期配置',
+        })),
       });
       throw new Error(formatPromotionFailures(
         '当前环境预检未通过，未写入任何文件',
@@ -1360,9 +1585,17 @@ class ExtensionController {
       ));
     }
     if (confirmationSource === 'vscode') {
+      const preloadCount = lifecycleChanges.filter(change =>
+        change.kind === 'filePreload').length;
+      const orderCount = lifecycleChanges.filter(change =>
+        change.kind === 'preloadOrder').length;
+      const releaseCount = lifecycleChanges.filter(change =>
+        change.kind === 'folderRelease').length;
       const confirmation = await vscode.window.showWarningMessage(
         `确认将变更集“${changeSet.name}”应用到当前环境“${target.name}”？`
-          + `本次将处理 ${artifacts.length} 个文件，写入前仍会执行目标环境预检。`,
+          + `本次将处理 ${artifacts.length} 个文件、${preloadCount} 项文件前置、`
+          + `${orderCount} 项加载顺序、${releaseCount} 项发布状态，`
+          + '生命周期配置只会在代码全部成功后执行。',
         { modal: true },
         '确认应用',
       );
@@ -1376,28 +1609,59 @@ class ExtensionController {
       async () => {
         const startedAt = new Date().toISOString();
         const appliedCandidates: PromotionCandidate[] = [];
-        const files = await vscode.window.withProgress({
+        const result = await vscode.window.withProgress({
           location: vscode.ProgressLocation.Notification,
           title: `Ecode: 应用变更集 ${changeSet.name}`,
           cancellable: true,
-        }, (progress, token) => this.service.deployRelease(
-          profile,
-          artifacts,
-          message => progress.report({ message }),
-          token,
-          candidate => appliedCandidates.push(candidate),
-        ));
+        }, async (progress, token) => {
+          const files = artifacts.length > 0
+            ? await this.service.deployRelease(
+                profile,
+                artifacts,
+                message => progress.report({ message }),
+                token,
+                candidate => appliedCandidates.push(candidate),
+              )
+            : [];
+          const codeSucceeded = files.every(file => file.status === 'succeeded');
+          const lifecycle = codeSucceeded
+            ? await deployLifecycleChanges(
+                lifecycleChanges,
+                this.lifecycle,
+                message => progress.report({ message }),
+                () => token.isCancellationRequested,
+              )
+            : lifecycleChanges.map(change => ({
+                kind: change.kind,
+                path: change.path,
+                status: 'skipped' as const,
+                message: '代码未全部成功，生命周期配置留待重试',
+              }));
+          return { files, lifecycle };
+        });
         const record: DeploymentRecord = {
-          schemaVersion: 1,
+          schemaVersion: 2,
           id: `DEP-${randomUUID()}`,
           changeSetId: changeSet.id,
           targetEnvironmentId: target.id,
           startedAt,
           completedAt: new Date().toISOString(),
-          status: deploymentStatus(files),
-          files,
+          status: deploymentStatus(result.files, result.lifecycle),
+          files: result.files,
+          lifecycle: result.lifecycle,
         };
         await promotionStore.saveDeployment(record);
+        for (const lifecycleResult of result.lifecycle) {
+          const sourceChange = lifecycleChanges.find(change =>
+            change.kind === lifecycleResult.kind
+            && sameRemotePath(change.path, lifecycleResult.path));
+          const appliedChange = sourceChange
+            ? appliedLifecycleChange(sourceChange, lifecycleResult)
+            : undefined;
+          if (appliedChange) {
+            await promotionStore.recordLifecycleChange(target.id, appliedChange);
+          }
+        }
         const pushRecord = appliedCandidates.length > 0
           ? await promotionStore.recordPush(
               target.id,
@@ -1415,7 +1679,8 @@ class ExtensionController {
         } else {
           vscode.window.showErrorMessage(formatPromotionFailures(
             `应用结果：${record.status}`,
-            files,
+            result.files,
+            result.lifecycle,
           ));
         }
         return record.status;
@@ -1980,40 +2245,89 @@ class ExtensionController {
     return this.readLifecycleSnapshot();
   }
 
-  private recordLifecyclePreload(
+  private async recordLifecyclePreload(
     remotePath: string,
     enabled: boolean,
-  ): void {
+    previous: boolean | undefined,
+    changed = true,
+  ): Promise<LifecycleChangeRecord | undefined> {
     const file = this.lifecycleSnapshot?.files.find(item =>
       sameRemotePath(item.path, remotePath));
     if (file) {
       file.preloadState = enabled ? 'preloaded' : 'normal';
       this.tree.refresh();
     }
+    if (!changed || previous === undefined) {
+      return undefined;
+    }
+    return this.recordLifecycleChange({
+      kind: 'filePreload',
+      path: remotePath,
+      before: previous,
+      after: enabled,
+      verifiedAt: new Date().toISOString(),
+    });
   }
 
-  private recordLifecycleRelease(
+  private async recordLifecycleRelease(
     remotePath: string,
     enabled: boolean,
-  ): void {
+    previous: boolean | undefined,
+    changed = true,
+  ): Promise<LifecycleChangeRecord | undefined> {
     const folder = this.lifecycleSnapshot?.folders.find(item =>
       sameRemotePath(item.path, remotePath));
     if (folder) {
       folder.released = enabled;
       this.tree.refresh();
     }
+    if (!changed || previous === undefined) {
+      return undefined;
+    }
+    return this.recordLifecycleChange({
+      kind: 'folderRelease',
+      path: remotePath,
+      before: previous,
+      after: enabled,
+      verifiedAt: new Date().toISOString(),
+    });
   }
 
-  private recordLifecyclePreStateOrder(
+  private async recordLifecyclePreStateOrder(
     remotePath: string,
     preStateOrder: string,
-  ): void {
+    previousPreStateOrder: string,
+    changed = true,
+  ): Promise<LifecycleChangeRecord | undefined> {
     const folder = this.lifecycleSnapshot?.folders.find(item =>
       sameRemotePath(item.path, remotePath));
     if (folder) {
       folder.preStateOrder = preStateOrder;
       this.tree.refresh();
     }
+    if (!changed) {
+      return undefined;
+    }
+    return this.recordLifecycleChange({
+      kind: 'preloadOrder',
+      path: remotePath,
+      before: previousPreStateOrder,
+      after: preStateOrder,
+      verifiedAt: new Date().toISOString(),
+    });
+  }
+
+  private async recordLifecycleChange(
+    change: LifecycleChange,
+  ): Promise<LifecycleChangeRecord> {
+    const environment = await this.store.getActiveEnvironment();
+    if (!environment) {
+      throw new Error('当前没有活动环境，无法保存生命周期记录');
+    }
+    const record = await this.promotionStore(environment.workspaceFolder)
+      .recordLifecycleChange(environment.id, change);
+    await this.updateViews();
+    return record;
   }
 
   private async setResourcePreload(
@@ -2106,9 +2420,17 @@ class ExtensionController {
       if (confirmed !== '修改顺序') {
         return;
       }
-      const result = await this.lifecycle.setPreStateOrder(folder.id, preStateOrder);
+      const result = await this.lifecycle.setPreStateOrderByPath(
+        folder.path,
+        preStateOrder,
+      );
       assertLifecycleVerification(result.verified, '设置前置加载顺序');
-      this.recordLifecyclePreStateOrder(folder.path, preStateOrder);
+      await this.recordLifecyclePreStateOrder(
+        folder.path,
+        preStateOrder,
+        result.previousPreStateOrder,
+        result.changed,
+      );
       vscode.window.showInformationMessage(
         `Ecode: 已修改前置加载顺序 · ${folder.path} · ${preStateOrder}`,
       );
@@ -2137,7 +2459,12 @@ class ExtensionController {
     }
     const result = await this.lifecycle.setFilePreloadedByPath(file.path, enabled);
     assertLifecycleVerification(result.verified, verb);
-    this.recordLifecyclePreload(file.path, enabled);
+    await this.recordLifecyclePreload(
+      file.path,
+      enabled,
+      result.previous,
+      result.changed,
+    );
     vscode.window.showInformationMessage(`Ecode: 已${verb} · ${file.path}`);
   }
 
@@ -2160,11 +2487,14 @@ class ExtensionController {
     if (confirmed !== verb) {
       return;
     }
-    const result = enabled
-      ? await this.lifecycle.publishFolder(folder.id, folder.appId)
-      : await this.lifecycle.unpublishFolder(folder.id, folder.appId);
+    const result = await this.lifecycle.setFolderReleasedByPath(folder.path, enabled);
     assertLifecycleVerification(result.verified, verb);
-    this.recordLifecycleRelease(folder.path, enabled);
+    await this.recordLifecycleRelease(
+      folder.path,
+      enabled,
+      result.previous,
+      result.changed,
+    );
     vscode.window.showInformationMessage(`Ecode: 已${verb} · ${folder.path}`);
   }
 
@@ -2186,15 +2516,17 @@ class ExtensionController {
     busyLabel: string,
     operationLabel: string,
     operation: () => Promise<T>,
-    record?: (result: T) => void,
+    record?: (result: T) => Promise<unknown>,
   ): Promise<AiInvocationResult> {
     const data = await this.runExclusive(busyLabel, async () => {
       const result = await operation();
       assertLifecycleVerification(result.verified, operationLabel);
-      record?.(result);
+      if (record) {
+        await record(result);
+      }
       return result;
     });
-    return { status: 'succeeded', data };
+    return lifecycleMutationInvocationResult(operationLabel, data);
   }
 
   private async runExclusive<T>(
@@ -2345,6 +2677,7 @@ class ExtensionController {
     let changeSets: ChangeSet[] = [];
     let deployments: DeploymentRecord[] = [];
     let pushRecords: PushRecord[] = [];
+    let lifecycleRecords: LifecycleChangeRecord[] = [];
     const manifestLoadOrder = [...environments].sort((left, right) =>
       Number(left.id === activeEnvironment?.id)
       - Number(right.id === activeEnvironment?.id));
@@ -2373,10 +2706,11 @@ class ExtensionController {
     if (profile) {
       try {
         const promotionStore = this.promotionStore(profile.workspaceFolder);
-        [changeSets, deployments, pushRecords] = await Promise.all([
+        [changeSets, deployments, pushRecords, lifecycleRecords] = await Promise.all([
           promotionStore.listChangeSets(),
           promotionStore.listDeployments(),
           promotionStore.listPushRecords(),
+          promotionStore.listLifecycleRecords(),
         ]);
         changeSets.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
         deployments.sort((left, right) =>
@@ -2406,6 +2740,8 @@ class ExtensionController {
         lastSync: lastSyncByEnvironment.get(environment.id),
         changes: active ? this.changes : undefined,
         pushRecords: pushRecords.filter(record =>
+          record.environmentId === environment.id),
+        lifecycleRecords: lifecycleRecords.filter(record =>
           record.environmentId === environment.id),
         busyMessage: active ? busyMessage : undefined,
         lifecycle: hasCurrentLifecycle && this.lifecycleSnapshot
@@ -2473,6 +2809,18 @@ export function isPushableChange(change: SyncChange): boolean {
 
 export function visibleAiChanges(changes: readonly SyncChange[]): SyncChange[] {
   return changes.filter(change => change.status !== 'clean');
+}
+
+export function lifecycleMutationInvocationResult<T>(
+  operationLabel: string,
+  data: T | undefined,
+): AiInvocationResult {
+  return data === undefined
+    ? {
+        status: 'failed',
+        message: `${operationLabel}未完成，远端状态可能不确定，请重新查询生命周期状态确认`,
+      }
+    : { status: 'succeeded', data };
 }
 
 export function countChanges(
@@ -2558,11 +2906,16 @@ function toConnectionProfile(environment: EnvironmentProfile): ConnectionProfile
 
 function deploymentStatus(
   files: DeploymentFileResult[],
+  lifecycle: DeploymentLifecycleResult[] = [],
 ): DeploymentRecord['status'] {
-  if (files.length > 0 && files.every(file => file.status === 'succeeded')) {
+  const statuses = [
+    ...files.map(file => file.status),
+    ...lifecycle.map(item => item.status),
+  ];
+  if (statuses.length > 0 && statuses.every(status => status === 'succeeded')) {
     return 'succeeded';
   }
-  if (files.some(file => file.status === 'succeeded')) {
+  if (statuses.some(status => status === 'succeeded')) {
     return 'partial';
   }
   if (files.some(file => file.status === 'conflict')) {
@@ -2574,14 +2927,60 @@ function deploymentStatus(
 function formatPromotionFailures(
   prefix: string,
   files: DeploymentFileResult[],
+  lifecycle: DeploymentLifecycleResult[] = [],
 ): string {
-  const failures = files.filter(file =>
-    file.status === 'conflict' || file.status === 'failed');
+  const failures = [
+    ...files.filter(file => file.status === 'conflict' || file.status === 'failed')
+      .map(file => ({ path: file.path, message: file.message ?? file.status })),
+    ...lifecycle.filter(item => item.status !== 'succeeded')
+      .map(item => ({ path: item.path, message: item.message ?? item.status })),
+  ];
   const detail = failures.slice(0, 3)
-    .map(file => `${file.path}: ${file.message ?? file.status}`)
+    .map(item => `${item.path}: ${item.message}`)
     .join('；');
   const remaining = failures.length > 3 ? `；另有 ${failures.length - 3} 项` : '';
   return detail ? `${prefix}：${detail}${remaining}` : prefix;
+}
+
+function appliedLifecycleChange(
+  source: LifecycleChange,
+  result: DeploymentLifecycleResult,
+): LifecycleChange | undefined {
+  if (result.status !== 'succeeded' || result.changed !== true) {
+    return undefined;
+  }
+  const verifiedAt = new Date().toISOString();
+  if (source.kind === 'preloadOrder' && typeof result.previous === 'string') {
+    return { ...source, before: result.previous, verifiedAt };
+  }
+  if (source.kind !== 'preloadOrder' && typeof result.previous === 'boolean') {
+    return { ...source, before: result.previous, verifiedAt };
+  }
+  return undefined;
+}
+
+function lifecycleRecordFromCommandArgument(
+  argument: unknown,
+): LifecycleChangeRecord | undefined {
+  if (
+    argument
+    && typeof argument === 'object'
+    && 'record' in argument
+  ) {
+    return lifecycleRecordFromCommandArgument(argument.record);
+  }
+  if (
+    !argument
+    || typeof argument !== 'object'
+    || !('id' in argument)
+    || typeof argument.id !== 'string'
+    || !('environmentId' in argument)
+    || typeof argument.environmentId !== 'string'
+    || !('change' in argument)
+  ) {
+    return undefined;
+  }
+  return argument as LifecycleChangeRecord;
 }
 
 function errorMessage(error: unknown): string {
@@ -2647,8 +3046,12 @@ function assertLifecycleVerification(
   verified: boolean | undefined,
   operation: string,
 ): void {
-  if (verified === false) {
-    throw new Error(`${operation}接口返回成功，但远端状态复核未通过`);
+  if (verified !== true) {
+    throw new Error(
+      verified === false
+        ? `${operation}接口返回成功，但远端状态复核未通过`
+        : `${operation}接口可能已写入，但当前服务端无法回读确认；未生成生命周期记录`,
+    );
   }
 }
 

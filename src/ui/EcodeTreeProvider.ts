@@ -1,11 +1,17 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import {
+  lifecycleChangeLabel,
+  lifecycleChangeTransition,
+} from '../domain/lifecycle';
 import { resolveSafeLocalPath } from '../domain/paths';
 import type {
   ChangeSet,
   ChangeSetFile,
   DeploymentRecord,
   EnvironmentProfile,
+  LifecycleChange,
+  LifecycleChangeRecord,
   PushRecord,
   SyncChange,
 } from '../domain/types';
@@ -26,6 +32,7 @@ export interface EnvironmentTreeState {
   lastSync?: string;
   changes?: SyncChange[];
   pushRecords?: PushRecord[];
+  lifecycleRecords?: LifecycleChangeRecord[];
   busyMessage?: string;
   lifecycle?: LifecycleSnapshot;
   lifecycleFresh?: boolean;
@@ -73,11 +80,14 @@ type EcodeTreeNode =
       children: EcodeTreeNode[];
       icon: TreeIcon;
       expanded?: boolean;
+      contextValue?: string;
     }
   | { type: 'pushRecord'; record: PushRecord }
   | { type: 'pushRecordFile'; record: PushRecord; file: ChangeSetFile }
+  | { type: 'lifecycleRecord'; record: LifecycleChangeRecord }
   | { type: 'changeSet'; changeSet: ChangeSet }
   | { type: 'changeSetFile'; changeSet: ChangeSet; file: ChangeSetFile }
+  | { type: 'changeSetLifecycle'; changeSet: ChangeSet; change: LifecycleChange }
   | LifecycleSourceTreeNode
   | { type: 'change'; change: SyncChange };
 
@@ -152,7 +162,7 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
           ? vscode.TreeItemCollapsibleState.Collapsed
           : vscode.TreeItemCollapsibleState.Expanded,
       );
-      item.contextValue = 'ecode.group';
+      item.contextValue = element.contextValue ?? 'ecode.group';
       item.iconPath = themeIcon(element.icon.id, element.icon.color);
       return item;
     }
@@ -200,16 +210,38 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
         element.changeSet.name,
         vscode.TreeItemCollapsibleState.Collapsed,
       );
-      item.description = appliedHere
-        ? `已应用到当前环境 · ${Object.keys(element.changeSet.files).length} 个文件`
-        : `${Object.keys(element.changeSet.files).length} 个文件`;
+      const counts = `${Object.keys(element.changeSet.files).length} 个文件 · `
+        + `${Object.keys(element.changeSet.lifecycleChanges ?? {}).length} 项生命周期`;
+      item.description = appliedHere ? `已应用到当前环境 · ${counts}` : counts;
       item.tooltip = `${element.changeSet.id}\n来源环境：${
         this.environmentName(element.changeSet.sourceEnvironmentId)
-      }\n展开查看文件；右侧按钮可应用到当前环境或删除变更集`;
+      }\n变更：${counts}\n展开查看文件和生命周期；右侧按钮可应用到当前环境或删除变更集`;
       item.contextValue = 'ecode.changeSet';
       item.iconPath = appliedHere
         ? themeIcon('pass-filled', 'charts.green')
         : themeIcon('git-pull-request', 'charts.blue');
+      return item;
+    }
+
+    if (element.type === 'lifecycleRecord') {
+      const item = new vscode.TreeItem(element.record.change.path);
+      item.description = lifecycleChangeLabel(element.record.change);
+      item.tooltip = `${element.record.change.path}\n${lifecycleChangeLabel(
+        element.record.change,
+      )}\n${lifecycleChangeTransition(
+        element.record.change,
+      )}\n${new Date(element.record.createdAt).toLocaleString()}\n${element.record.id}`;
+      item.contextValue = 'ecode.lifecycleRecord';
+      item.iconPath = themeIcon('pulse', 'charts.blue');
+      return item;
+    }
+
+    if (element.type === 'changeSetLifecycle') {
+      const item = new vscode.TreeItem(element.change.path);
+      item.description = lifecycleChangeLabel(element.change);
+      item.tooltip = `${element.change.path}\n${lifecycleChangeTransition(element.change)}`;
+      item.contextValue = 'ecode.changeSetLifecycle';
+      item.iconPath = themeIcon('pulse', 'charts.blue');
       return item;
     }
 
@@ -347,13 +379,21 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
       }));
     }
     if (element?.type === 'changeSet') {
-      return Object.values(element.changeSet.files)
+      const files: EcodeTreeNode[] = Object.values(element.changeSet.files)
         .sort((left, right) => left.path.localeCompare(right.path))
         .map(file => ({
           type: 'changeSetFile',
           changeSet: element.changeSet,
           file,
         }));
+      const lifecycle: EcodeTreeNode[] = Object.values(
+        element.changeSet.lifecycleChanges ?? {},
+      ).sort((left, right) => left.path.localeCompare(right.path)).map(change => ({
+        type: 'changeSetLifecycle',
+        changeSet: element.changeSet,
+        change,
+      }));
+      return [...files, ...lifecycle];
     }
     if (element?.type === 'lifecycleSource') {
       return element.children;
@@ -448,6 +488,7 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
         }];
 
     const pushRecords = state.pushRecords ?? [];
+    const lifecycleRecords = state.lifecycleRecords ?? [];
     const pushRecordChildren: EcodeTreeNode[] = pushRecords.length > 0
       ? pushRecords.map(record => ({
           type: 'pushRecord',
@@ -511,6 +552,22 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
         label: `推送记录 (${pushRecords.length})`,
         icon: { id: 'history' },
         children: pushRecordChildren,
+        expanded: false,
+      },
+      {
+        type: 'group',
+        label: `生命周期记录 (${lifecycleRecords.length})`,
+        icon: { id: 'pulse' },
+        contextValue: active && lifecycleRecords.length > 0
+          ? 'ecode.lifecycleRecordsGroup.active'
+          : 'ecode.lifecycleRecordsGroup',
+        children: lifecycleRecords.length > 0
+          ? lifecycleRecords.map(record => ({ type: 'lifecycleRecord', record }))
+          : [{
+              type: 'message',
+              label: '暂无生命周期记录',
+              icon: { id: 'history', color: 'disabledForeground' },
+            }],
         expanded: false,
       },
     ];

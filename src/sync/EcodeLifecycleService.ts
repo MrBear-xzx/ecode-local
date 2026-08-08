@@ -65,14 +65,18 @@ interface VerifiedLifecycleResult {
   verified?: boolean;
 }
 
-interface PathLifecycleResult extends VerifiedLifecycleResult {
+export interface PathLifecycleResult extends VerifiedLifecycleResult {
   path: string;
   enabled: boolean;
+  previous?: boolean;
+  changed: boolean;
 }
 
-interface PreStateOrderResult extends VerifiedLifecycleResult {
+export interface PreStateOrderResult extends VerifiedLifecycleResult {
   path: string;
   preStateOrder: string;
+  previousPreStateOrder: string;
+  changed: boolean;
 }
 
 interface TreeTask {
@@ -194,17 +198,35 @@ export class EcodeLifecycleService {
 
   async setFilePreloaded(fileId: string, enabled: boolean): Promise<VerifiedLifecycleResult> {
     const profile = await this.requireProfile();
-    await this.withAuthentication(profile, async (_files, lifecycle) => {
-      ensureSuccess(
-        await lifecycle.markFile(fileId, enabled ? 'pre-state' : ''),
-        enabled ? '设置前置加载失败' : '取消前置加载失败',
-      );
-    });
+    try {
+      await this.withAuthentication(profile, async (_files, lifecycle) => {
+        ensureSuccess(
+          await lifecycle.markFile(fileId, enabled ? 'pre-state' : ''),
+          enabled ? '设置前置加载失败' : '取消前置加载失败',
+        );
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof EcodeOperationError)) {
+        throw error;
+      }
+      const reconciled = await this.verifyFilePreloaded(fileId, enabled);
+      if (reconciled.verified === true) {
+        return reconciled;
+      }
+      throw error;
+    }
+    return this.verifyFilePreloaded(fileId, enabled);
+  }
+
+  private async verifyFilePreloaded(
+    fileId: string,
+    expected: boolean,
+  ): Promise<VerifiedLifecycleResult> {
     const refreshed = await this.getSnapshot();
     const file = refreshed.files.find(item => item.id === fileId);
     return {
       verified: file && file.preloadState !== 'unknown'
-        ? file.preloadState === (enabled ? 'preloaded' : 'normal')
+        ? file.preloadState === (expected ? 'preloaded' : 'normal')
         : undefined,
     };
   }
@@ -226,6 +248,8 @@ export class EcodeLifecycleService {
       return {
         path: target.path,
         enabled,
+        previous: enabled,
+        changed: false,
         verified: true,
       };
     }
@@ -238,6 +262,8 @@ export class EcodeLifecycleService {
     return {
       path: target.path,
       enabled,
+      previous: !enabled,
+      changed: true,
       ...await this.setFilePreloaded(target.id, enabled),
     };
   }
@@ -248,17 +274,35 @@ export class EcodeLifecycleService {
   ): Promise<VerifiedLifecycleResult> {
     const preStateOrder = normalizePreStateOrder(order);
     const profile = await this.requireProfile();
-    await this.withAuthentication(profile, async (_files, lifecycle) => {
-      ensureSuccess(
-        await lifecycle.setPreStateOrder(folderId, preStateOrder),
-        '设置前置加载顺序失败',
-      );
-    });
+    try {
+      await this.withAuthentication(profile, async (_files, lifecycle) => {
+        ensureSuccess(
+          await lifecycle.setPreStateOrder(folderId, preStateOrder),
+          '设置前置加载顺序失败',
+        );
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof EcodeOperationError)) {
+        throw error;
+      }
+      const reconciled = await this.verifyPreStateOrder(folderId, preStateOrder);
+      if (reconciled.verified === true) {
+        return reconciled;
+      }
+      throw error;
+    }
+    return this.verifyPreStateOrder(folderId, preStateOrder);
+  }
+
+  private async verifyPreStateOrder(
+    folderId: string,
+    expected: string,
+  ): Promise<VerifiedLifecycleResult> {
     const refreshed = await this.getSnapshot();
     const folder = refreshed.folders.find(item => item.id === folderId);
     return {
       verified: folder?.preStateOrder !== undefined
-        ? samePreStateOrder(folder.preStateOrder, preStateOrder)
+        ? samePreStateOrder(folder.preStateOrder, expected)
         : undefined,
     };
   }
@@ -276,9 +320,23 @@ export class EcodeLifecycleService {
       throw new Error(`仅分类下的根文件夹支持设置前置加载顺序: ${target.path}`);
     }
     const preStateOrder = normalizePreStateOrder(order);
+    const previousPreStateOrder = normalizePreStateOrder(
+      target.preStateOrder ?? '10000',
+    );
+    if (samePreStateOrder(previousPreStateOrder, preStateOrder)) {
+      return {
+        path: target.path,
+        preStateOrder,
+        previousPreStateOrder,
+        changed: false,
+        verified: true,
+      };
+    }
     return {
       path: target.path,
       preStateOrder,
+      previousPreStateOrder,
+      changed: true,
       ...await this.setPreStateOrder(target.id, preStateOrder),
     };
   }
@@ -337,9 +395,20 @@ export class EcodeLifecycleService {
     if (!target.rootFolder) {
       throw new Error(`仅支持发布分类下的根文件夹: ${target.path}`);
     }
+    if (target.released === enabled) {
+      return {
+        path: target.path,
+        enabled,
+        previous: enabled,
+        changed: false,
+        verified: true,
+      };
+    }
     return {
       path: target.path,
       enabled,
+      previous: target.released,
+      changed: true,
       ...await (enabled
         ? this.publishFolder(target.id, target.appId)
         : this.unpublishFolder(target.id, target.appId)),

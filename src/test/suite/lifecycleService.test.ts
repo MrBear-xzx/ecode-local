@@ -17,7 +17,9 @@ suite('Ecode lifecycle service', () => {
   let preStateOrder: string;
   let released: boolean;
   let releaseListSupported: boolean;
+  let preloadResponseFails: boolean;
   let releaseResponseFails: boolean;
+  let preStateOrderResponseFails: boolean;
   let treeReportsReleased: boolean;
   let releaseListUsesAppId: boolean;
   let delayedInitialReads: boolean;
@@ -34,7 +36,9 @@ suite('Ecode lifecycle service', () => {
     preStateOrder = '10000';
     released = true;
     releaseListSupported = true;
+    preloadResponseFails = false;
     releaseResponseFails = false;
+    preStateOrderResponseFails = false;
     treeReportsReleased = false;
     releaseListUsesAppId = false;
     delayedInitialReads = false;
@@ -207,7 +211,11 @@ suite('Ecode lifecycle service', () => {
             '/api/cloudstore/ecode/deleteReleaseFile',
           ].includes(url.pathname);
           response.end(JSON.stringify(
-            releaseRequest && releaseResponseFails
+            (url.pathname === '/api/cloudstore/ecode/markFile'
+              && preloadResponseFails)
+              || (releaseRequest && releaseResponseFails)
+              || (url.pathname === '/api/ecode/type/setPreStateOrder'
+                && preStateOrderResponseFails)
               ? { status: false, msg: '请求超时 (30000ms)' }
               : { status: true },
           ));
@@ -334,6 +342,8 @@ suite('Ecode lifecycle service', () => {
     assert.deepStrictEqual(orderResult, {
       path: 'Project/app',
       preStateOrder: '5.5',
+      previousPreStateOrder: '10000',
+      changed: true,
       verified: true,
     });
     assert.strictEqual(unpublishResult.verified, true);
@@ -354,16 +364,48 @@ suite('Ecode lifecycle service', () => {
     assert.deepStrictEqual(preloadResult, {
       path: 'Project/entry.js',
       enabled: false,
+      previous: true,
+      changed: true,
       verified: true,
     });
     assert.deepStrictEqual(releaseResult, {
       path: 'Project/app',
       enabled: false,
+      previous: true,
+      changed: true,
       verified: true,
     });
     assert.deepStrictEqual(orderResult, {
       path: 'Project/app',
       preStateOrder: '3',
+      previousPreStateOrder: '10000',
+      changed: true,
+      verified: true,
+    });
+  });
+
+  test('reports already converged lifecycle writes without mutating', async () => {
+    const service = createService(baseUrl);
+
+    assert.deepStrictEqual(await service.setFilePreloadedByPath('Project/entry.js', true), {
+      path: 'Project/entry.js',
+      enabled: true,
+      previous: true,
+      changed: false,
+      verified: true,
+    });
+    assert.deepStrictEqual(await service.setFolderReleasedByPath('Project/app', true), {
+      path: 'Project/app',
+      enabled: true,
+      previous: true,
+      changed: false,
+      verified: true,
+    });
+    assert.deepStrictEqual(await service.setPreStateOrderByPath('Project/app', '10000'), {
+      path: 'Project/app',
+      preStateOrder: '10000',
+      previousPreStateOrder: '10000',
+      changed: false,
       verified: true,
     });
   });
@@ -445,6 +487,36 @@ suite('Ecode lifecycle service', () => {
 
     assert.strictEqual(unpublishResult.verified, true);
     assert.strictEqual(publishResult.verified, true);
+  });
+
+  test('reconciles timed-out preload writes from the refreshed tree', async () => {
+    preloadResponseFails = true;
+    const service = createService(baseUrl);
+
+    const result = await service.setFilePreloadedByPath('Project/entry.js', false);
+
+    assert.deepStrictEqual(result, {
+      path: 'Project/entry.js',
+      enabled: false,
+      previous: true,
+      changed: true,
+      verified: true,
+    });
+  });
+
+  test('reconciles timed-out preload-order writes from the refreshed tree', async () => {
+    preStateOrderResponseFails = true;
+    const service = createService(baseUrl);
+
+    const result = await service.setPreStateOrderByPath('Project/app', '9');
+
+    assert.deepStrictEqual(result, {
+      path: 'Project/app',
+      preStateOrder: '9',
+      previousPreStateOrder: '10000',
+      changed: true,
+      verified: true,
+    });
   });
 });
 

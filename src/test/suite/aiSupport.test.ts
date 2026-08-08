@@ -172,6 +172,24 @@ suite('AI coding support', () => {
     assert.deepStrictEqual(parseAiInvocation({ action: 'getLifecycleState' }), {
       action: 'getLifecycleState',
     });
+    assert.deepStrictEqual(parseAiInvocation({ action: 'listLifecycleRecords' }), {
+      action: 'listLifecycleRecords',
+    });
+    assert.deepStrictEqual(parseAiInvocation({
+      action: 'createChangeSet',
+      pushRecordIds: [],
+      lifecycleRecordIds: ['LIFECYCLE-test'],
+      name: '仅生命周期',
+    }), {
+      action: 'createChangeSet',
+      pushRecordIds: [],
+      lifecycleRecordIds: ['LIFECYCLE-test'],
+      name: '仅生命周期',
+    });
+    assert.throws(
+      () => parseAiInvocation({ action: 'createChangeSet', name: '空变更集' }),
+      /至少需要一个推送记录或生命周期记录/,
+    );
     assert.deepStrictEqual(parseAiInvocation({
       action: 'setPreload',
       path: 'Project/app/entry.js',

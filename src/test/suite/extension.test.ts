@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 import {
   countChanges,
   isPushableChange,
+  lifecycleMutationInvocationResult,
   validateEnvironmentDirectoryInput,
   validateEnvironmentName,
   visibleAiChanges,
@@ -57,6 +58,8 @@ suite('Ecode Extension Test Suite', () => {
     assert.ok(commands.includes('ecode.refreshLifecycleDecorations'));
     assert.ok(commands.includes('ecode.renamePushRecord'));
     assert.ok(commands.includes('ecode.deletePushRecord'));
+    assert.ok(commands.includes('ecode.deleteLifecycleRecord'));
+    assert.ok(commands.includes('ecode.deleteLifecycleRecords'));
     assert.ok(commands.includes('ecode.rollbackPushFile'));
     assert.ok(commands.includes('ecode.openPromotionDiff'));
     assert.ok(commands.includes('ecode.openDiff'));
@@ -119,6 +122,26 @@ suite('Ecode Extension Test Suite', () => {
       changeCounts: countChanges(changes),
       changes: visibleAiChanges(changes),
     })) < 1024 * 1024);
+  });
+
+  test('reports an uncertain lifecycle mutation instead of succeeding without data', () => {
+    assert.deepStrictEqual(
+      lifecycleMutationInvocationResult('设置前置加载顺序', undefined),
+      {
+        status: 'failed',
+        message: '设置前置加载顺序未完成，远端状态可能不确定，请重新查询生命周期状态确认',
+      },
+    );
+    assert.deepStrictEqual(
+      lifecycleMutationInvocationResult('设置前置加载顺序', {
+        changed: false,
+        verified: true,
+      }),
+      {
+        status: 'succeeded',
+        data: { changed: false, verified: true },
+      },
+    );
   });
 
   test('environment name validation rejects duplicates while typing', () => {
@@ -226,6 +249,7 @@ suite('Ecode Extension Test Suite', () => {
     const hidden = new Map(menus.map(item => [item.command, item.when]));
     for (const command of [
       'ecode.openDiff',
+      'ecode.deleteLifecycleRecord',
       'ecode.publishResourceFolder',
       'ecode.unpublishResourceFolder',
       'ecode.setResourcePreloadOrder',
@@ -277,6 +301,10 @@ suite('Ecode Extension Test Suite', () => {
           'view == ecode.workspace && viewItem == ecode.lifecycle.file.preloaded',
         ],
       ],
+    );
+    assert.strictEqual(
+      menus.find(item => item.command === 'ecode.deleteLifecycleRecords')?.when,
+      'view == ecode.workspace && viewItem == ecode.lifecycleRecordsGroup.active',
     );
   });
 

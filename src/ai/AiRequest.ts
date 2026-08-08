@@ -13,6 +13,7 @@ export const AI_INSPECT_ACTIONS = [
   'getLifecycleState',
   'refreshChanges',
   'listPushRecords',
+  'listLifecycleRecords',
   'listChangeSets',
   'getKnowledge',
 ] as const;
@@ -30,6 +31,7 @@ export const AI_EXECUTE_ACTIONS = [
   'rollbackPushFile',
   'renamePushRecord',
   'deletePushRecord',
+  'deleteLifecycleRecord',
   'revertChange',
   'resolveConflict',
   'createChangeSet',
@@ -50,6 +52,7 @@ export const AI_CONFIRMATION_ACTIONS = [
   'setFolderRelease',
   'rollbackPushFile',
   'deletePushRecord',
+  'deleteLifecycleRecord',
   'revertChange',
   'resolveConflict',
   'applyChangeSet',
@@ -72,6 +75,8 @@ export interface AiInvocation {
   preStateOrder?: string;
   pushRecordId?: string;
   pushRecordIds?: string[];
+  lifecycleRecordId?: string;
+  lifecycleRecordIds?: string[];
   changeSetId?: string;
   name?: string;
   resolution?: ConflictResolution;
@@ -179,6 +184,12 @@ export function parseAiInvocation(value: unknown): AiInvocation {
     case 'deletePushRecord':
       invocation.pushRecordId = requireIdentifier(value.pushRecordId, 'pushRecordId');
       break;
+    case 'deleteLifecycleRecord':
+      invocation.lifecycleRecordId = requireIdentifier(
+        value.lifecycleRecordId,
+        'lifecycleRecordId',
+      );
+      break;
     case 'revertChange':
       invocation.path = parseRemotePath(value.path, 'path');
       break;
@@ -191,7 +202,17 @@ export function parseAiInvocation(value: unknown): AiInvocation {
       );
       break;
     case 'createChangeSet':
-      invocation.pushRecordIds = parseIdentifiers(value.pushRecordIds, 'pushRecordIds');
+      invocation.pushRecordIds = parseOptionalIdentifiers(value.pushRecordIds, 'pushRecordIds');
+      invocation.lifecycleRecordIds = parseOptionalIdentifiers(
+        value.lifecycleRecordIds,
+        'lifecycleRecordIds',
+      );
+      if (
+        invocation.pushRecordIds.length === 0
+        && invocation.lifecycleRecordIds.length === 0
+      ) {
+        throw new Error('AI 请求至少需要一个推送记录或生命周期记录标识');
+      }
       invocation.name = requireString(value.name, 'name', 200);
       break;
     case 'applyChangeSet':
@@ -263,6 +284,12 @@ function parseIdentifiers(value: unknown, field: string): string[] {
     throw new Error(`AI 请求 ${field} 不能重复`);
   }
   return values;
+}
+
+function parseOptionalIdentifiers(value: unknown, field: string): string[] {
+  return value === undefined || (Array.isArray(value) && value.length === 0)
+    ? []
+    : parseIdentifiers(value, field);
 }
 
 function requireIdentifier(value: unknown, field: string, maxLength = 128): string {

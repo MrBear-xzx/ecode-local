@@ -10,6 +10,8 @@ import type {
   ChangeSet,
   ChangeSetFile,
   DeploymentRecord,
+  LifecycleChange,
+  LifecycleChangeRecord,
   PromotionCandidate,
   PushRecord,
   ReleaseArtifact,
@@ -33,24 +35,27 @@ export class PromotionStore {
   ): Promise<ChangeSet> {
     const now = new Date().toISOString();
     const changeSet: ChangeSet = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: `CS-${compactTimestamp(now)}-${randomUUID().slice(0, 8)}`,
       name: name.trim(),
       sourceEnvironmentId,
       createdAt: now,
       updatedAt: now,
       files: {},
+      lifecycleChanges: {},
     };
     await this.writeEntity('change-sets', changeSet.id, changeSet);
     return changeSet;
   }
 
   async getChangeSet(id: string): Promise<ChangeSet | undefined> {
-    return this.readEntity<ChangeSet>('change-sets', id);
+    const stored = await this.readEntity<ChangeSet>('change-sets', id);
+    return stored ? normalizeStoredChangeSet(stored) : undefined;
   }
 
   async listChangeSets(): Promise<ChangeSet[]> {
-    return this.listEntities<ChangeSet>('change-sets');
+    return (await this.listEntities<ChangeSet>('change-sets'))
+      .map(normalizeStoredChangeSet);
   }
 
   async deleteChangeSet(id: string): Promise<void> {
@@ -110,6 +115,73 @@ export class PromotionStore {
       changeSet.files[candidate.path] = file;
     }
     changeSet.updatedAt = new Date().toISOString();
+    validateChangeSet(changeSet);
+    await this.writeEntity('change-sets', changeSet.id, changeSet);
+    return changeSet;
+  }
+
+  async recordLifecycleChange(
+    environmentId: string,
+    change: LifecycleChange,
+  ): Promise<LifecycleChangeRecord> {
+    const now = new Date().toISOString();
+    const record: LifecycleChangeRecord = {
+      schemaVersion: 1,
+      id: `LIFECYCLE-${compactTimestamp(now)}-${randomUUID().slice(0, 8)}`,
+      environmentId,
+      createdAt: now,
+      change: { ...change, verifiedAt: now },
+    };
+    await this.writeEntity('lifecycle-records', record.id, record);
+    return record;
+  }
+
+  async listLifecycleRecords(
+    environmentId?: string,
+  ): Promise<LifecycleChangeRecord[]> {
+    return (await this.listEntities<LifecycleChangeRecord>('lifecycle-records'))
+      .filter(isLifecycleChangeRecord)
+      .filter(record => !environmentId || record.environmentId === environmentId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async deleteLifecycleRecord(id: string): Promise<void> {
+    if (!isEntityId(id)) {
+      throw new Error('生命周期记录标识无效');
+    }
+    try {
+      await fs.unlink(path.join(this.root, 'lifecycle-records', `${id}.json`));
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('生命周期记录不存在或已删除');
+      }
+      throw error;
+    }
+  }
+
+  async recordLifecycleChanges(
+    changeSetId: string,
+    changes: LifecycleChange[],
+  ): Promise<ChangeSet> {
+    const changeSet = await this.getChangeSet(changeSetId);
+    if (!changeSet) {
+      throw new Error('变更集不存在');
+    }
+    const lifecycleChanges = changeSet.lifecycleChanges ?? {};
+    for (const change of changes) {
+      const key = lifecycleChangeKey(change);
+      const existing = lifecycleChanges[key];
+      const folded = foldLifecycleChange(existing, change);
+      if (folded) {
+        lifecycleChanges[key] = folded;
+      } else {
+        delete lifecycleChanges[key];
+      }
+    }
+    changeSet.schemaVersion = 2;
+    changeSet.lifecycleChanges = lifecycleChanges;
+    changeSet.updatedAt = new Date().toISOString();
+    validateChangeSet(changeSet);
     await this.writeEntity('change-sets', changeSet.id, changeSet);
     return changeSet;
   }
@@ -356,6 +428,68 @@ function normalizeStoredPushRecord(record: PushRecord): PushRecord {
       ? storedName.trim()
       : new Date(record.createdAt).toLocaleString(),
   };
+}
+
+function normalizeStoredChangeSet(changeSet: ChangeSet): ChangeSet {
+  return {
+    ...changeSet,
+    lifecycleChanges: changeSet.lifecycleChanges ?? {},
+  };
+}
+
+function lifecycleChangeKey(change: Pick<LifecycleChange, 'kind' | 'path'>): string {
+  return `${change.kind}:${change.path.toLocaleLowerCase('en-US')}`;
+}
+
+function foldLifecycleChange(
+  existing: LifecycleChange | undefined,
+  incoming: LifecycleChange,
+): LifecycleChange | undefined {
+  if (!existing || existing.kind !== incoming.kind) {
+    return incoming;
+  }
+  if (existing.before === incoming.after) {
+    return undefined;
+  }
+  return {
+    ...incoming,
+    before: existing.before,
+  } as LifecycleChange;
+}
+
+function validateChangeSet(changeSet: ChangeSet): void {
+  const deletedPaths = new Set(
+    Object.values(changeSet.files)
+      .filter(file => file.operation === 'delete')
+      .map(file => file.path.toLocaleLowerCase('en-US')),
+  );
+  const invalid = Object.values(changeSet.lifecycleChanges ?? {}).find(change =>
+    change.kind === 'filePreload'
+    && deletedPaths.has(change.path.toLocaleLowerCase('en-US')));
+  if (invalid) {
+    throw new Error(`${invalid.path}: 将被删除的文件不能设置前置状态`);
+  }
+}
+
+function isLifecycleChangeRecord(value: LifecycleChangeRecord): boolean {
+  const change = value?.change;
+  if (
+    value?.schemaVersion !== 1
+    || typeof value.id !== 'string'
+    || typeof value.environmentId !== 'string'
+    || typeof value.createdAt !== 'string'
+    || !change
+    || typeof change.path !== 'string'
+    || typeof change.verifiedAt !== 'string'
+  ) {
+    return false;
+  }
+  if (change.kind === 'preloadOrder') {
+    return typeof change.before === 'string' && typeof change.after === 'string';
+  }
+  return (change.kind === 'filePreload' || change.kind === 'folderRelease')
+    && typeof change.before === 'boolean'
+    && typeof change.after === 'boolean';
 }
 
 function isEntityId(value: string): boolean {

@@ -25,6 +25,7 @@ const ACTIONS = new Set([
   'getLifecycleState',
   'refreshChanges',
   'listPushRecords',
+  'listLifecycleRecords',
   'listChangeSets',
   'getKnowledge',
   'configure',
@@ -39,6 +40,7 @@ const ACTIONS = new Set([
   'rollbackPushFile',
   'renamePushRecord',
   'deletePushRecord',
+  'deleteLifecycleRecord',
   'revertChange',
   'resolveConflict',
   'createChangeSet',
@@ -54,6 +56,7 @@ const CONFIRMATION_ACTIONS = new Set([
   'setFolderRelease',
   'rollbackPushFile',
   'deletePushRecord',
+  'deleteLifecycleRecord',
   'revertChange',
   'resolveConflict',
   'applyChangeSet',
@@ -67,6 +70,7 @@ const OPTION_KEYS = new Map([
   ['--enabled', 'enabled'],
   ['--order', 'preStateOrder'],
   ['--push-record-id', 'pushRecordId'],
+  ['--lifecycle-record-id', 'lifecycleRecordId'],
   ['--change-set-id', 'changeSetId'],
   ['--name', 'name'],
   ['--resolution', 'resolution'],
@@ -193,6 +197,14 @@ function buildInvocation(action, values) {
     case 'deletePushRecord':
       invocation.pushRecordId = one(values, used, 'pushRecordId', '--push-record-id');
       break;
+    case 'deleteLifecycleRecord':
+      invocation.lifecycleRecordId = one(
+        values,
+        used,
+        'lifecycleRecordId',
+        '--lifecycle-record-id',
+      );
+      break;
     case 'revertChange':
       invocation.path = one(values, used, 'path', '--path');
       break;
@@ -201,7 +213,14 @@ function buildInvocation(action, values) {
       invocation.resolution = one(values, used, 'resolution', '--resolution');
       break;
     case 'createChangeSet':
-      invocation.pushRecordIds = many(values, used, 'pushRecordId', '--push-record-id');
+      invocation.pushRecordIds = optionalMany(values, used, 'pushRecordId');
+      invocation.lifecycleRecordIds = optionalMany(values, used, 'lifecycleRecordId');
+      if (invocation.pushRecordIds.length === 0 && invocation.lifecycleRecordIds.length === 0) {
+        throw new CliError(
+          'createChangeSet 至少提供一个 --push-record-id 或 --lifecycle-record-id',
+          64,
+        );
+      }
       invocation.name = one(values, used, 'name', '--name');
       break;
     case 'applyChangeSet':
@@ -251,6 +270,11 @@ function many(values, used, key, option) {
     throw new CliError(`${option} 至少提供一次`, 64);
   }
   return items;
+}
+
+function optionalMany(values, used, key) {
+  used.add(key);
+  return values[key] || [];
 }
 
 function parseBooleanOption(value, option) {
@@ -553,14 +577,15 @@ function helpText() {
     + `  rollbackPushFile --push-record-id <ID> --path <路径>\n`
     + `  renamePushRecord --push-record-id <ID> --name <名称>\n`
     + `  deletePushRecord --push-record-id <ID>\n`
+    + `  deleteLifecycleRecord --lifecycle-record-id <ID>\n`
     + `  revertChange --path <路径>\n`
     + `  resolveConflict --path <路径> --resolution <值>\n`
-    + `  createChangeSet --push-record-id <ID> [--push-record-id <ID> ...] --name <名称>\n`
+    + `  createChangeSet [--push-record-id <ID> ...] [--lifecycle-record-id <ID> ...] --name <名称>\n`
     + `  applyChangeSet|deleteChangeSet --change-set-id <ID>\n\n`
     + `无专用参数的 action：\n  ${[...ACTIONS].filter(action => ![
       'switchEnvironment', 'deleteEnvironment', 'push', 'rollbackPushFile', 'renamePushRecord',
       'setPreload', 'setPreloadOrder', 'setFolderRelease',
-      'deletePushRecord', 'revertChange',
+      'deletePushRecord', 'deleteLifecycleRecord', 'revertChange',
       'resolveConflict', 'createChangeSet', 'applyChangeSet', 'deleteChangeSet',
     ].includes(action)).join('、')}\n`;
 }
