@@ -87,6 +87,17 @@ export function buildSyncPlan(
   }
 
   changes.push(...unsupported);
+  for (const item of changes) {
+    const local = localFiles.get(item.path);
+    const remote = remoteFiles.get(item.path);
+    item.kind = local?.kind
+      ?? (remote?.entry.kind === 'resource' ? 'resource' : undefined)
+      ?? manifest.files[item.path]?.kind
+      ?? item.kind
+      ?? 'text';
+    item.localSize = local?.size;
+    item.remoteSize = remote?.size;
+  }
   const executable = changes.filter(item =>
     item.status === 'remoteAdded'
     || item.status === 'remoteModified'
@@ -123,6 +134,11 @@ export function buildLocalChanges(
     } else if (baseline && local && baseline.baselineHash !== local.hash) {
       changes.push(change(path, 'localModified', local.hash, undefined, baseline.remoteId, baseline.baselineHash));
     }
+  }
+  for (const item of changes) {
+    const local = localFiles.get(item.path);
+    item.kind = local?.kind ?? manifest.files[item.path]?.kind ?? 'text';
+    item.localSize = local?.size;
   }
   return changes;
 }

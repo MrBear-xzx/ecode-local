@@ -31,6 +31,7 @@ import type {
   DeploymentRecord,
   ConnectionProfile,
   EnvironmentProfile,
+  EcodeAppMetadata,
   LifecycleChange,
   LifecycleChangeRecord,
   PromotionCandidate,
@@ -66,6 +67,7 @@ import {
 import {
   BASELINE_SCHEME,
   EMPTY_SCHEME,
+  LOCAL_SCHEME,
   REMOTE_SCHEME,
   VirtualDocumentProvider,
   virtualUri,
@@ -98,6 +100,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const store = new WorkspaceStore(initialWorkspace);
   const auth = new AuthManager(context);
   const service = new EcodeSyncService(store, auth, output);
+  await service.cleanupExpiredStaging();
   const lifecycle = new EcodeLifecycleService(store, auth, output);
   const tree = new EcodeTreeProvider();
   const lifecycleTreeDecorations = new LifecycleTreeDecorationProvider();
@@ -147,6 +150,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.registerTextDocumentContentProvider(
       REMOTE_SCHEME,
       new VirtualDocumentProvider(REMOTE_SCHEME, service),
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      LOCAL_SCHEME,
+      new VirtualDocumentProvider(LOCAL_SCHEME, service),
     ),
     vscode.workspace.registerTextDocumentContentProvider(
       EMPTY_SCHEME,
@@ -950,15 +957,9 @@ class ExtensionController {
     }
     const current = await this.store.getActiveEnvironment();
     const environments = await this.store.getEnvironments();
-    const candidates = environments.filter(environment => environment.id !== current?.id);
+    const candidates = switchEnvironmentCandidates(current?.id, environments);
     if (candidates.length === 0) {
-      const action = await vscode.window.showInformationMessage(
-        'Ecode: 尚未配置其他环境',
-        '新增环境',
-      );
-      if (action === '新增环境') {
-        await this.configure(true);
-      }
+      await this.configure(true);
       return;
     }
     const selected = await vscode.window.showQuickPick(
@@ -1519,8 +1520,24 @@ class ExtensionController {
     }
     const uris = this.promotionDiff.createDiff(
       remotePath,
-      file.baseContent,
-      file.resultContent,
+      file.kind === 'resource'
+        ? promotionResourceSummary(
+            '推送前',
+            remotePath,
+            file.size,
+            file.baseHash,
+            file.operation !== 'add',
+          )
+        : file.baseContent,
+      file.kind === 'resource'
+        ? promotionResourceSummary(
+            '推送后',
+            remotePath,
+            file.size,
+            file.resultHash,
+            file.operation !== 'delete',
+          )
+        : file.resultContent,
     );
     await vscode.commands.executeCommand(
       'vscode.diff',
@@ -1774,8 +1791,11 @@ class ExtensionController {
     );
     const baseline = virtualUri(BASELINE_SCHEME, change.path);
     const remote = virtualUri(REMOTE_SCHEME, change.path);
+    const localSummary = virtualUri(LOCAL_SCHEME, change.path);
     const empty = virtualUri(EMPTY_SCHEME, change.path);
-    const localOrEmpty = fs.existsSync(local.fsPath) ? local : empty;
+    const localOrEmpty = change.kind === 'resource'
+      ? localSummary
+      : fs.existsSync(local.fsPath) ? local : empty;
 
     if (change.status === 'conflict') {
       const comparison = await vscode.window.showQuickPick([
@@ -2719,6 +2739,19 @@ class ExtensionController {
         output.warn(`Unable to read promotion state: ${errorMessage(error)}`);
       }
     }
+    const appMetadataByEnvironment = new Map<string, EcodeAppMetadata[]>();
+    await Promise.all(environments.map(async environment => {
+      try {
+        const sourceRoot = resolveEnvironmentSourceRoot(
+          environment.workspaceFolder,
+          environment.directory,
+        );
+        const snapshot = await this.store.loadAppMetadata(sourceRoot);
+        appMetadataByEnvironment.set(environment.id, snapshot?.apps ?? []);
+      } catch (error: unknown) {
+        output.warn(`Unable to read App metadata for ${environment.name}: ${errorMessage(error)}`);
+      }
+    }));
     const environmentStates: EnvironmentTreeState[] = environments.map(environment => {
       const active = environment.id === activeEnvironment?.id;
       const environmentSourceRoot = resolveEnvironmentSourceRoot(
@@ -2750,6 +2783,7 @@ class ExtensionController {
         lifecycleFresh: hasCurrentLifecycle
           && this.lifecycleSnapshotFresh
           && Boolean(this.lifecycleSnapshot),
+        apps: appMetadataByEnvironment.get(environment.id) ?? [],
       };
     });
     this.tree.update(
@@ -2879,6 +2913,13 @@ export function validateEnvironmentDirectoryInput(
     : undefined;
 }
 
+export function switchEnvironmentCandidates(
+  currentEnvironmentId: string | undefined,
+  environments: EnvironmentProfile[],
+): EnvironmentProfile[] {
+  return environments.filter(environment => environment.id !== currentEnvironmentId);
+}
+
 function showResult(operation: string, result: SyncOperationResult): void {
   const summary = `${operation}完成：${result.pulled} 拉取，${result.pushed} 推送，`
     + `${result.deletedLocal} 个本地删除，${result.deletedRemote} 个远端删除，`
@@ -2985,6 +3026,26 @@ function lifecycleRecordFromCommandArgument(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function promotionResourceSummary(
+  label: string,
+  remotePath: string,
+  size: number | undefined,
+  hash: string | undefined,
+  exists: boolean,
+): string {
+  return [
+    `${label}二进制资源摘要`,
+    '',
+    `路径: ${remotePath}`,
+    `扩展名: ${path.posix.extname(remotePath) || '(无)'}`,
+    `存在: ${exists ? '是' : '否'}`,
+    `大小: ${size === undefined ? '(未知)' : `${size} bytes`}`,
+    `SHA-256: ${hash ?? '(无)'}`,
+    '',
+    '二进制资源不执行文本 Diff。',
+  ].join('\n');
 }
 
 function requireLifecycleTreePath(

@@ -5,9 +5,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { type AddressInfo } from 'net';
 import type { FormMetadataCache } from '../../domain/formMetadata';
-import { hashText } from '../../domain/text';
+import { hashFileBytes, hashText } from '../../domain/text';
 import type {
   ConnectionProfile,
+  AppMetadataSnapshot,
   PromotionCandidate,
   ReleaseArtifact,
   StoredConflict,
@@ -33,6 +34,16 @@ suite('Ecode sync service', () => {
     metadata?: unknown;
   }>;
   let folders: Array<{ id: string; name: string; parentId: string }>;
+  let resources: Array<{
+    id: string;
+    name: string;
+    parentId: string;
+    content: Buffer;
+  }>;
+  let failedResourceUploads: number;
+  let corruptedResourceUploads: number;
+  let createConcurrentResourceOnFailedUpload: boolean;
+  let replaceUploadedResourceBeforeCleanup: boolean;
   let failedUploads: Set<string>;
   let corruptedUploads: Set<string>;
   let ambiguousUploads: Set<string>;
@@ -50,6 +61,11 @@ suite('Ecode sync service', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'ecode-service-'));
     files = [{ id: 'file-1', name: 'a.js', content: 'const remote = true;\n' }];
     folders = [];
+    resources = [];
+    failedResourceUploads = 0;
+    corruptedResourceUploads = 0;
+    createConcurrentResourceOnFailedUpload = false;
+    replaceUploadedResourceBeforeCleanup = false;
     failedUploads = new Set();
     corruptedUploads = new Set();
     ambiguousUploads = new Set();
@@ -65,6 +81,28 @@ suite('Ecode sync service', () => {
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
       const url = new URL(request.url ?? '/', 'http://localhost');
+      if (url.pathname.startsWith('/resource/')) {
+        const resource = resources.find(item => item.id === url.pathname.slice('/resource/'.length));
+        if (!resource) {
+          response.statusCode = 404;
+          response.end();
+          return;
+        }
+        response.setHeader('Content-Type', 'application/octet-stream');
+        response.setHeader('Content-Length', String(resource.content.length));
+        response.end(resource.content);
+        if (replaceUploadedResourceBeforeCleanup && resource.name === 'new.bin') {
+          const index = resources.indexOf(resource);
+          resources.splice(index, 1, {
+            id: 'resource-concurrent-replacement',
+            name: resource.name,
+            parentId: resource.parentId,
+            content: Buffer.from([7, 7, 7]),
+          });
+          replaceUploadedResourceBeforeCleanup = false;
+        }
+        return;
+      }
       if (url.pathname === '/api/ecode/type/tree' && !url.search) {
         rootTreeRequests++;
         if (expiredTreeResponses > 0) {
@@ -79,7 +117,12 @@ suite('Ecode sync service', () => {
         response.end(JSON.stringify({
           status: true,
           data: {
-            typeList: [{ id: 'type-1', name: 'Type', attribute: 'type' }],
+            typeList: [{
+              id: 'type-1',
+              name: 'Type',
+              attribute: 'type',
+              appId: 'app-1',
+            }],
             childFolder: [],
             childFile: [],
           },
@@ -110,6 +153,14 @@ suite('Ecode sync service', () => {
                 name: file.name,
                 attribute: 'file',
               })),
+            resources: resources
+              .filter(resource => resource.parentId === folderId)
+              .map(resource => ({
+                id: resource.id,
+                name: resource.name,
+                attribute: 'resource',
+                route: `/resource/${resource.id}`,
+              })),
           },
         }));
         return;
@@ -137,6 +188,14 @@ suite('Ecode sync service', () => {
                 id: file.id,
                 name: file.name,
                 attribute: 'file',
+              })),
+            resources: resources
+              .filter(resource => resource.parentId === 'type-1')
+              .map(resource => ({
+                id: resource.id,
+                name: resource.name,
+                attribute: 'resource',
+                route: `/resource/${resource.id}`,
               })),
           },
         }));
@@ -211,6 +270,61 @@ suite('Ecode sync service', () => {
             parentId: form.get('parentId') || form.get('typeId') || '',
           });
           response.end(JSON.stringify({ api_status: true, status: true }));
+        });
+        return;
+      }
+      if (
+        url.pathname === '/api/ecode/resource/remove'
+        && request.method === 'POST'
+      ) {
+        void collectRequestBody(request).then(body => {
+          const form = new URLSearchParams(body.toString('utf8'));
+          const index = resources.findIndex(item => item.id === form.get('resourceId'));
+          if (index >= 0) {
+            resources.splice(index, 1);
+          }
+          response.end(JSON.stringify({ status: index >= 0 }));
+        });
+        return;
+      }
+      if (
+        url.pathname === '/api/ecode/resource/upload'
+        && request.method === 'POST'
+      ) {
+        void collectRequestBody(request).then(body => {
+          const contentType = request.headers['content-type'] ?? '';
+          const boundary = /boundary=([^;]+)/.exec(contentType)?.[1] ?? '';
+          const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'));
+          const footer = Buffer.from(`\r\n--${boundary}--`);
+          const footerStart = body.lastIndexOf(footer);
+          const header = body.subarray(0, headerEnd).toString('utf8');
+          const name = /filename="([^"]+)"/.exec(header)?.[1] ?? 'resource.bin';
+          const uploaded = body.subarray(headerEnd + 4, footerStart);
+          if (failedResourceUploads > 0) {
+            failedResourceUploads--;
+            if (createConcurrentResourceOnFailedUpload) {
+              resources.push({
+                id: 'resource-concurrent',
+                name,
+                parentId: url.searchParams.get('folderId') ?? '',
+                content: Buffer.from([7, 7, 7]),
+              });
+            }
+            response.end(JSON.stringify({ status: false, msg: 'upload failed' }));
+            return;
+          }
+          resources.push({
+            id: `resource-${resources.length + 10}`,
+            name,
+            parentId: url.searchParams.get('folderId') ?? '',
+            content: corruptedResourceUploads > 0
+              ? Buffer.concat([uploaded, Buffer.from([0])])
+              : uploaded,
+          });
+          if (corruptedResourceUploads > 0) {
+            corruptedResourceUploads--;
+          }
+          response.end(JSON.stringify({ status: true }));
         });
         return;
       }
@@ -344,6 +458,236 @@ suite('Ecode sync service', () => {
     assert.ok(progress.some(message => message.includes('扫描远端目录')));
     assert.ok(progress.some(message => message.includes('读取远端文件 1/1')));
     assert.ok(progress.some(message => message.includes('扫描本地文件')));
+  });
+
+  test('pulls raw resources and restores the old remote bytes when replacement upload fails', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    const original = Buffer.from([0, 255, 1, 128]);
+    resources = [{
+      id: 'resource-1',
+      name: 'logo.png',
+      parentId: 'resource-folder',
+      content: original,
+    }];
+    const harness = createHarness(root, baseUrl);
+
+    const pull = await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'logo.png');
+    assert.strictEqual(pull.success, true);
+    assert.deepStrictEqual(fs.readFileSync(localPath), original);
+    assert.strictEqual(
+      harness.store.manifest.files['Type/Resources/logo.png'].kind,
+      'resource',
+    );
+
+    fs.writeFileSync(localPath, Buffer.from([9, 8, 7, 6]));
+    failedResourceUploads = 1;
+    const push = await harness.service.pushSelected(
+      ['Type/Resources/logo.png'],
+      () => undefined,
+    );
+
+    assert.strictEqual(push.pushed, 0);
+    assert.strictEqual(push.failed, 1);
+    assert.match(push.errors[0], /旧版本已恢复/);
+    assert.strictEqual(resources.length, 1);
+    assert.strictEqual(resources[0].name, 'logo.png');
+    assert.deepStrictEqual(resources[0].content, original);
+  });
+
+  test('applies a binary resource change set by target path without reusing the source id', async () => {
+    files = [];
+    folders = [{ id: 'target-resource-folder', name: 'Resources', parentId: 'type-1' }];
+    const original = Buffer.from([1, 2, 3, 4]);
+    resources = [{
+      id: 'target-resource-id',
+      name: 'logo.png',
+      parentId: 'target-resource-folder',
+      content: original,
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const replacementPath = path.join(root, 'replacement-object.bin');
+    const replacement = Buffer.from([9, 8, 7, 6, 5]);
+    fs.writeFileSync(replacementPath, replacement);
+    const base = await hashFileBytes(path.join(
+      root,
+      'ecode',
+      'Type',
+      'Resources',
+      'logo.png',
+    ));
+    const result = await hashFileBytes(replacementPath);
+    const artifact: ReleaseArtifact = {
+      path: 'Type/Resources/logo.png',
+      operation: 'modify',
+      kind: 'resource',
+      size: result.size,
+      baseHash: base.hash,
+      resultHash: result.hash,
+      resultResourcePath: replacementPath,
+    };
+
+    const candidates: PromotionCandidate[] = [];
+    const deployed = await harness.service.deployRelease(
+      await harness.store.getProfile(),
+      [artifact],
+      () => undefined,
+      undefined,
+      candidate => candidates.push(candidate),
+    );
+
+    assert.strictEqual(deployed[0].status, 'succeeded');
+    assert.strictEqual(resources.length, 1);
+    assert.notStrictEqual(resources[0].id, 'target-resource-id');
+    assert.deepStrictEqual(resources[0].content, replacement);
+    assert.deepStrictEqual(
+      fs.readFileSync(path.join(root, 'ecode', 'Type', 'Resources', 'logo.png')),
+      replacement,
+    );
+    assert.strictEqual(candidates[0].kind, 'resource');
+    assert.ok(candidates[0].baseResourcePath);
+    assert.ok(fs.existsSync(candidates[0].baseResourcePath!));
+  });
+
+  test('deletes a resource without deleting its resource root', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-1',
+      name: 'obsolete.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1, 0, 2]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    fs.unlinkSync(path.join(root, 'ecode', 'Type', 'Resources', 'obsolete.bin'));
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/obsolete.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.deletedRemote, 1);
+    assert.deepStrictEqual(resources, []);
+    assert.ok(folders.some(folder => folder.id === 'resource-folder'));
+  });
+
+  test('uploads a new resource only inside a known resource root', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const added = Buffer.from([0, 255, 5, 128]);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, added);
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.pushed, 1);
+    assert.deepStrictEqual(
+      resources.find(resource => resource.name === 'new.bin')?.content,
+      added,
+    );
+    assert.strictEqual(harness.store.manifest.files['Type/Resources/new.bin'].kind, 'resource');
+  });
+
+  test('removes a uniquely identified new resource when readback verification fails', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    corruptedResourceUploads = 1;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.match(result.errors[0], /SHA-256/);
+    assert.ok(!resources.some(resource => resource.name === 'new.bin'));
+    assert.ok(!harness.store.manifest.files['Type/Resources/new.bin']);
+  });
+
+  test('does not delete a concurrent same-name resource after an unconfirmed upload failure', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    failedResourceUploads = 1;
+    createConcurrentResourceOnFailedUpload = true;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.deepStrictEqual(
+      resources.find(resource => resource.id === 'resource-concurrent')?.content,
+      Buffer.from([7, 7, 7]),
+    );
+  });
+
+  test('does not delete a same-name resource whose id changed before cleanup', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    corruptedResourceUploads = 1;
+    replaceUploadedResourceBeforeCleanup = true;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.match(result.errors[0], /无法清理远端产物/);
+    assert.deepStrictEqual(
+      resources.find(resource => resource.id === 'resource-concurrent-replacement')?.content,
+      Buffer.from([7, 7, 7]),
+    );
   });
 
   test('batches manifest persistence during a full pull', async () => {
@@ -981,10 +1325,14 @@ suite('Ecode sync service', () => {
     assert.deepStrictEqual(appliedCandidates, [{
       path: 'Type/a.js',
       operation: 'modify',
+      kind: 'text',
+      size: Buffer.byteLength('const remote = true;\n', 'utf8'),
       baseHash: hashText('const remote = true;\n'),
       baseContent: 'const remote = true;\n',
+      baseResourcePath: undefined,
       resultHash: artifact.resultHash,
       resultContent: artifact.resultContent,
+      resultResourcePath: undefined,
     }]);
   });
 
@@ -1583,6 +1931,41 @@ suite('Ecode sync service', () => {
     );
   });
 
+  test('keeps raw resource bytes after resolving a remote deletion conflict locally', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [
+      {
+        id: 'resource-logo',
+        name: 'logo.png',
+        parentId: 'resource-folder',
+        content: Buffer.from([0, 255, 1, 128]),
+      },
+      {
+        id: 'resource-seed',
+        name: 'seed.bin',
+        parentId: 'resource-folder',
+        content: Buffer.from([1]),
+      },
+    ];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'logo.png');
+    const localBytes = Buffer.from([9, 255, 8, 128]);
+    fs.writeFileSync(localPath, localBytes);
+    resources.splice(resources.findIndex(resource => resource.id === 'resource-logo'), 1);
+    await harness.service.pull(() => undefined);
+
+    await harness.service.keepLocalAfterRemoteDeletion('Type/Resources/logo.png');
+
+    assert.deepStrictEqual(fs.readFileSync(localPath), localBytes);
+    assert.ok(!harness.store.manifest.files['Type/Resources/logo.png']);
+    const change = (await harness.service.refreshLocalChanges())
+      .find(item => item.path === 'Type/Resources/logo.png');
+    assert.strictEqual(change?.status, 'localAdded');
+    assert.strictEqual(change?.kind, 'resource');
+  });
+
   test('backs up a modified local file before accepting a remote deletion conflict', async () => {
     const harness = createHarness(root, baseUrl);
     await harness.service.pull(() => undefined);
@@ -1702,6 +2085,14 @@ suite('Ecode sync service', () => {
   });
 });
 
+async function collectRequestBody(request: http.IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 function createHarness(
   workspaceFolder: string,
   serverUrl: string,
@@ -1758,6 +2149,8 @@ class MemoryStore {
   conflicts = new Map<string, StoredConflict>();
   recoveries: Array<{ path: string; content: string }> = [];
   private snapshots = new Map<string, string>();
+  private resourceSnapshots = new Map<string, string>();
+  private appMetadata: AppMetadataSnapshot | undefined;
 
   constructor(private profile: ConnectionProfile) {
     this.manifest = {
@@ -1792,6 +2185,17 @@ class MemoryStore {
     this.manifest = manifest;
   }
 
+  async loadAppMetadata(): Promise<AppMetadataSnapshot | undefined> {
+    return this.appMetadata;
+  }
+
+  async saveRemoteCatalog(
+    _tree: unknown,
+    apps: AppMetadataSnapshot,
+  ): Promise<void> {
+    this.appMetadata = apps;
+  }
+
   async loadFormMetadataCache(
     fingerprint: string,
     syncRoot: string,
@@ -1816,6 +2220,32 @@ class MemoryStore {
 
   async readSnapshot(_syncRoot: string, key: string): Promise<string> {
     return this.snapshots.get(key) ?? '';
+  }
+
+  async saveResourceSnapshot(
+    _syncRoot: string,
+    sourcePath: string,
+    expectedHash?: string,
+  ): Promise<string> {
+    const result = await hashFileBytes(sourcePath);
+    assert.strictEqual(expectedHash ?? result.hash, result.hash);
+    const objectDirectory = path.join(this.profile.workspaceFolder, '.test-resource-objects');
+    fs.mkdirSync(objectDirectory, { recursive: true });
+    const objectPath = path.join(objectDirectory, `${result.hash}.bin`);
+    fs.copyFileSync(sourcePath, objectPath);
+    this.resourceSnapshots.set(result.hash, objectPath);
+    return result.hash;
+  }
+
+  async getSnapshotPath(
+    _syncRoot: string,
+    key: string,
+  ): Promise<string> {
+    const snapshot = this.resourceSnapshots.get(key);
+    if (!snapshot) {
+      throw new Error('resource snapshot missing');
+    }
+    return snapshot;
   }
 
   async saveConflict(_syncRoot: string, conflict: StoredConflict): Promise<void> {
@@ -1844,6 +2274,19 @@ class MemoryStore {
   ): Promise<string> {
     this.recoveries.push({ path: remotePath, content });
     return 'recovery.txt';
+  }
+
+  async saveResourceRecovery(
+    _syncRoot: string,
+    remotePath: string,
+    sourcePath: string,
+  ): Promise<string> {
+    const recoveryDirectory = path.join(this.profile.workspaceFolder, '.test-recovery');
+    fs.mkdirSync(recoveryDirectory, { recursive: true });
+    const recoveryPath = path.join(recoveryDirectory, `${this.recoveries.length}.bin`);
+    fs.copyFileSync(sourcePath, recoveryPath);
+    this.recoveries.push({ path: remotePath, content: recoveryPath });
+    return recoveryPath;
   }
 }
 

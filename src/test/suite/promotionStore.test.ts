@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { hashText } from '../../domain/text';
+import { hashFileBytes, hashText } from '../../domain/text';
 import type { DeploymentRecord } from '../../domain/types';
 import { PromotionStore } from '../../storage/PromotionStore';
 
@@ -88,6 +88,36 @@ suite('Promotion store', () => {
     await store.saveDeployment(record);
 
     assert.deepStrictEqual(await store.listDeployments(), [record]);
+  });
+
+  test('stores and materializes binary resource objects by content hash', async () => {
+    const beforePath = path.join(root, 'before.png');
+    const afterPath = path.join(root, 'after.png');
+    fs.writeFileSync(beforePath, Buffer.from([0, 1, 255, 128]));
+    fs.writeFileSync(afterPath, Buffer.from([0, 2, 254, 129]));
+    const before = await hashFileBytes(beforePath);
+    const after = await hashFileBytes(afterPath);
+    const changeSet = await store.createChangeSet('资源替换', 'environment-a');
+
+    const updated = await store.recordVerifiedCandidates(changeSet.id, [{
+      path: 'App/resources/logo.png',
+      operation: 'modify',
+      kind: 'resource',
+      size: after.size,
+      baseHash: before.hash,
+      baseResourcePath: beforePath,
+      resultHash: after.hash,
+      resultResourcePath: afterPath,
+    }]);
+    const [artifact] = await store.materializeChangeSet(updated);
+
+    assert.strictEqual(updated.schemaVersion, 3);
+    assert.strictEqual(updated.files['App/resources/logo.png'].kind, 'resource');
+    assert.ok(artifact.resultResourcePath);
+    assert.deepStrictEqual(
+      fs.readFileSync(artifact.resultResourcePath!),
+      fs.readFileSync(afterPath),
+    );
   });
 
   test('records and filters verified lifecycle changes', async () => {
@@ -189,10 +219,14 @@ suite('Promotion store', () => {
     assert.deepStrictEqual(await store.materializePushRecord(record), [{
       path: 'Type/a.js',
       operation: 'modify',
+      kind: 'text',
+      size: undefined,
       baseHash: hashText(before),
       baseContent: before,
+      baseResourcePath: undefined,
       resultHash: hashText(after),
       resultContent: after,
+      resultResourcePath: undefined,
     }]);
   });
 

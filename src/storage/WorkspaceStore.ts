@@ -6,9 +6,12 @@ import {
   ECODE_LOCAL_DIRECTORY,
 } from '../domain/constants';
 import type {
+  AppMetadataSnapshot,
   ConnectionProfile,
   EnvironmentConfiguration,
   EnvironmentProfile,
+  FileKind,
+  RemoteTreeSnapshot,
   StoredConflict,
   StoredEnvironmentProfile,
   SyncManifest,
@@ -22,12 +25,18 @@ import {
   resolveEnvironmentSourceRoot,
   validateEnvironmentDirectory,
 } from '../domain/paths';
-import { hashText } from '../domain/text';
-import { writeJsonAtomic, writeTextAtomic } from './AtomicFileStore';
+import { hashFileBytes, hashText } from '../domain/text';
+import {
+  copyFileAtomic,
+  writeJsonAtomic,
+  writeTextAtomic,
+} from './AtomicFileStore';
 
 const MANIFEST_FILE = 'sync-manifest.json';
 const FORM_METADATA_FILE = 'form-metadata.json';
 const LIFECYCLE_SNAPSHOT_FILE = 'lifecycle-snapshot.json';
+const REMOTE_TREE_FILE = 'remote-tree.json';
+const APP_METADATA_FILE = 'app-metadata.json';
 
 export class WorkspaceStore {
   private workspaceFolder: string | undefined;
@@ -199,7 +208,7 @@ export class WorkspaceStore {
   async loadManifest(serverFingerprint: string, syncRoot: string): Promise<SyncManifest> {
     const storageRoot = await this.environmentStorageRoot(syncRoot);
     const empty = (): SyncManifest => ({
-      schemaVersion: 1,
+      schemaVersion: 2,
       serverFingerprint,
       syncRoot,
       updatedAt: new Date(0).toISOString(),
@@ -209,13 +218,23 @@ export class WorkspaceStore {
       const raw = await fs.readFile(path.join(storageRoot, MANIFEST_FILE), 'utf8');
       const parsed = JSON.parse(raw) as SyncManifest;
       if (
-        parsed.schemaVersion !== 1
+        ![1, 2].includes(parsed.schemaVersion)
         || parsed.serverFingerprint !== serverFingerprint
         || path.resolve(parsed.syncRoot) !== path.resolve(syncRoot)
       ) {
         return empty();
       }
-      return parsed;
+      return {
+        ...parsed,
+        schemaVersion: 2,
+        files: Object.fromEntries(Object.entries(parsed.files ?? {}).map(
+          ([remotePath, entry]) => [remotePath, {
+            ...entry,
+            kind: entry.kind === 'resource' ? 'resource' : 'text',
+            size: typeof entry.size === 'number' ? entry.size : 0,
+          }],
+        )),
+      };
     } catch (error: unknown) {
       if (!isFileSystemError(error, 'ENOENT')) {
         throw new Error(`同步清单读取失败: ${errorMessage(error)}`);
@@ -226,6 +245,7 @@ export class WorkspaceStore {
 
   async saveManifest(manifest: SyncManifest): Promise<void> {
     const root = await this.environmentStorageRoot(manifest.syncRoot);
+    manifest.schemaVersion = 2;
     manifest.updatedAt = new Date().toISOString();
     await writeJsonAtomic(path.join(root, MANIFEST_FILE), manifest);
   }
@@ -325,6 +345,36 @@ export class WorkspaceStore {
     return key;
   }
 
+  async saveResourceSnapshot(
+    syncRoot: string,
+    sourcePath: string,
+    expectedHash?: string,
+  ): Promise<string> {
+    const { hash } = await hashFileBytes(sourcePath);
+    if (expectedHash && hash !== expectedHash) {
+      throw new Error('资源快照源文件在保存期间发生变化');
+    }
+    const directory = path.join(
+      await this.environmentStorageRoot(syncRoot),
+      'snapshots',
+    );
+    const file = path.join(directory, `${hash}.bin`);
+    try {
+      await fs.access(file);
+    } catch (error: unknown) {
+      if (!isFileSystemError(error, 'ENOENT')) {
+        throw error;
+      }
+      await copyFileAtomic(file, sourcePath);
+      const copied = await hashFileBytes(file);
+      if (copied.hash !== hash) {
+        await fs.unlink(file);
+        throw new Error('资源快照源文件在复制期间发生变化');
+      }
+    }
+    return hash;
+  }
+
   async readSnapshot(syncRoot: string, key: string): Promise<string> {
     return fs.readFile(
       path.join(await this.environmentStorageRoot(syncRoot), 'snapshots', `${key}.txt`),
@@ -332,10 +382,38 @@ export class WorkspaceStore {
     );
   }
 
+  async getSnapshotPath(
+    syncRoot: string,
+    key: string,
+    kind: FileKind,
+  ): Promise<string> {
+    if (!/^[a-f0-9]{64}$/.test(key)) {
+      throw new Error('同步快照标识无效');
+    }
+    const file = path.join(
+      await this.environmentStorageRoot(syncRoot),
+      'snapshots',
+      `${key}.${kind === 'resource' ? 'bin' : 'txt'}`,
+    );
+    if (kind === 'resource') {
+      const result = await hashFileBytes(file);
+      if (result.hash !== key) {
+        throw new Error('资源同步快照校验失败');
+      }
+    } else if (hashText(await fs.readFile(file, 'utf8')) !== key) {
+      throw new Error('文本同步快照校验失败');
+    }
+    return file;
+  }
+
   async saveConflict(syncRoot: string, conflict: StoredConflict): Promise<void> {
     const directory = path.join(await this.environmentStorageRoot(syncRoot), 'conflicts');
     await fs.mkdir(directory, { recursive: true });
-    await writeJsonAtomic(path.join(directory, `${hashText(conflict.path)}.json`), conflict);
+    await writeJsonAtomic(path.join(directory, `${hashText(conflict.path)}.json`), {
+      ...conflict,
+      schemaVersion: 2,
+      kind: conflict.kind ?? 'text',
+    });
   }
 
   async loadConflict(
@@ -351,7 +429,7 @@ export class WorkspaceStore {
         ),
         'utf8',
       );
-      return JSON.parse(raw) as StoredConflict;
+      return normalizeStoredConflict(JSON.parse(raw) as StoredConflict);
     } catch (error: unknown) {
       if (!isFileSystemError(error, 'ENOENT')) {
         throw error;
@@ -368,9 +446,9 @@ export class WorkspaceStore {
         .filter(name => name.endsWith('.json'))
         .map(async name => {
           try {
-            return JSON.parse(
+            return normalizeStoredConflict(JSON.parse(
               await fs.readFile(path.join(directory, name), 'utf8'),
-            ) as StoredConflict;
+            ) as StoredConflict);
           } catch {
             return undefined;
           }
@@ -420,6 +498,57 @@ export class WorkspaceStore {
           throw error;
         }
       }
+    }
+  }
+
+  async saveResourceRecovery(
+    syncRoot: string,
+    remotePath: string,
+    sourcePath: string,
+  ): Promise<string> {
+    const directory = path.join(await this.environmentStorageRoot(syncRoot), 'recovery');
+    await fs.mkdir(directory, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const baseName = `${stamp}-${hashText(remotePath).slice(0, 12)}`;
+    for (let suffix = 0; ; suffix++) {
+      const file = path.join(
+        directory,
+        `${baseName}${suffix === 0 ? '' : `-${suffix}`}.bin`,
+      );
+      try {
+        await fs.copyFile(sourcePath, file, fs.constants.COPYFILE_EXCL);
+        return file;
+      } catch (error: unknown) {
+        if (!isFileSystemError(error, 'EEXIST')) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  async saveRemoteCatalog(
+    tree: RemoteTreeSnapshot,
+    apps: AppMetadataSnapshot,
+  ): Promise<void> {
+    const root = await this.environmentStorageRoot(tree.syncRoot);
+    await Promise.all([
+      writeJsonAtomic(path.join(root, REMOTE_TREE_FILE), tree),
+      writeJsonAtomic(path.join(root, APP_METADATA_FILE), apps),
+    ]);
+  }
+
+  async loadAppMetadata(syncRoot: string): Promise<AppMetadataSnapshot | undefined> {
+    try {
+      const root = await this.environmentStorageRoot(syncRoot);
+      const value = JSON.parse(
+        await fs.readFile(path.join(root, APP_METADATA_FILE), 'utf8'),
+      ) as AppMetadataSnapshot;
+      return value.schemaVersion === 1 ? value : undefined;
+    } catch (error: unknown) {
+      if (isFileSystemError(error, 'ENOENT')) {
+        return undefined;
+      }
+      throw new Error(`App 元数据读取失败: ${errorMessage(error)}`);
     }
   }
 
@@ -807,4 +936,17 @@ function isFileSystemError(error: unknown, code: string): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeStoredConflict(conflict: StoredConflict): StoredConflict {
+  return {
+    ...conflict,
+    schemaVersion: 2,
+    kind: conflict.kind === 'resource' ? 'resource' : 'text',
+    remoteSize: typeof conflict.remoteSize === 'number'
+      ? conflict.remoteSize
+      : conflict.remoteContent === undefined
+        ? 0
+        : Buffer.byteLength(conflict.remoteContent, 'utf8'),
+  };
 }

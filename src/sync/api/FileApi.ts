@@ -1,3 +1,9 @@
+import { createHash } from 'crypto';
+import { createWriteStream } from 'fs';
+import { mkdir, stat, unlink } from 'fs/promises';
+import * as path from 'path';
+import { once } from 'events';
+import { Readable } from 'stream';
 import { type EcodeApiClient } from './EcodeApiClient';
 import { extractFormMetadata } from './FormMetadataParser';
 import type { FormContext, FormField, FormTable } from '../../domain/formMetadata';
@@ -7,6 +13,16 @@ import type {
   TreeNode,
   TreePayload,
 } from './types';
+import {
+  formatResourceLimit,
+  MAX_RESOURCE_BYTES,
+} from '../../domain/text';
+
+export interface ResourceDownloadResult {
+  sourcePath: string;
+  hash: string;
+  size: number;
+}
 
 export class FileApi {
   constructor(private readonly client: EcodeApiClient) {}
@@ -157,6 +173,106 @@ export class FileApi {
       folderId: remoteId,
     });
   }
+
+  async downloadResource(
+    route: string,
+    targetPath: string,
+  ): Promise<ApiResponse<ResourceDownloadResult>> {
+    let response: Response;
+    try {
+      response = await this.client.getRaw(route);
+    } catch (error: unknown) {
+      return {
+        status: false,
+        msg: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (response.status === 401 || response.status === 302) {
+      return { status: false, msg: 'Session expired', code: 401 };
+    }
+    if (!response.ok || !response.body) {
+      return {
+        status: false,
+        msg: `资源下载失败: HTTP ${response.status}`,
+        code: response.status,
+      };
+    }
+
+    const declaredSize = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredSize) && declaredSize > MAX_RESOURCE_BYTES) {
+      return {
+        status: false,
+        msg: `资源文件超过 ${formatResourceLimit()} 上限`,
+      };
+    }
+
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    const output = createWriteStream(targetPath, { flags: 'wx' });
+    const hash = createHash('sha256');
+    let size = 0;
+    try {
+      await once(output, 'open');
+      const readable = Readable.fromWeb(
+        response.body as unknown as globalThis.ReadableStream<Uint8Array>,
+      );
+      const timeout = setTimeout(() => {
+        readable.destroy(new Error(`请求超时 (${this.client.getTimeoutMs()}ms)`));
+      }, this.client.getTimeoutMs());
+      try {
+        for await (const chunk of readable) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > MAX_RESOURCE_BYTES) {
+            throw new Error(`资源文件超过 ${formatResourceLimit()} 上限`);
+          }
+          hash.update(buffer);
+          if (!output.write(buffer)) {
+            await once(output, 'drain');
+          }
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      output.end();
+      await once(output, 'close');
+      return {
+        status: true,
+        data: { sourcePath: targetPath, hash: hash.digest('hex'), size },
+      };
+    } catch (error: unknown) {
+      output.destroy();
+      try {
+        await unlink(targetPath);
+      } catch {
+        // 下载失败时目标文件可能尚未创建。
+      }
+      return {
+        status: false,
+        msg: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async uploadResource(
+    filePath: string,
+    folderId: string,
+    fileName?: string,
+  ): Promise<ApiResponse<unknown>> {
+    const file = await stat(filePath);
+    if (file.size > MAX_RESOURCE_BYTES) {
+      return { status: false, msg: `资源文件超过 ${formatResourceLimit()} 上限` };
+    }
+    return this.client.postMultipartFile(
+      `/api/ecode/resource/upload?folderId=${encodeURIComponent(folderId)}`,
+      'file',
+      filePath,
+      fileName,
+    );
+  }
+
+  async deleteResource(resourceId: string): Promise<ApiResponse<unknown>> {
+    return this.client.postForm('/api/ecode/resource/remove', { resourceId });
+  }
 }
 
 function encodeContent(content: string): string {
@@ -177,6 +293,7 @@ function extractTreePayload(result: ApiResponse<unknown>): TreePayload {
     typeList: asTreeNodes(data.typeList),
     childFolder: asTreeNodes(data.childFolder),
     childFile: asTreeNodes(data.childFile),
+    resources: asTreeNodes(data.resources),
   };
 }
 
@@ -241,6 +358,13 @@ function asTreeNode(value: unknown): TreeNode | undefined {
         released: optionalBooleanValue(
           firstRecordValue(record, 'released', 'isReleased', 'isRelease'),
         ) ?? (releaseStatus?.toLowerCase() === 'released' ? true : undefined),
+        treeType: firstRecordString(record, 'treeType'),
+        businessType: firstRecordString(record, 'businessType'),
+        initialAppId: firstRecordString(record, 'initialAppId'),
+        route: firstRecordString(record, 'route'),
+        status: releaseStatus,
+        state: firstRecordString(record, 'state'),
+        debugMode: firstRecordString(record, 'debugMode') === 'y' ? 'y' : 'n',
       }
     : undefined;
 }

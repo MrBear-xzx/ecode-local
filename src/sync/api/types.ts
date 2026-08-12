@@ -24,6 +24,13 @@ export interface TreeNode {
   preStateOrder?: string;
   isRootFolder?: boolean;
   released?: boolean;
+  treeType?: string;
+  businessType?: string;
+  initialAppId?: string;
+  route?: string;
+  status?: string;
+  state?: string;
+  debugMode?: 'y' | 'n';
 }
 
 export interface TreePayload {
@@ -31,6 +38,7 @@ export interface TreePayload {
   typeList: TreeNode[];
   childFolder: TreeNode[];
   childFile: TreeNode[];
+  resources: TreeNode[];
 }
 
 export interface FileDetail {

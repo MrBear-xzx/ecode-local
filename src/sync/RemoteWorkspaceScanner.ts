@@ -1,9 +1,15 @@
+import { randomUUID } from 'crypto';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import type * as vscode from 'vscode';
 import { assertNoCaseCollisions, normalizeRemotePath } from '../domain/paths';
-import { hashText, isSupportedText } from '../domain/text';
+import { hashText, isSupportedText, textByteSize } from '../domain/text';
 import type {
+  EcodeAppMetadata,
   RemoteFileContent,
   RemoteFileEntry,
+  RemoteTreeNode,
   SyncChange,
 } from '../domain/types';
 import {
@@ -26,12 +32,19 @@ export interface RemoteScan {
   ambiguousDirectories: Set<string>;
   unsupported: SyncChange[];
   errors: string[];
+  resourceRoots: Set<string>;
+  tree: RemoteTreeNode[];
+  apps: EcodeAppMetadata[];
+  stagingRoot: string;
 }
 
 export interface RemoteDirectoryEntry {
   id: string;
   path: string;
   kind: 'type' | 'folder';
+  attribute?: string;
+  appId?: string;
+  treeNode?: RemoteTreeNode;
 }
 
 export interface RemoteIndex {
@@ -42,9 +55,15 @@ export interface RemoteIndex {
   unsupportedPaths: SyncChange[];
   observedFilePaths: Set<string>;
   preloadedFiles: Map<string, RemoteFileContent>;
+  resourceRoots: Set<string>;
+  tree: RemoteTreeNode[];
+  apps: EcodeAppMetadata[];
 }
 
-interface RemoteTreeTask extends RemoteDirectoryEntry {}
+interface RemoteTreeTask extends RemoteDirectoryEntry {
+  sourceNode: TreeNode;
+  treeNode: RemoteTreeNode;
+}
 
 export class RemoteWorkspaceScanner {
   constructor(private readonly output: vscode.LogOutputChannel) {}
@@ -55,6 +74,7 @@ export class RemoteWorkspaceScanner {
     cancellation?: CancellationLike,
   ): Promise<RemoteScan> {
     const index = await this.listIndex(api, cancellation, onProgress);
+    const stagingRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ecode-resource-scan-'));
     const entries = index.files;
     const unsupported: SyncChange[] = [
       ...index.pathCollisions,
@@ -64,33 +84,40 @@ export class RemoteWorkspaceScanner {
     const total = entries.size;
     let completed = 0;
     onProgress(`正在读取远端文件 0/${total}`);
-    const contents = await mapConcurrent([...entries.values()], 4, async entry => {
-      this.throwIfCancelled(cancellation);
-      try {
-        const preloaded = index.preloadedFiles.get(entry.path);
-        return preloaded?.entry.id === entry.id
-          ? preloaded
-          : await this.readFile(api, entry);
-      } catch (error: unknown) {
-        if (error instanceof SessionExpiredError) {
-          throw error;
-        }
-        if (error instanceof EcodeOperationError && error.code !== undefined) {
-          errors.push(`${entry.path}: ${error.message}`);
+    let contents: Array<RemoteFileContent | undefined>;
+    try {
+      contents = await mapConcurrent([...entries.values()], 4, async entry => {
+        this.throwIfCancelled(cancellation);
+        try {
+          const preloaded = index.preloadedFiles.get(entry.path);
+          return preloaded?.entry.id === entry.id
+            ? preloaded
+            : await this.readFile(api, entry, stagingRoot);
+        } catch (error: unknown) {
+          if (error instanceof SessionExpiredError) {
+            throw error;
+          }
+          if (error instanceof EcodeOperationError && error.code !== undefined) {
+            errors.push(`${entry.path}: ${error.message}`);
+            return undefined;
+          }
+          unsupported.push({
+            path: entry.path,
+            status: 'unsupported',
+            kind: entry.kind === 'resource' ? 'resource' : 'text',
+            remoteId: entry.id,
+            message: errorMessage(error),
+          });
           return undefined;
+        } finally {
+          completed++;
+          onProgress(`正在读取远端文件 ${completed}/${total}: ${entry.path}`);
         }
-        unsupported.push({
-          path: entry.path,
-          status: 'unsupported',
-          remoteId: entry.id,
-          message: errorMessage(error),
-        });
-        return undefined;
-      } finally {
-        completed++;
-        onProgress(`正在读取远端文件 ${completed}/${total}: ${entry.path}`);
-      }
-    });
+      });
+    } catch (error: unknown) {
+      await this.cleanupStaging(stagingRoot);
+      throw error;
+    }
 
     return {
       files: new Map(
@@ -109,7 +136,43 @@ export class RemoteWorkspaceScanner {
       ambiguousDirectories: new Set(index.ambiguousDirectories),
       unsupported,
       errors,
+      resourceRoots: index.resourceRoots,
+      tree: index.tree,
+      apps: index.apps,
+      stagingRoot,
     };
+  }
+
+  async cleanupStaging(stagingRoot: string): Promise<void> {
+    const resolved = path.resolve(stagingRoot);
+    if (!isResourceStagingPath(resolved)) {
+      throw new Error(`拒绝清理未知资源暂存目录: ${stagingRoot}`);
+    }
+    await fs.rm(resolved, { recursive: true, force: true });
+  }
+
+  async cleanupExpiredStaging(maxAgeMs = 24 * 60 * 60 * 1000): Promise<void> {
+    const tempRoot = path.resolve(os.tmpdir());
+    let names: string[];
+    try {
+      names = await fs.readdir(tempRoot);
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - maxAgeMs;
+    await Promise.all(names
+      .filter(isResourceStagingName)
+      .map(async name => {
+        const candidate = path.join(tempRoot, name);
+        try {
+          const stats = await fs.stat(candidate);
+          if (stats.isDirectory() && stats.mtimeMs < cutoff) {
+            await this.cleanupStaging(candidate);
+          }
+        } catch {
+          // 激活清理是尽力而为，单个目录失败不影响扩展启动。
+        }
+      }));
   }
 
   async listIndex(
@@ -137,18 +200,40 @@ export class RemoteWorkspaceScanner {
     const aliasedDirectoryPaths = new Set<string>();
     const traversalCollisions: SyncChange[] = [];
     const unsupportedPaths: SyncChange[] = [];
+    const tree: RemoteTreeNode[] = [];
+    const resourceRoots = new Set<string>();
     let pending: RemoteTreeTask[] = [];
     const system = root.system;
     if (system?.id) {
       const remotePath = normalizeRemoteNodePath(system.name, '分类', unsupportedPaths);
       if (remotePath) {
-        pending.push({ id: system.id, path: remotePath, kind: 'type' });
+        const treeNode = createRemoteTreeNode(system, remotePath);
+        tree.push(treeNode);
+        pending.push({
+          id: system.id,
+          path: remotePath,
+          kind: 'type',
+          attribute: system.attribute,
+          appId: system.appId ?? system.initialAppId,
+          sourceNode: system,
+          treeNode,
+        });
       }
     }
     for (const type of root.typeList) {
       const remotePath = normalizeRemoteNodePath(type.name, '分类', unsupportedPaths);
       if (remotePath) {
-        pending.push({ id: type.id, path: remotePath, kind: 'type' });
+        const treeNode = createRemoteTreeNode(type, remotePath);
+        tree.push(treeNode);
+        pending.push({
+          id: type.id,
+          path: remotePath,
+          kind: 'type',
+          attribute: type.attribute,
+          appId: type.appId ?? type.initialAppId,
+          sourceNode: type,
+          treeNode,
+        });
       }
     }
 
@@ -203,9 +288,28 @@ export class RemoteWorkspaceScanner {
           remoteDirectoryNodeKey(task),
           payload.childFile.length > 0
             || payload.childFolder.length > 0
-            || payload.typeList.length > 0,
+            || payload.typeList.length > 0
+            || payload.resources.length > 0,
         );
-        this.collectFiles(payload.childFile, task.path, entries, unsupportedPaths);
+        this.collectFiles(
+          payload.childFile,
+          task.path,
+          entries,
+          unsupportedPaths,
+          'text',
+          task.treeNode,
+        );
+        this.collectFiles(
+          payload.resources,
+          task.path,
+          entries,
+          unsupportedPaths,
+          'resource',
+          task.treeNode,
+        );
+        if (task.attribute === 'resource' || payload.resources.length > 0) {
+          resourceRoots.add(task.path);
+        }
         completedDirectories++;
         onProgress?.(`正在扫描远端目录：已完成 ${completedDirectories} 个`);
         const childTasks: RemoteTreeTask[] = [];
@@ -216,7 +320,17 @@ export class RemoteWorkspaceScanner {
             unsupportedPaths,
           );
           if (remotePath) {
-            childTasks.push({ id: folder.id, path: remotePath, kind: 'folder' });
+            const treeNode = createRemoteTreeNode(folder, remotePath);
+            task.treeNode.children.push(treeNode);
+            childTasks.push({
+              id: folder.id,
+              path: remotePath,
+              kind: 'folder',
+              attribute: folder.attribute,
+              appId: folder.appId ?? folder.initialAppId,
+              sourceNode: folder,
+              treeNode,
+            });
           }
         }
         for (const type of payload.typeList) {
@@ -226,7 +340,17 @@ export class RemoteWorkspaceScanner {
             unsupportedPaths,
           );
           if (remotePath) {
-            childTasks.push({ id: type.id, path: remotePath, kind: 'type' });
+            const treeNode = createRemoteTreeNode(type, remotePath);
+            task.treeNode.children.push(treeNode);
+            childTasks.push({
+              id: type.id,
+              path: remotePath,
+              kind: 'type',
+              attribute: type.attribute,
+              appId: type.appId ?? type.initialAppId,
+              sourceNode: type,
+              treeNode,
+            });
           }
         }
         return childTasks;
@@ -315,6 +439,17 @@ export class RemoteWorkspaceScanner {
         continue;
       }
 
+      if (uniqueEntries.some(entry => entry.kind === 'resource')) {
+        pathCollisions.push({
+          path: remotePath,
+          status: 'unsupported',
+          kind: 'resource',
+          conflictReason: 'remotePathCollision',
+          message: `远端资源路径存在多个节点，无法安全选择: ${remotePath}`,
+        });
+        continue;
+      }
+
       const inspected = await mapConcurrent(uniqueEntries, 4, async entry => {
         this.throwIfCancelled(cancellation);
         try {
@@ -335,7 +470,10 @@ export class RemoteWorkspaceScanner {
           content: RemoteFileContent;
         } => Boolean(item.content),
       );
-      const populated = readable.filter(item => item.content.content.length > 0);
+      const populated = readable.filter(item =>
+        item.content.entry.kind === 'text'
+        && 'content' in item.content
+        && item.content.content.length > 0);
       if (readable.length === uniqueEntries.length && populated.length === 1) {
         const selected = populated[0];
         resolvedEntries.push(selected.entry);
@@ -410,6 +548,9 @@ export class RemoteWorkspaceScanner {
       unsupportedPaths,
       observedFilePaths,
       preloadedFiles,
+      resourceRoots,
+      tree,
+      apps: collectAppMetadata(tree, resourceRoots),
     };
   }
 
@@ -418,6 +559,8 @@ export class RemoteWorkspaceScanner {
     parentPath: string,
     entries: RemoteFileEntry[],
     unsupported: SyncChange[],
+    kind: 'text' | 'resource',
+    parentTreeNode: RemoteTreeNode,
   ): void {
     for (const node of nodes) {
       const remotePath = normalizeRemoteNodePath(
@@ -432,8 +575,11 @@ export class RemoteWorkspaceScanner {
         id: node.id,
         path: remotePath,
         name: node.name,
-        kind: 'text',
+        kind,
+        route: node.route,
+        parentId: node.parentId,
       });
+      parentTreeNode.children.push(createRemoteTreeNode(node, remotePath));
     }
   }
 
@@ -446,16 +592,50 @@ export class RemoteWorkspaceScanner {
       : api.listTree(directory.id);
   }
 
-  async readFile(api: FileApi, entry: RemoteFileEntry): Promise<RemoteFileContent> {
+  async readFile(
+    api: FileApi,
+    entry: RemoteFileEntry,
+    stagingRoot?: string,
+  ): Promise<RemoteFileContent> {
+    if (entry.kind === 'resource') {
+      if (!entry.route) {
+        throw new Error('远端资源缺少下载地址');
+      }
+      const ownedStagingRoot = stagingRoot
+        ?? await fs.mkdtemp(path.join(os.tmpdir(), 'ecode-resource-single-'));
+      const targetPath = path.join(ownedStagingRoot, `${randomUUID()}.bin`);
+      try {
+        const detail = requireSuccess(
+          await api.downloadResource(entry.route, targetPath),
+          `读取远端资源失败: ${entry.path}`,
+        );
+        return {
+          entry: { ...entry, kind: 'resource' },
+          sourcePath: detail.sourcePath,
+          stagingRoot: ownedStagingRoot,
+          hash: detail.hash,
+          size: detail.size,
+          formMetadataState: 'absent',
+          formContexts: [],
+          formMetadataWarnings: [],
+        };
+      } catch (error: unknown) {
+        if (!stagingRoot) {
+          await this.cleanupStaging(ownedStagingRoot);
+        }
+        throw error;
+      }
+    }
     const response = await api.viewFileDetail(entry.id);
     const detail = requireSuccess(response, `读取远端文件失败: ${entry.path}`);
     if (!isSupportedText(detail.content)) {
       throw new Error('当前版本不支持二进制或非 UTF-8 文件');
     }
     return {
-      entry,
+      entry: { ...entry, kind: 'text' },
       content: detail.content,
       hash: hashText(detail.content),
+      size: textByteSize(detail.content),
       formMetadataState: detail.formMetadataState,
       formContexts: detail.formContexts,
       formMetadataWarnings: detail.formMetadataWarnings,
@@ -467,6 +647,92 @@ export class RemoteWorkspaceScanner {
       throw new SyncCancelledError();
     }
   }
+}
+
+function isResourceStagingName(name: string): boolean {
+  return name.startsWith('ecode-resource-scan-')
+    || name.startsWith('ecode-resource-single-');
+}
+
+function isResourceStagingPath(candidate: string): boolean {
+  const relative = path.relative(path.resolve(os.tmpdir()), candidate);
+  return Boolean(relative)
+    && !path.isAbsolute(relative)
+    && !relative.startsWith(`..${path.sep}`)
+    && !relative.includes(path.sep)
+    && isResourceStagingName(relative);
+}
+
+function createRemoteTreeNode(node: TreeNode, remotePath: string): RemoteTreeNode {
+  return {
+    id: node.id,
+    name: node.name,
+    path: remotePath,
+    treeType: node.treeType,
+    businessType: node.businessType,
+    attribute: node.attribute,
+    parentId: node.parentId,
+    appId: node.appId,
+    initialAppId: node.initialAppId,
+    route: node.route,
+    status: node.status,
+    state: node.state ?? node.preloadState,
+    preStateOrder: node.preStateOrder,
+    debugMode: node.debugMode,
+    hasChild: node.hasChild,
+    children: [],
+  };
+}
+
+function collectAppMetadata(
+  roots: RemoteTreeNode[],
+  resourceRoots: ReadonlySet<string>,
+): EcodeAppMetadata[] {
+  const apps: EcodeAppMetadata[] = [];
+  const visit = (node: RemoteTreeNode): void => {
+    const appId = node.initialAppId ?? node.appId
+      ?? (node.attribute === 'system' ? node.id : undefined);
+    if (appId) {
+      const descendants = flattenTree(node.children);
+      apps.push({
+        appId,
+        nodeId: node.id,
+        path: node.path,
+        status: node.attribute === 'system' ? 'released' : node.status ?? '',
+        preStateOrder: node.preStateOrder ?? '10000',
+        preloadFiles: descendants
+          .filter(item => item.state === 'pre-state' || item.attribute === 'system')
+          .map(item => item.path)
+          .sort(),
+        resourceRoots: [...resourceRoots]
+          .filter(root => root === node.path || root.startsWith(`${node.path}/`))
+          .sort(),
+        resources: descendants
+          .filter(item => Boolean(item.route))
+          .map(item => item.path)
+          .sort(),
+        configs: descendants
+          .filter(item => item.attribute === 'config' || item.attribute === 'non-code')
+          .map(item => item.path)
+          .sort(),
+        debugMode: node.debugMode ?? 'n',
+      });
+    }
+    node.children.forEach(visit);
+  };
+  roots.forEach(visit);
+  return apps.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function flattenTree(nodes: RemoteTreeNode[]): RemoteTreeNode[] {
+  const result: RemoteTreeNode[] = [];
+  const pending = [...nodes];
+  while (pending.length > 0) {
+    const node = pending.shift()!;
+    result.push(node);
+    pending.unshift(...node.children);
+  }
+  return result;
 }
 
 function joinRemote(parent: string, name: string): string {

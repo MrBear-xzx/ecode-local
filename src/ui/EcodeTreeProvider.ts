@@ -10,6 +10,7 @@ import type {
   ChangeSetFile,
   DeploymentRecord,
   EnvironmentProfile,
+  EcodeAppMetadata,
   LifecycleChange,
   LifecycleChangeRecord,
   PushRecord,
@@ -36,6 +37,7 @@ export interface EnvironmentTreeState {
   busyMessage?: string;
   lifecycle?: LifecycleSnapshot;
   lifecycleFresh?: boolean;
+  apps?: EcodeAppMetadata[];
 }
 
 interface LifecycleSourceTreeNode {
@@ -52,6 +54,7 @@ interface LifecycleSourceTreeNode {
   containsUnknownReleaseState?: boolean;
   preloadState?: PreloadState;
   canPreload?: boolean;
+  app?: EcodeAppMetadata;
 }
 
 interface SourceDirectoryTreeNode {
@@ -334,6 +337,11 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
           arguments: [element.localResourceUri],
         };
       }
+      if (element.app) {
+        item.description = element.app.preStateOrder
+          ? `前置 ${element.app.preStateOrder}`
+          : undefined;
+      }
       return item;
     }
 
@@ -502,9 +510,11 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
 
     const sourceChildren: EcodeTreeNode[] = active
       ? state.lifecycle
-        ? buildLifecycleSourceTree(
+          ? buildLifecycleSourceTree(
             state.lifecycle,
             path.resolve(environment.workspaceFolder, environment.directory),
+            state.apps ?? [],
+            state.changes ?? [],
           )
         : [{
             type: 'message',
@@ -601,6 +611,8 @@ export class EcodeTreeProvider implements vscode.TreeDataProvider<EcodeTreeNode>
 function buildLifecycleSourceTree(
   snapshot: LifecycleSnapshot,
   sourceRoot: string,
+  apps: EcodeAppMetadata[],
+  changes: SyncChange[],
 ): LifecycleSourceTreeNode[] {
   const nodes = new Map<string, LifecycleSourceTreeNode>();
   for (const category of snapshot.categories) {
@@ -625,6 +637,27 @@ function buildLifecycleSourceTree(
       canPreload: file.canPreload,
     });
   }
+  for (const app of apps) {
+    for (const resourceRoot of app.resourceRoots) {
+      ensureLifecycleSourceFolders(nodes, resourceRoot, sourceRoot);
+    }
+    for (const resourcePath of app.resources) {
+      ensureLifecycleSourceFile(nodes, resourcePath, sourceRoot);
+    }
+    const node = nodes.get(sourcePathKey(app.path));
+    if (node) {
+      node.app = app;
+    }
+  }
+  const resourceRoots = apps.flatMap(app => app.resourceRoots);
+  for (const change of changes) {
+    if (
+      change.kind === 'resource'
+      && resourceRoots.some(resourceRoot => isPathInside(change.path, resourceRoot))
+    ) {
+      ensureLifecycleSourceFile(nodes, change.path, sourceRoot);
+    }
+  }
 
   const roots: LifecycleSourceTreeNode[] = [];
   for (const node of nodes.values()) {
@@ -643,6 +676,42 @@ function buildLifecycleSourceTree(
     markReleaseDescendants(root);
   }
   return roots;
+}
+
+function ensureLifecycleSourceFile(
+  nodes: Map<string, LifecycleSourceTreeNode>,
+  remotePath: string,
+  sourceRoot: string,
+): void {
+  const parentPath = path.posix.dirname(remotePath);
+  if (parentPath !== '.') {
+    ensureLifecycleSourceFolders(nodes, parentPath, sourceRoot);
+  }
+  const key = sourcePathKey(remotePath);
+  if (!nodes.has(key)) {
+    nodes.set(key, lifecycleSourceNode('file', remotePath, sourceRoot));
+  }
+}
+
+function ensureLifecycleSourceFolders(
+  nodes: Map<string, LifecycleSourceTreeNode>,
+  remotePath: string,
+  sourceRoot: string,
+): void {
+  const segments = remotePath.split('/');
+  for (let index = 1; index <= segments.length; index++) {
+    const folderPath = segments.slice(0, index).join('/');
+    const key = sourcePathKey(folderPath);
+    if (!nodes.has(key)) {
+      nodes.set(key, lifecycleSourceNode('folder', folderPath, sourceRoot));
+    }
+  }
+}
+
+function isPathInside(candidate: string, directory: string): boolean {
+  const candidateKey = sourcePathKey(candidate);
+  const directoryKey = sourcePathKey(directory);
+  return candidateKey === directoryKey || candidateKey.startsWith(`${directoryKey}/`);
 }
 
 function lifecycleSourceNode(
@@ -735,6 +804,19 @@ function markReleaseDescendants(
 }
 
 function lifecycleSourceTooltip(node: LifecycleSourceTreeNode): string {
+  if (node.app) {
+    return [
+      node.remotePath,
+      `App ID: ${node.app.appId}`,
+      `发布状态: ${appReleaseStateLabel(node)}`,
+      `前置顺序: ${node.app.preStateOrder || '未设置'}`,
+      `前置文件: ${node.app.preloadFiles.length}`,
+      `资源目录: ${node.app.resourceRoots.length}`,
+      `资源数量: ${node.app.resources.length}`,
+      `配置数量: ${node.app.configs.length}`,
+      `调试状态: ${node.app.debugMode === 'y' ? '开启' : '关闭'}`,
+    ].join('\n');
+  }
   if (node.kind === 'category') {
     return `${node.remotePath}\nEcode 项目分类\n${
       node.containsReleasedFolder
@@ -756,6 +838,13 @@ function lifecycleSourceTooltip(node: LifecycleSourceTreeNode): string {
   return `${node.remotePath}\n${
     node.preloadState === 'preloaded' ? 'Ecode 前置加载文件' : 'Ecode 源码文件'
   }`;
+}
+
+function appReleaseStateLabel(node: LifecycleSourceTreeNode): string {
+  if (node.kind === 'folder' && node.rootFolder && node.released !== undefined) {
+    return node.released ? '已发布' : '未发布';
+  }
+  return node.app?.status === 'released' ? '已发布' : '未知';
 }
 
 function releaseStateLabel(released: boolean | undefined): string {

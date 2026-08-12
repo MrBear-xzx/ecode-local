@@ -1,8 +1,15 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { assertNoCaseCollisions } from '../domain/paths';
-import { hashText, isSupportedText } from '../domain/text';
-import type { LocalFileState, SyncChange } from '../domain/types';
+import {
+  formatResourceLimit,
+  hashFileBytes,
+  hashText,
+  isSupportedText,
+  MAX_RESOURCE_BYTES,
+  textByteSize,
+} from '../domain/text';
+import type { FileKind, LocalFileState, SyncChange } from '../domain/types';
 
 export interface LocalScan {
   files: Map<string, LocalFileState>;
@@ -18,7 +25,10 @@ interface LocalFileEntry {
 export class LocalWorkspaceScanner {
   constructor(private readonly readConcurrency = 8) {}
 
-  async scan(syncRoot: string): Promise<LocalScan> {
+  async scan(
+    syncRoot: string,
+    resourceRoots: ReadonlySet<string> = new Set(),
+  ): Promise<LocalScan> {
     const files = new Map<string, LocalFileState>();
     const directories = new Set<string>();
     const unsupported: SyncChange[] = [];
@@ -53,7 +63,11 @@ export class LocalWorkspaceScanner {
     const scanned = await mapConcurrent(
       discoveredFiles,
       this.readConcurrency,
-      entry => this.readDiscoveredFile(entry, unsupported),
+      entry => this.readDiscoveredFile(
+        entry,
+        unsupported,
+        isResourcePath(entry.relative, resourceRoots),
+      ),
     );
     for (const file of scanned) {
       if (file) {
@@ -69,18 +83,39 @@ export class LocalWorkspaceScanner {
   async readFileIfExists(
     localPath: string,
     remotePath: string,
+    kind: FileKind = 'text',
   ): Promise<LocalFileState | undefined> {
     try {
       const stat = await fs.lstat(localPath);
       if (stat.isSymbolicLink()) {
         throw new Error(`同步路径包含符号链接: ${localPath}`);
       }
+      if (kind === 'resource') {
+        const stat = await fs.stat(localPath);
+        if (stat.size > MAX_RESOURCE_BYTES) {
+          throw new Error(`资源文件超过 ${formatResourceLimit()} 上限: ${remotePath}`);
+        }
+        const result = await hashFileBytes(localPath);
+        return {
+          path: remotePath,
+          kind: 'resource',
+          sourcePath: localPath,
+          hash: result.hash,
+          size: result.size,
+        };
+      }
       const buffer = await fs.readFile(localPath);
       const content = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
       if (!isSupportedText(content)) {
         throw new Error(`当前版本不支持非文本本地文件: ${remotePath}`);
       }
-      return { path: remotePath, content, hash: hashText(content) };
+      return {
+        path: remotePath,
+        kind: 'text',
+        content,
+        hash: hashText(content),
+        size: textByteSize(content),
+      };
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return undefined;
@@ -92,7 +127,29 @@ export class LocalWorkspaceScanner {
   private async readDiscoveredFile(
     entry: LocalFileEntry,
     unsupported: SyncChange[],
+    resource: boolean,
   ): Promise<LocalFileState | undefined> {
+    if (resource) {
+      const stat = await fs.stat(entry.absolute);
+      if (stat.size > MAX_RESOURCE_BYTES) {
+        unsupported.push({
+          path: entry.relative,
+          status: 'unsupported',
+          kind: 'resource',
+          localSize: stat.size,
+          message: `资源文件超过 ${formatResourceLimit()} 上限`,
+        });
+        return undefined;
+      }
+      const result = await hashFileBytes(entry.absolute);
+      return {
+        path: entry.relative,
+        kind: 'resource',
+        sourcePath: entry.absolute,
+        hash: result.hash,
+        size: result.size,
+      };
+    }
     const buffer = await fs.readFile(entry.absolute);
     let content: string;
     try {
@@ -115,10 +172,24 @@ export class LocalWorkspaceScanner {
     }
     return {
       path: entry.relative,
+      kind: 'text',
       content,
       hash: hashText(content),
+      size: textByteSize(content),
     };
   }
+}
+
+function isResourcePath(
+  remotePath: string,
+  resourceRoots: ReadonlySet<string>,
+): boolean {
+  for (const root of resourceRoots) {
+    if (remotePath === root || remotePath.startsWith(`${root}/`)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function mapConcurrent<T, R>(

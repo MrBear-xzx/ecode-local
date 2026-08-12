@@ -6,6 +6,7 @@ import {
   countChanges,
   isPushableChange,
   lifecycleMutationInvocationResult,
+  switchEnvironmentCandidates,
   validateEnvironmentDirectoryInput,
   validateEnvironmentName,
   visibleAiChanges,
@@ -200,6 +201,31 @@ suite('Ecode Extension Test Suite', () => {
     assert.strictEqual(
       validateEnvironmentDirectoryInput('dev_env', environments, environments[0]),
       undefined,
+    );
+  });
+
+  test('switch environment falls back to add when no alternative exists', () => {
+    const current: EnvironmentProfile = {
+      version: 2,
+      id: 'current',
+      name: '当前环境',
+      directory: 'current_env',
+      workspaceFolder: 'D:\\workspace\\project',
+      serverUrl: 'https://current.example.com',
+      username: 'current',
+    };
+    const other: EnvironmentProfile = {
+      ...current,
+      id: 'other',
+      name: '其他环境',
+      directory: 'other_env',
+    };
+
+    assert.deepStrictEqual(switchEnvironmentCandidates(undefined, []), []);
+    assert.deepStrictEqual(switchEnvironmentCandidates(current.id, [current]), []);
+    assert.deepStrictEqual(
+      switchEnvironmentCandidates(current.id, [current, other]),
+      [other],
     );
   });
 
