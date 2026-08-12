@@ -105,6 +105,11 @@ suite('File API', () => {
         response.end();
       } else if (request.url === '/slow') {
         setTimeout(() => response.end(JSON.stringify({ status: true })), 100);
+      } else if (request.url === '/resource/stalled.bin') {
+        response.setHeader('Content-Type', 'application/octet-stream');
+        response.flushHeaders();
+        response.write(Buffer.from([1]));
+        setTimeout(() => response.end(Buffer.from([2])), 200);
       } else if (request.url === '/expired') {
         response.end(JSON.stringify({
           status: false,
@@ -344,6 +349,17 @@ suite('File API', () => {
       client.getRaw('https://example.com/resource.bin'),
       /不同源/,
     );
+  });
+
+  test('times out when a resource response body stops transferring', async () => {
+    const target = path.join(root, 'stalled.bin');
+    const api = new FileApi(new EcodeApiClient(baseUrl, 25));
+
+    const result = await api.downloadResource('/resource/stalled.bin', target);
+
+    assert.strictEqual(result.status, false);
+    assert.match(result.msg ?? '', /超时/);
+    await assert.rejects(fs.stat(target), /ENOENT/);
   });
 
   test('uploads a streamed multipart resource with its remote name and deletes by id', async () => {

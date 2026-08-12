@@ -1512,14 +1512,18 @@ export class EcodeSyncService {
 
   async keepLocalAfterRemoteDeletion(remotePath: string): Promise<void> {
     const context = await this.loadContext();
-    await this.requireRemoteDeletionConflict(
+    const conflict = await this.requireRemoteDeletionConflict(
       context.profile,
       context.syncRoot,
       remotePath,
     );
     const localPath = resolveSafeLocalPath(context.syncRoot, remotePath);
     assertNoSymlinkSegments(context.syncRoot, localPath);
-    if (!await this.localScanner.readFileIfExists(localPath, remotePath)) {
+    if (!await this.localScanner.readFileIfExists(
+      localPath,
+      remotePath,
+      conflict.kind ?? context.manifest.files[remotePath]?.kind ?? 'text',
+    )) {
       throw new Error('本地文件已不存在，无法保留并重新创建远端文件');
     }
     delete context.manifest.files[remotePath];
@@ -2201,6 +2205,8 @@ export class EcodeSyncService {
 
     this.throwIfCancelled(cancellation);
     let destructive = false;
+    let uploadConfirmed = false;
+    let uploadedResourceId: string | undefined;
     try {
       if (status === 'localModified') {
         const deletion = await api.deleteResource(existing!.id);
@@ -2218,14 +2224,16 @@ export class EcodeSyncService {
         destructive = true;
         existing = undefined;
       }
+      const upload = await api.uploadResource(
+        localFile.sourcePath,
+        parent.id,
+        path.posix.basename(remotePath),
+      );
       this.requireMutationSuccess(
-        await api.uploadResource(
-          localFile.sourcePath,
-          parent.id,
-          path.posix.basename(remotePath),
-        ),
+        upload,
         `上传资源失败: ${remotePath}`,
       );
+      uploadConfirmed = true;
       const uploadedEntry = await this.findRemoteFileInDirectory(
         api,
         parent,
@@ -2236,6 +2244,7 @@ export class EcodeSyncService {
       if (!uploadedEntry) {
         throw new Error('上传后无法在资源目录中找到该文件');
       }
+      uploadedResourceId = uploadedEntry.id;
       const verified = await this.remoteScanner.readFile(api, uploadedEntry);
       try {
         if (verified.hash !== localFile.hash || verified.size !== localFile.size) {
@@ -2249,6 +2258,42 @@ export class EcodeSyncService {
         await this.cleanupRemoteStaging(verified);
       }
     } catch (error: unknown) {
+      if (status === 'localAdded' && uploadConfirmed) {
+        try {
+          const failedEntry = await this.findRemoteFileInDirectory(
+            api,
+            parent,
+            path.posix.basename(remotePath),
+            remotePath,
+            'resource',
+          );
+          if (failedEntry) {
+            if (!uploadedResourceId || failedEntry.id !== uploadedResourceId) {
+              throw new Error('同名资源标识已变化，无法确认它属于本次上传');
+            }
+            this.requireMutationSuccess(
+              await api.deleteResource(failedEntry.id),
+              `清理失败资源产物失败: ${remotePath}`,
+            );
+            const remaining = await this.findRemoteFileInDirectory(
+              api,
+              parent,
+              path.posix.basename(remotePath),
+              remotePath,
+              'resource',
+            );
+            if (remaining) {
+              throw new Error('清理后失败资源产物仍然存在');
+            }
+          }
+        } catch (cleanupError: unknown) {
+          throw new Error(
+            `资源新增失败且无法清理远端产物: ${errorMessage(error)}；`
+            + `清理错误: ${errorMessage(cleanupError)}；请人工检查远端资源目录`,
+          );
+        }
+        throw error;
+      }
       if (!destructive || !restoreSnapshot) {
         throw error;
       }
@@ -2261,6 +2306,9 @@ export class EcodeSyncService {
           'resource',
         );
         if (failedEntry) {
+          if (!uploadedResourceId || failedEntry.id !== uploadedResourceId) {
+            throw new Error('同名资源标识已变化，无法安全清理并恢复旧版本');
+          }
           this.requireMutationSuccess(
             await api.deleteResource(failedEntry.id),
             `清理失败资源产物失败: ${remotePath}`,

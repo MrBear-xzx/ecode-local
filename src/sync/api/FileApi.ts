@@ -215,16 +215,23 @@ export class FileApi {
       const readable = Readable.fromWeb(
         response.body as unknown as globalThis.ReadableStream<Uint8Array>,
       );
-      for await (const chunk of readable) {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        size += buffer.length;
-        if (size > MAX_RESOURCE_BYTES) {
-          throw new Error(`资源文件超过 ${formatResourceLimit()} 上限`);
+      const timeout = setTimeout(() => {
+        readable.destroy(new Error(`请求超时 (${this.client.getTimeoutMs()}ms)`));
+      }, this.client.getTimeoutMs());
+      try {
+        for await (const chunk of readable) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > MAX_RESOURCE_BYTES) {
+            throw new Error(`资源文件超过 ${formatResourceLimit()} 上限`);
+          }
+          hash.update(buffer);
+          if (!output.write(buffer)) {
+            await once(output, 'drain');
+          }
         }
-        hash.update(buffer);
-        if (!output.write(buffer)) {
-          await once(output, 'drain');
-        }
+      } finally {
+        clearTimeout(timeout);
       }
       output.end();
       await once(output, 'close');

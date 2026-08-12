@@ -24,6 +24,10 @@ export class EcodeApiClient {
     return this.baseUrl;
   }
 
+  getTimeoutMs(): number {
+    return this.timeoutMs;
+  }
+
   buildUrl(requestPath: string): string {
     return `${this.baseUrl.replace(/\/+$/, '')}/${requestPath.replace(/^\/+/, '')}`;
   }
@@ -160,6 +164,13 @@ export class EcodeApiClient {
         redirect: 'manual',
         signal: controller.signal,
       });
+    } catch (error: unknown) {
+      if (controller.signal.aborted) {
+        const timeoutError = new Error(`请求超时 (${this.timeoutMs}ms)`);
+        timeoutError.name = 'AbortError';
+        throw timeoutError;
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }

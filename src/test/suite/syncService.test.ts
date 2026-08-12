@@ -41,6 +41,9 @@ suite('Ecode sync service', () => {
     content: Buffer;
   }>;
   let failedResourceUploads: number;
+  let corruptedResourceUploads: number;
+  let createConcurrentResourceOnFailedUpload: boolean;
+  let replaceUploadedResourceBeforeCleanup: boolean;
   let failedUploads: Set<string>;
   let corruptedUploads: Set<string>;
   let ambiguousUploads: Set<string>;
@@ -60,6 +63,9 @@ suite('Ecode sync service', () => {
     folders = [];
     resources = [];
     failedResourceUploads = 0;
+    corruptedResourceUploads = 0;
+    createConcurrentResourceOnFailedUpload = false;
+    replaceUploadedResourceBeforeCleanup = false;
     failedUploads = new Set();
     corruptedUploads = new Set();
     ambiguousUploads = new Set();
@@ -85,6 +91,16 @@ suite('Ecode sync service', () => {
         response.setHeader('Content-Type', 'application/octet-stream');
         response.setHeader('Content-Length', String(resource.content.length));
         response.end(resource.content);
+        if (replaceUploadedResourceBeforeCleanup && resource.name === 'new.bin') {
+          const index = resources.indexOf(resource);
+          resources.splice(index, 1, {
+            id: 'resource-concurrent-replacement',
+            name: resource.name,
+            parentId: resource.parentId,
+            content: Buffer.from([7, 7, 7]),
+          });
+          replaceUploadedResourceBeforeCleanup = false;
+        }
         return;
       }
       if (url.pathname === '/api/ecode/type/tree' && !url.search) {
@@ -276,11 +292,6 @@ suite('Ecode sync service', () => {
         && request.method === 'POST'
       ) {
         void collectRequestBody(request).then(body => {
-          if (failedResourceUploads > 0) {
-            failedResourceUploads--;
-            response.end(JSON.stringify({ status: false, msg: 'upload failed' }));
-            return;
-          }
           const contentType = request.headers['content-type'] ?? '';
           const boundary = /boundary=([^;]+)/.exec(contentType)?.[1] ?? '';
           const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'));
@@ -288,12 +299,31 @@ suite('Ecode sync service', () => {
           const footerStart = body.lastIndexOf(footer);
           const header = body.subarray(0, headerEnd).toString('utf8');
           const name = /filename="([^"]+)"/.exec(header)?.[1] ?? 'resource.bin';
+          const uploaded = body.subarray(headerEnd + 4, footerStart);
+          if (failedResourceUploads > 0) {
+            failedResourceUploads--;
+            if (createConcurrentResourceOnFailedUpload) {
+              resources.push({
+                id: 'resource-concurrent',
+                name,
+                parentId: url.searchParams.get('folderId') ?? '',
+                content: Buffer.from([7, 7, 7]),
+              });
+            }
+            response.end(JSON.stringify({ status: false, msg: 'upload failed' }));
+            return;
+          }
           resources.push({
             id: `resource-${resources.length + 10}`,
             name,
             parentId: url.searchParams.get('folderId') ?? '',
-            content: body.subarray(headerEnd + 4, footerStart),
+            content: corruptedResourceUploads > 0
+              ? Buffer.concat([uploaded, Buffer.from([0])])
+              : uploaded,
           });
+          if (corruptedResourceUploads > 0) {
+            corruptedResourceUploads--;
+          }
           response.end(JSON.stringify({ status: true }));
         });
         return;
@@ -572,6 +602,92 @@ suite('Ecode sync service', () => {
       added,
     );
     assert.strictEqual(harness.store.manifest.files['Type/Resources/new.bin'].kind, 'resource');
+  });
+
+  test('removes a uniquely identified new resource when readback verification fails', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    corruptedResourceUploads = 1;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.match(result.errors[0], /SHA-256/);
+    assert.ok(!resources.some(resource => resource.name === 'new.bin'));
+    assert.ok(!harness.store.manifest.files['Type/Resources/new.bin']);
+  });
+
+  test('does not delete a concurrent same-name resource after an unconfirmed upload failure', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    failedResourceUploads = 1;
+    createConcurrentResourceOnFailedUpload = true;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.deepStrictEqual(
+      resources.find(resource => resource.id === 'resource-concurrent')?.content,
+      Buffer.from([7, 7, 7]),
+    );
+  });
+
+  test('does not delete a same-name resource whose id changed before cleanup', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [{
+      id: 'resource-seed',
+      name: 'seed.bin',
+      parentId: 'resource-folder',
+      content: Buffer.from([1]),
+    }];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'new.bin');
+    fs.writeFileSync(localPath, Buffer.from([0, 255, 5, 128]));
+    corruptedResourceUploads = 1;
+    replaceUploadedResourceBeforeCleanup = true;
+
+    const result = await harness.service.pushSelected(
+      ['Type/Resources/new.bin'],
+      () => undefined,
+    );
+
+    assert.strictEqual(result.pushed, 0);
+    assert.strictEqual(result.failed, 1);
+    assert.match(result.errors[0], /无法清理远端产物/);
+    assert.deepStrictEqual(
+      resources.find(resource => resource.id === 'resource-concurrent-replacement')?.content,
+      Buffer.from([7, 7, 7]),
+    );
   });
 
   test('batches manifest persistence during a full pull', async () => {
@@ -1813,6 +1929,41 @@ suite('Ecode sync service', () => {
       (await harness.service.refreshLocalChanges())[0]?.status,
       'localAdded',
     );
+  });
+
+  test('keeps raw resource bytes after resolving a remote deletion conflict locally', async () => {
+    files = [];
+    folders = [{ id: 'resource-folder', name: 'Resources', parentId: 'type-1' }];
+    resources = [
+      {
+        id: 'resource-logo',
+        name: 'logo.png',
+        parentId: 'resource-folder',
+        content: Buffer.from([0, 255, 1, 128]),
+      },
+      {
+        id: 'resource-seed',
+        name: 'seed.bin',
+        parentId: 'resource-folder',
+        content: Buffer.from([1]),
+      },
+    ];
+    const harness = createHarness(root, baseUrl);
+    await harness.service.pull(() => undefined);
+    const localPath = path.join(root, 'ecode', 'Type', 'Resources', 'logo.png');
+    const localBytes = Buffer.from([9, 255, 8, 128]);
+    fs.writeFileSync(localPath, localBytes);
+    resources.splice(resources.findIndex(resource => resource.id === 'resource-logo'), 1);
+    await harness.service.pull(() => undefined);
+
+    await harness.service.keepLocalAfterRemoteDeletion('Type/Resources/logo.png');
+
+    assert.deepStrictEqual(fs.readFileSync(localPath), localBytes);
+    assert.ok(!harness.store.manifest.files['Type/Resources/logo.png']);
+    const change = (await harness.service.refreshLocalChanges())
+      .find(item => item.path === 'Type/Resources/logo.png');
+    assert.strictEqual(change?.status, 'localAdded');
+    assert.strictEqual(change?.kind, 'resource');
   });
 
   test('backs up a modified local file before accepting a remote deletion conflict', async () => {
