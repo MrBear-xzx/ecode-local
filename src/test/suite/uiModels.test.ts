@@ -12,6 +12,7 @@ import { EcodeTreeProvider } from '../../ui/EcodeTreeProvider';
 import { PromotionDiffProvider } from '../../ui/PromotionDiffProvider';
 import {
   BASELINE_SCHEME,
+  LOCAL_SCHEME,
   REMOTE_SCHEME,
   VirtualDocumentProvider,
   virtualUri,
@@ -231,7 +232,7 @@ suite('Ecode UI models', () => {
     assert.strictEqual(lifecycleGroup?.contextValue, 'ecode.lifecycleRecordsGroup');
   });
 
-  test('uses native source icons except for publishable release packages', () => {
+  test('uses native source icons and includes remote and locally added resources', () => {
     const provider = new EcodeTreeProvider();
     const environment: EnvironmentProfile = {
       version: 2,
@@ -246,12 +247,54 @@ suite('Ecode UI models', () => {
       environment,
       active: true,
       lifecycleFresh: true,
+      changes: [{
+        path: 'Type/Released/resources/test.png',
+        status: 'localAdded',
+        kind: 'resource',
+        localHash: 'local-resource-hash',
+        localSize: 8,
+      }],
+      apps: [{
+        appId: 'app-42',
+        nodeId: 'released',
+        path: 'Type/Released',
+        status: 'released',
+        preStateOrder: '10000',
+        preloadFiles: ['Type/Released/app.js'],
+        resourceRoots: ['Type/Released/resources'],
+        resources: ['Type/Released/resources/logo.png'],
+        configs: [],
+        debugMode: 'n',
+      }, {
+        appId: 'app-unreleased',
+        nodeId: 'plain',
+        path: 'Type/Plain',
+        status: '',
+        preStateOrder: '10000',
+        preloadFiles: [],
+        resourceRoots: [],
+        resources: [],
+        configs: [],
+        debugMode: 'n',
+      }, {
+        appId: 'system-app',
+        nodeId: 'system',
+        path: 'System',
+        status: 'released',
+        preStateOrder: '10000',
+        preloadFiles: [],
+        resourceRoots: [],
+        resources: [],
+        configs: [],
+        debugMode: 'n',
+      }],
       lifecycle: {
         capabilities: { systemInfo: true, releaseList: true },
         categories: [
           { id: 'type', path: 'Type' },
           { id: 'pending', path: 'Pending' },
           { id: 'empty', path: 'Unused' },
+          { id: 'system', path: 'System' },
         ],
         folders: [{
           id: 'released',
@@ -315,9 +358,12 @@ suite('Ecode UI models', () => {
       provider.getTreeItem(node).label === 'Unused');
     const pendingCategory = sourceNodes.find(node =>
       provider.getTreeItem(node).label === 'Pending');
+    const systemCategory = sourceNodes.find(node =>
+      provider.getTreeItem(node).label === 'System');
     assert.ok(category);
     assert.ok(emptyCategory);
     assert.ok(pendingCategory);
+    assert.ok(systemCategory);
     const categoryItem = provider.getTreeItem(category);
     const emptyCategoryItem = provider.getTreeItem(emptyCategory);
     const pendingCategoryItem = provider.getTreeItem(pendingCategory);
@@ -343,6 +389,13 @@ suite('Ecode UI models', () => {
       provider.getTreeItem(node).label === 'postloaded.js')!);
     const unknownFileItem = provider.getTreeItem(releasedChildren.find(node =>
       provider.getTreeItem(node).label === 'unknown.js')!);
+    const resources = releasedChildren.find(node =>
+      provider.getTreeItem(node).label === 'resources');
+    assert.ok(resources);
+    const resourceItems = provider.getChildren(resources)
+      .map(node => provider.getTreeItem(node));
+    const remoteResourceItem = resourceItems.find(item => item.label === 'logo.png');
+    const localResourceItem = resourceItems.find(item => item.label === 'test.png');
 
     assert.strictEqual(themeIconId(categoryItem), 'folder-library');
     assert.strictEqual(themeIconColor(categoryItem), 'charts.blue');
@@ -359,12 +412,19 @@ suite('Ecode UI models', () => {
     assert.strictEqual(themeIconId(releasedItem), 'package');
     assert.strictEqual(themeIconColor(releasedItem), 'charts.green');
     assert.strictEqual(releasedItem.contextValue, 'ecode.lifecycle.folder.released');
-    assert.strictEqual(releasedItem.description, '已发布 · 10000');
-    assert.match(String(releasedItem.tooltip), /前置加载顺序: 10000/);
+    assert.strictEqual(
+      releasedItem.description,
+      '前置 10000',
+    );
+    assert.match(String(releasedItem.tooltip), /App ID: app-42/);
+    assert.match(String(releasedItem.tooltip), /发布状态: 已发布/);
+    assert.match(String(releasedItem.tooltip), /资源数量: 1/);
     assert.strictEqual(themeIconId(plainItem), 'package');
     assert.strictEqual(themeIconColor(plainItem), 'disabledForeground');
     assert.strictEqual(plainItem.contextValue, 'ecode.lifecycle.folder.unreleased');
-    assert.strictEqual(plainItem.description, '未发布 · 10000');
+    assert.strictEqual(plainItem.description, '前置 10000');
+    assert.match(String(plainItem.tooltip), /发布状态: 未发布/);
+    assert.match(String(provider.getTreeItem(systemCategory).tooltip), /发布状态: 已发布/);
     assert.strictEqual(themeIconId(unknownReleaseItem), 'package');
     assert.strictEqual(themeIconColor(unknownReleaseItem), 'disabledForeground');
     assert.strictEqual(unknownReleaseItem.contextValue, 'ecode.lifecycle.folder.unknown');
@@ -399,6 +459,8 @@ suite('Ecode UI models', () => {
     assert.strictEqual(unknownFileItem.contextValue, 'ecode.lifecycle.file');
     assert.strictEqual(fileItem.command?.command, 'vscode.open');
     assert.strictEqual((fileItem.command?.arguments?.[0] as vscode.Uri).scheme, 'file');
+    assert.strictEqual(remoteResourceItem?.command?.command, 'vscode.open');
+    assert.strictEqual(localResourceItem?.command?.command, 'vscode.open');
   });
 
   test('renders a cached source tree immediately and schedules one live refresh', () => {
@@ -455,10 +517,12 @@ suite('Ecode UI models', () => {
     const service = {
       getBaselineContent: async (remotePath: string) => `baseline:${remotePath}`,
       getLatestRemoteContent: async (remotePath: string) => `remote:${remotePath}`,
+      getLocalContent: async (remotePath: string) => `local:${remotePath}`,
     } as EcodeSyncService;
     const remotePath = 'Type/含空格/a.js';
     const baseline = new VirtualDocumentProvider(BASELINE_SCHEME, service);
     const remote = new VirtualDocumentProvider(REMOTE_SCHEME, service);
+    const local = new VirtualDocumentProvider(LOCAL_SCHEME, service);
 
     assert.strictEqual(
       await baseline.provideTextDocumentContent(virtualUri(BASELINE_SCHEME, remotePath)),
@@ -467,6 +531,10 @@ suite('Ecode UI models', () => {
     assert.strictEqual(
       await remote.provideTextDocumentContent(virtualUri(REMOTE_SCHEME, remotePath)),
       `remote:${remotePath}`,
+    );
+    assert.strictEqual(
+      await local.provideTextDocumentContent(virtualUri(LOCAL_SCHEME, remotePath)),
+      `local:${remotePath}`,
     );
   });
 

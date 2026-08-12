@@ -143,6 +143,7 @@ function entry(path: string, content: string): SyncManifest['files'][string] {
     remoteId: path,
     path,
     kind: 'text',
+    size: Buffer.byteLength(content, 'utf8'),
     baselineHash: hashText(content),
     snapshotKey: hashText(content),
     lastVerifiedAt: new Date(0).toISOString(),
@@ -150,7 +151,13 @@ function entry(path: string, content: string): SyncManifest['files'][string] {
 }
 
 function localFile(path: string, content: string): LocalFileState {
-  return { path, content, hash: hashText(content) };
+  return {
+    path,
+    kind: 'text',
+    content,
+    hash: hashText(content),
+    size: Buffer.byteLength(content, 'utf8'),
+  };
 }
 
 function remoteFile(path: string, id: string, content: string): RemoteFileContent {
@@ -158,6 +165,7 @@ function remoteFile(path: string, id: string, content: string): RemoteFileConten
     entry: { id, path, name: path.split('/').at(-1) ?? path, kind: 'text' },
     content,
     hash: hashText(content),
+    size: Buffer.byteLength(content, 'utf8'),
     formMetadataState: 'absent',
     formContexts: [],
     formMetadataWarnings: [],

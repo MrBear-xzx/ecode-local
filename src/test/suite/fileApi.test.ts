@@ -1,5 +1,8 @@
 import * as assert from 'assert';
 import * as http from 'http';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { type AddressInfo } from 'net';
 import { EcodeApiClient } from '../../sync/api/EcodeApiClient';
 import { FileApi } from '../../sync/api/FileApi';
@@ -8,12 +11,35 @@ suite('File API', () => {
   let server: http.Server;
   let baseUrl: string;
   const posted = new Map<string, URLSearchParams>();
+  let root: string;
+  let multipartBody: Buffer = Buffer.alloc(0);
 
   setup(async () => {
     posted.clear();
+    multipartBody = Buffer.alloc(0);
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'ecode-file-api-test-'));
     server = http.createServer((request, response) => {
       response.setHeader('Content-Type', 'application/json');
-      if (request.url?.startsWith('/api/ecode/type/tree')) {
+      if (request.url === '/resource/raw.bin') {
+        response.setHeader('Content-Type', 'application/octet-stream');
+        response.end(Buffer.from([0, 255, 1, 2, 128]));
+      } else if (
+        request.method === 'POST'
+        && request.url?.startsWith('/api/ecode/resource/upload')
+      ) {
+        void collectBody(request).then(body => {
+          multipartBody = body;
+          response.end(JSON.stringify({ status: true }));
+        });
+      } else if (
+        request.method === 'POST'
+        && request.url === '/api/ecode/resource/remove'
+      ) {
+        respondWithForm(request, response, form => {
+          posted.set(request.url ?? '', form);
+          response.end(JSON.stringify({ status: true }));
+        });
+      } else if (request.url?.startsWith('/api/ecode/type/tree')) {
         response.end(JSON.stringify({
           status: true,
           typeList: [{
@@ -37,6 +63,12 @@ suite('File API', () => {
             attribute: 'file',
             fileExtension: 'js',
             state: 'pre-state',
+          }],
+          resources: [{
+            id: 4,
+            name: 'logo.png',
+            attribute: 'resource',
+            route: '/resource/raw.bin',
           }],
         }));
       } else if (request.url?.startsWith('/api/cloudstore/ecode/one')) {
@@ -148,6 +180,7 @@ suite('File API', () => {
     await new Promise<void>((resolve, reject) =>
       server.close(error => error ? reject(error) : resolve()),
     );
+    await fs.rm(root, { recursive: true, force: true });
   });
 
   test('unwraps top-level tree and file-content response shapes', async () => {
@@ -164,6 +197,7 @@ suite('File API', () => {
     assert.strictEqual(tree.data?.childFolder[0].preStateOrder, '10000');
     assert.strictEqual(tree.data?.childFile[0].fileType, 'js');
     assert.strictEqual(tree.data?.childFile[0].preloadState, 'pre-state');
+    assert.strictEqual(tree.data?.resources[0].route, '/resource/raw.bin');
     assert.strictEqual(content.status, true);
     assert.strictEqual(content.data, 'const value = 1;\n');
   });
@@ -295,14 +329,53 @@ suite('File API', () => {
     assert.strictEqual(result.status, true);
     assert.strictEqual(form?.get('folderId'), 'folder-1');
   });
+
+  test('downloads a resource as original bytes and rejects cross-origin routes', async () => {
+    const client = new EcodeApiClient(baseUrl);
+    const api = new FileApi(client);
+    const target = path.join(root, 'raw.bin');
+
+    const result = await api.downloadResource('/resource/raw.bin', target);
+
+    assert.strictEqual(result.status, true);
+    assert.deepStrictEqual(await fs.readFile(target), Buffer.from([0, 255, 1, 2, 128]));
+    assert.strictEqual(result.data?.size, 5);
+    await assert.rejects(
+      client.getRaw('https://example.com/resource.bin'),
+      /不同源/,
+    );
+  });
+
+  test('uploads a streamed multipart resource with its remote name and deletes by id', async () => {
+    const source = path.join(root, 'object.bin');
+    const bytes = Buffer.from([0, 10, 13, 255, 128]);
+    await fs.writeFile(source, bytes);
+    const api = new FileApi(new EcodeApiClient(baseUrl));
+
+    const uploaded = await api.uploadResource(source, 'folder-1', 'logo.png');
+    const deleted = await api.deleteResource('resource-1');
+
+    assert.strictEqual(uploaded.status, true);
+    assert.match(multipartBody.toString('latin1'), /filename="logo\.png"/);
+    assert.ok(multipartBody.includes(bytes));
+    assert.strictEqual(deleted.status, true);
+    assert.strictEqual(
+      posted.get('/api/ecode/resource/remove')?.get('resourceId'),
+      'resource-1',
+    );
+  });
 });
 
-async function collectForm(request: http.IncomingMessage): Promise<URLSearchParams> {
+async function collectBody(request: http.IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
     chunks.push(Buffer.from(chunk));
   }
-  return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+  return Buffer.concat(chunks);
+}
+
+async function collectForm(request: http.IncomingMessage): Promise<URLSearchParams> {
+  return new URLSearchParams((await collectBody(request)).toString('utf8'));
 }
 
 function respondWithForm(

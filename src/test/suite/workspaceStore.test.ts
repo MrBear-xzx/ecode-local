@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { FormMetadataCache } from '../../domain/formMetadata';
+import { hashFileBytes } from '../../domain/text';
 import type {
   StoredConflict,
   SyncManifest,
@@ -354,6 +355,34 @@ suite('Workspace store', () => {
     assert.strictEqual(fs.readFileSync(second, 'utf8'), 'local version');
   });
 
+  test('persists binary snapshots and resource conflicts without embedding bytes in JSON', async () => {
+    const syncRoot = path.join(workspaceFolder, 'dev');
+    await store.loadManifest('identity-a', syncRoot);
+    const source = path.join(root, 'logo.png');
+    fs.writeFileSync(source, Buffer.from([0, 255, 128, 10]));
+    const expected = await hashFileBytes(source);
+
+    const key = await store.saveResourceSnapshot(syncRoot, source, expected.hash);
+    const snapshot = await store.getSnapshotPath(syncRoot, key, 'resource');
+    await store.saveConflict(syncRoot, {
+      schemaVersion: 2,
+      path: 'App/resources/logo.png',
+      remoteId: 'resource-1',
+      kind: 'resource',
+      remoteSnapshotKey: key,
+      remoteSize: expected.size,
+      remoteHash: expected.hash,
+      detectedAt: new Date().toISOString(),
+      reason: 'bothModified',
+    });
+
+    assert.deepStrictEqual(fs.readFileSync(snapshot), fs.readFileSync(source));
+    const conflict = await store.loadConflict(syncRoot, 'App/resources/logo.png');
+    assert.strictEqual(conflict?.kind, 'resource');
+    assert.strictEqual(conflict?.remoteContent, undefined);
+    assert.strictEqual(conflict?.remoteSnapshotKey, key);
+  });
+
   function environmentRoot(directory: string): string {
     return path.join(workspaceFolder, '.ecode-local', directory);
   }
@@ -374,6 +403,7 @@ function manifestEntry(remotePath: string, hash: string): SyncManifest['files'][
     remoteId: `file-${hash}`,
     path: remotePath,
     kind: 'text',
+    size: 0,
     baselineHash: hash,
     snapshotKey: hash,
     lastVerifiedAt: new Date(0).toISOString(),

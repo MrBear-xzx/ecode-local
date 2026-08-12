@@ -41,41 +41,121 @@ export interface RemoteFileEntry {
   id: string;
   path: string;
   name: string;
-  kind: 'text' | 'unsupported';
+  kind: FileKind | 'unsupported';
+  route?: string;
+  parentId?: string;
   reason?: string;
 }
 
-export interface RemoteFileContent {
+export type FileKind = 'text' | 'resource';
+
+export interface RemoteTreeNode {
+  id: string;
+  name: string;
+  path: string;
+  treeType?: string;
+  businessType?: string;
+  attribute?: string;
+  parentId?: string;
+  appId?: string;
+  initialAppId?: string;
+  route?: string;
+  status?: string;
+  state?: string;
+  preStateOrder?: string;
+  debugMode?: 'y' | 'n';
+  hasChild?: boolean;
+  children: RemoteTreeNode[];
+}
+
+export interface RemoteTreeSnapshot {
+  schemaVersion: 1;
+  serverFingerprint: string;
+  syncRoot: string;
+  capturedAt: string;
+  roots: RemoteTreeNode[];
+}
+
+export interface EcodeAppMetadata {
+  appId: string;
+  nodeId: string;
+  path: string;
+  status: string;
+  preStateOrder: string;
+  preloadFiles: string[];
+  resourceRoots: string[];
+  resources: string[];
+  configs: string[];
+  debugMode: 'y' | 'n';
+}
+
+export interface AppMetadataSnapshot {
+  schemaVersion: 1;
+  serverFingerprint: string;
+  syncRoot: string;
+  capturedAt: string;
+  apps: EcodeAppMetadata[];
+}
+
+interface RemoteFileContentBase {
   entry: RemoteFileEntry;
-  content: string;
   hash: string;
+  size: number;
   formMetadataState: FormMetadataState;
   formContexts: FormContext[];
   formMetadataWarnings: string[];
 }
 
+export interface RemoteTextFileContent extends RemoteFileContentBase {
+  entry: RemoteFileEntry & { kind: 'text' };
+  content: string;
+}
+
+export interface RemoteResourceFileContent extends RemoteFileContentBase {
+  entry: RemoteFileEntry & { kind: 'resource' };
+  sourcePath: string;
+  stagingRoot: string;
+}
+
+export type RemoteFileContent =
+  | RemoteTextFileContent
+  | RemoteResourceFileContent;
+
 export interface ManifestEntry {
   remoteId: string;
   path: string;
-  kind: 'text';
+  kind: FileKind;
+  size: number;
   baselineHash: string;
   snapshotKey: string;
   lastVerifiedAt: string;
 }
 
 export interface SyncManifest {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   serverFingerprint: string;
   syncRoot: string;
   updatedAt: string;
   files: Record<string, ManifestEntry>;
 }
 
-export interface LocalFileState {
+interface LocalFileStateBase {
   path: string;
-  content: string;
   hash: string;
+  size: number;
 }
+
+export interface LocalTextFileState extends LocalFileStateBase {
+  kind: 'text';
+  content: string;
+}
+
+export interface LocalResourceFileState extends LocalFileStateBase {
+  kind: 'resource';
+  sourcePath: string;
+}
+
+export type LocalFileState = LocalTextFileState | LocalResourceFileState;
 
 export type SyncChangeStatus =
   | 'clean'
@@ -98,10 +178,13 @@ export type ConflictReason =
 export interface SyncChange {
   path: string;
   status: SyncChangeStatus;
+  kind?: FileKind;
   remoteId?: string;
   baselineHash?: string;
   localHash?: string;
   remoteHash?: string;
+  localSize?: number;
+  remoteSize?: number;
   conflictReason?: ConflictReason;
   message?: string;
 }
@@ -127,9 +210,13 @@ export interface SyncOperationResult {
 }
 
 export interface StoredConflict {
+  schemaVersion?: 1 | 2;
   path: string;
   remoteId: string;
-  remoteContent: string;
+  kind?: FileKind;
+  remoteContent?: string;
+  remoteSnapshotKey?: string;
+  remoteSize?: number;
   remoteHash: string;
   detectedAt: string;
   reason: ConflictReason;
@@ -141,15 +228,21 @@ export type PromotionOperation = 'add' | 'modify' | 'delete';
 export interface PromotionCandidate {
   path: string;
   operation: PromotionOperation;
+  kind?: FileKind;
+  size?: number;
   baseHash?: string;
   baseContent?: string;
+  baseResourcePath?: string;
   resultHash?: string;
   resultContent?: string;
+  resultResourcePath?: string;
 }
 
 export interface ChangeSetFile {
   path: string;
   operation: PromotionOperation;
+  kind?: FileKind;
+  size?: number;
   baseHash?: string;
   baseSnapshotKey?: string;
   resultHash?: string;
@@ -195,7 +288,7 @@ export interface LifecycleChangeRecord {
 }
 
 export interface ChangeSet {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   id: string;
   name: string;
   sourceEnvironmentId: string;
@@ -206,7 +299,7 @@ export interface ChangeSet {
 }
 
 export interface PushRecord {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   id: string;
   name: string;
   environmentId: string;
@@ -261,9 +354,12 @@ export interface DeploymentRecord {
 export interface ReleaseArtifact {
   path: string;
   operation: PromotionOperation;
+  kind?: FileKind;
+  size?: number;
   baseHash?: string;
   resultHash?: string;
   resultContent?: string;
+  resultResourcePath?: string;
 }
 
 export interface ReleaseVerification {

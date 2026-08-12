@@ -3,6 +3,7 @@ import { type EcodeSyncService } from '../sync/EcodeSyncService';
 
 export const BASELINE_SCHEME = 'ecode-baseline';
 export const REMOTE_SCHEME = 'ecode-remote';
+export const LOCAL_SCHEME = 'ecode-local-summary';
 export const EMPTY_SCHEME = 'ecode-empty';
 
 export class VirtualDocumentProvider implements vscode.TextDocumentContentProvider {
@@ -10,6 +11,7 @@ export class VirtualDocumentProvider implements vscode.TextDocumentContentProvid
     private readonly scheme:
       | typeof BASELINE_SCHEME
       | typeof REMOTE_SCHEME
+      | typeof LOCAL_SCHEME
       | typeof EMPTY_SCHEME,
     private readonly service: EcodeSyncService,
   ) {}
@@ -21,12 +23,14 @@ export class VirtualDocumentProvider implements vscode.TextDocumentContentProvid
     }
     return this.scheme === BASELINE_SCHEME
       ? this.service.getBaselineContent(remotePath)
-      : this.service.getLatestRemoteContent(remotePath);
+      : this.scheme === LOCAL_SCHEME
+        ? this.service.getLocalContent(remotePath)
+        : this.service.getLatestRemoteContent(remotePath);
   }
 }
 
 export function virtualUri(
-  scheme: typeof BASELINE_SCHEME | typeof REMOTE_SCHEME | typeof EMPTY_SCHEME,
+  scheme: typeof BASELINE_SCHEME | typeof REMOTE_SCHEME | typeof LOCAL_SCHEME | typeof EMPTY_SCHEME,
   remotePath: string,
 ): vscode.Uri {
   return vscode.Uri.from({

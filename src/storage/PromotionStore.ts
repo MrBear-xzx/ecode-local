@@ -5,7 +5,7 @@ import {
   ECODE_LOCAL_DIRECTORY,
   ECODE_PROMOTION_DIRECTORY,
 } from '../domain/constants';
-import { hashText } from '../domain/text';
+import { hashFileBytes, hashText } from '../domain/text';
 import type {
   ChangeSet,
   ChangeSetFile,
@@ -16,7 +16,11 @@ import type {
   PushRecord,
   ReleaseArtifact,
 } from '../domain/types';
-import { writeJsonAtomic, writeTextAtomic } from './AtomicFileStore';
+import {
+  copyFileAtomic,
+  writeJsonAtomic,
+  writeTextAtomic,
+} from './AtomicFileStore';
 
 export class PromotionStore {
   private readonly root: string;
@@ -35,7 +39,7 @@ export class PromotionStore {
   ): Promise<ChangeSet> {
     const now = new Date().toISOString();
     const changeSet: ChangeSet = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: `CS-${compactTimestamp(now)}-${randomUUID().slice(0, 8)}`,
       name: name.trim(),
       sourceEnvironmentId,
@@ -85,12 +89,16 @@ export class PromotionStore {
       const baseHash = existing ? existing.baseHash : candidate.baseHash;
       const baseSnapshotKey = existing
         ? existing.baseSnapshotKey
-        : (candidate.baseContent === undefined
-          ? undefined
-          : await this.saveObject(candidate.baseContent));
-      const resultSnapshotKey = candidate.resultContent === undefined
-        ? undefined
-        : await this.saveObject(candidate.resultContent);
+        : await this.saveCandidateObject(
+          candidate.kind ?? 'text',
+          candidate.baseContent,
+          candidate.baseResourcePath,
+        );
+      const resultSnapshotKey = await this.saveCandidateObject(
+        candidate.kind ?? 'text',
+        candidate.resultContent,
+        candidate.resultResourcePath,
+      );
 
       if (
         candidate.operation === 'delete'
@@ -106,6 +114,8 @@ export class PromotionStore {
       const file: ChangeSetFile = {
         path: candidate.path,
         operation,
+        kind: candidate.kind ?? 'text',
+        size: candidate.size,
         baseHash,
         baseSnapshotKey,
         resultHash: candidate.resultHash,
@@ -178,7 +188,7 @@ export class PromotionStore {
         delete lifecycleChanges[key];
       }
     }
-    changeSet.schemaVersion = 2;
+    changeSet.schemaVersion = 3;
     changeSet.lifecycleChanges = lifecycleChanges;
     changeSet.updatedAt = new Date().toISOString();
     validateChangeSet(changeSet);
@@ -202,19 +212,25 @@ export class PromotionStore {
         path: candidate.path,
         operation: candidate.operation,
         baseHash: candidate.baseHash,
-        baseSnapshotKey: candidate.baseContent === undefined
-          ? undefined
-          : await this.saveObject(candidate.baseContent),
+        kind: candidate.kind ?? 'text',
+        size: candidate.size,
+        baseSnapshotKey: await this.saveCandidateObject(
+          candidate.kind ?? 'text',
+          candidate.baseContent,
+          candidate.baseResourcePath,
+        ),
         resultHash: candidate.resultHash,
-        resultSnapshotKey: candidate.resultContent === undefined
-          ? undefined
-          : await this.saveObject(candidate.resultContent),
+        resultSnapshotKey: await this.saveCandidateObject(
+          candidate.kind ?? 'text',
+          candidate.resultContent,
+          candidate.resultResourcePath,
+        ),
         verifiedAt: now,
       });
     }
     const successfulPaths = new Set(files.map(file => file.path));
     const record: PushRecord = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: `PUSH-${compactTimestamp(now)}-${randomUUID().slice(0, 8)}`,
       name: normalizePushRecordName(name, now),
       environmentId,
@@ -284,11 +300,18 @@ export class PromotionStore {
     files: ChangeSetFile[],
   ): Promise<PromotionCandidate[]> {
     return Promise.all(files.map(async file => {
-      const baseContent = file.baseSnapshotKey
+      const kind = file.kind ?? 'text';
+      const baseContent = kind === 'text' && file.baseSnapshotKey
         ? await this.readObject(file.baseSnapshotKey)
         : undefined;
-      const resultContent = file.resultSnapshotKey
+      const resultContent = kind === 'text' && file.resultSnapshotKey
         ? await this.readObject(file.resultSnapshotKey)
+        : undefined;
+      const baseResourcePath = kind === 'resource' && file.baseSnapshotKey
+        ? await this.readObjectPath(file.baseSnapshotKey, kind)
+        : undefined;
+      const resultResourcePath = kind === 'resource' && file.resultSnapshotKey
+        ? await this.readObjectPath(file.resultSnapshotKey, kind)
         : undefined;
       if (baseContent !== undefined && file.baseHash !== hashText(baseContent)) {
         throw new Error(`${file.path}: 推送前源码快照校验失败`);
@@ -299,10 +322,14 @@ export class PromotionStore {
       return {
         path: file.path,
         operation: file.operation,
+        kind,
+        size: file.size,
         baseHash: file.baseHash,
         baseContent,
+        baseResourcePath,
         resultHash: file.resultHash,
         resultContent,
+        resultResourcePath,
       };
     }));
   }
@@ -313,8 +340,12 @@ export class PromotionStore {
 
   private async materializeFiles(files: ChangeSetFile[]): Promise<ReleaseArtifact[]> {
     return Promise.all(files.map(async file => {
-      const resultContent = file.resultSnapshotKey
+      const kind = file.kind ?? 'text';
+      const resultContent = kind === 'text' && file.resultSnapshotKey
         ? await this.readObject(file.resultSnapshotKey)
+        : undefined;
+      const resultResourcePath = kind === 'resource' && file.resultSnapshotKey
+        ? await this.readObjectPath(file.resultSnapshotKey, kind)
         : undefined;
       if (
         resultContent !== undefined
@@ -325,9 +356,12 @@ export class PromotionStore {
       return {
         path: file.path,
         operation: file.operation,
+        kind,
+        size: file.size,
         baseHash: file.baseHash,
         resultHash: file.resultHash,
         resultContent,
+        resultResourcePath,
       };
     }));
   }
@@ -352,6 +386,32 @@ export class PromotionStore {
     return key;
   }
 
+  private async saveCandidateObject(
+    kind: 'text' | 'resource',
+    content: string | undefined,
+    resourcePath: string | undefined,
+  ): Promise<string | undefined> {
+    if (kind === 'text') {
+      return content === undefined ? undefined : this.saveObject(content);
+    }
+    if (!resourcePath) {
+      return undefined;
+    }
+    const { hash } = await hashFileBytes(resourcePath);
+    const file = path.join(this.root, 'objects', `${hash}.bin`);
+    try {
+      await fs.access(file);
+    } catch {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await copyFileAtomic(file, resourcePath);
+      if ((await hashFileBytes(file)).hash !== hash) {
+        await fs.unlink(file);
+        throw new Error('资源对象在保存期间发生变化');
+      }
+    }
+    return hash;
+  }
+
   private async readObject(key: string): Promise<string> {
     if (!/^[a-f0-9]{64}$/.test(key)) {
       throw new Error('变更集对象标识无效');
@@ -364,6 +424,24 @@ export class PromotionStore {
       throw new Error('变更集对象存储校验失败');
     }
     return content;
+  }
+
+  private async readObjectPath(
+    key: string,
+    kind: 'text' | 'resource',
+  ): Promise<string> {
+    if (!/^[a-f0-9]{64}$/.test(key)) {
+      throw new Error('变更集对象标识无效');
+    }
+    const file = path.join(
+      this.root,
+      'objects',
+      `${key}.${kind === 'resource' ? 'bin' : 'txt'}`,
+    );
+    if (kind === 'resource' && (await hashFileBytes(file)).hash !== key) {
+      throw new Error('变更集资源对象存储校验失败');
+    }
+    return file;
   }
 
   private async readEntity<T>(directory: string, id: string): Promise<T | undefined> {
@@ -424,15 +502,27 @@ function normalizeStoredPushRecord(record: PushRecord): PushRecord {
   const storedName = (record as PushRecord & { name?: unknown }).name;
   return {
     ...record,
+    schemaVersion: 2,
     name: typeof storedName === 'string' && storedName.trim()
       ? storedName.trim()
       : new Date(record.createdAt).toLocaleString(),
+    files: record.files.map(file => ({
+      ...file,
+      kind: file.kind === 'resource' ? 'resource' : 'text',
+    })),
   };
 }
 
 function normalizeStoredChangeSet(changeSet: ChangeSet): ChangeSet {
   return {
     ...changeSet,
+    schemaVersion: 3,
+    files: Object.fromEntries(Object.entries(changeSet.files).map(
+      ([remotePath, file]) => [remotePath, {
+        ...file,
+        kind: file.kind === 'resource' ? 'resource' : 'text',
+      }],
+    )),
     lifecycleChanges: changeSet.lifecycleChanges ?? {},
   };
 }
